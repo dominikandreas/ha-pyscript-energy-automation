@@ -15,6 +15,7 @@ class Victron:
     inverter_mode_sensor = "sensor.victron_inverter_mode_set"
     inverter_mode_input_select = "input_select.victron_inverter_mode"
     inverter_mode_mqtt_write_topic = f"victron/W/{device_id}/vebus/275/Mode"
+    setpoint_topic = f"victron/W/{device_id}/settings/0/Settings/CGwacs/AcPowerSetPoint"
 
     mode_input_select = "input_select.victron_inverter_mode"
     """Input select for inverter mode"""

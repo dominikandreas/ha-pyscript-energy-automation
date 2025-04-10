@@ -3,70 +3,61 @@
 from datetime import timedelta
 from typing import TYPE_CHECKING
 
-
 if TYPE_CHECKING:
     # The type checker (linter) does not know that utils can directly be imported in the pyscript engine.
     # Therefore during type checking we pretend to import them from modules.utils, which it can resolve.
     from modules.utils import clip, get, get_attr
+    from modules.const import EV as Const
 
     # These are provided by typescript and do not need to be imported in the actual script
     # They are only needed for type checking (linting), which development easier
-    from modules.utils import (
-        log,
-        now,
-        time_trigger,
-        with_timezone,
-        state_active,
-        state_trigger,
-        service,
-        task,
-        set
-    )
+    from modules.utils import log, now, time_trigger, with_timezone, state_active, state_trigger, service, task, set
 
-    from modules.states import (
-        Automation,
-        Charger,
-        ElectricityPrices,
-        EV,
-        Excess,
-        Battery,
-        House
-    )
+    from modules.states import Automation, Charger, ElectricityPrices, EV, Excess, Battery, House
     from modules.victron import Victron
 
 else:
+    from const import EV as Const
     from utils import clip, get, set, get_attr, now, with_timezone
-    from states import (
-        Automation,
-        Charger,
-        ElectricityPrices,
-        EV,
-        Excess,
-        Battery,
-        House
-    )
+    from states import Automation, Charger, ElectricityPrices, EV, Excess, Battery, House
     from victron import Victron
 
 
-class Const:
-    ev_capacity = 60
-    """The capacity of the EV battery in kWh"""
-    ev_consumption_per_drive = 55
-    """How much percent of the battery is consumed per drive"""
-    ev_days_allowed_to_reach_target = 7
-    """The average days it should take to reach the target state of charge.
+@state_trigger(f"{EV.planned_drives}")
+@time_trigger
+@time_trigger("period(now, 30sec)")
+def smart_charge_limit():
+    """The smart charge limit is the maximum state of charge the EV should be charged to
+    to ensure the battery is not fully charged when the car is not used for a longer
+    period of time.
 
-
-    In order to get the vehicle charged, the schedule allows to define the next
-    planned drive. This variable is a fallback to be used when no schedule is defined,
-    to control how much energy shall be requested for the vehicle per day.
+    The limit is calculated based on the time until the next drive.
     """
+    schedule = get_attr(EV.planned_drives, "next_event")
+    is_on = get(EV.planned_drives, False)
 
-    ev_phase_switch_delay = 20
-    """The delay in seconds between switching the number of phases of the EV charger"""
-    max_current = 16
-    """The maximum current the EV charger can provide"""
-    min_current = 6
+    t_now = now()
+
+    if not schedule:
+        smart_charge_limit = 85
+    else:
+        td = schedule - t_now
+        td_hours = td.total_seconds() // 3600
+
+        if (
+            td_hours < 6 or is_on
+        ):  # `or is_on` ensures that the car can continue to be charged when it was scheduled to leave but hasn't done so yet
+            smart_charge_limit = 100
+        elif td_hours < 20:
+            smart_charge_limit = 98
+        elif td_hours < 40:
+            smart_charge_limit = 95
+        elif td_hours < 60:
+            smart_charge_limit = 93
+        else:
+            smart_charge_limit = 85
+
+    set(EV.smart_charge_limit, smart_charge_limit)
 
 
 def get_ev_requested_energy_today():
@@ -116,62 +107,58 @@ last_ev_charging_phase_change = now() - timedelta(minutes=15)
 ev_charging_turned_on_by_automation = get(Charger.turned_on_by_automation, False)
 
 
-@state_trigger(f"{Charger.control_switch}.lower() == 'off'")
-def disable_ev_charging_turned_on_by_automation():
-    global ev_charging_turned_on_by_automation
-    ev_charging_turned_on_by_automation = False
-    set(Charger.turned_on_by_automation, False)
-    set(Charger.force_charge, 'off')
+@time_trigger
+@time_trigger("period(now, 15sec)")
+def ev_energy():
+    """Calculate the energy needed to charge the EV to the required state of charge"""
+    current_soc = get(EV.soc, 0)
+    ev_energy = (current_soc) / 100 * Const.ev_capacity
+    set(EV.energy, ev_energy)
 
 
 @state_trigger(f"{Charger.force_charge}.lower() == 'on'")
 def enable_force_charge():
-    global ev_charging_turned_on_by_automation
-    ev_charging_turned_on_by_automation = False
     set(Charger.control_switch, True)
-    set(Charger.turned_on_by_automation, False)
     set_phases_and_current(3, 16, "Force charge enabled, setting max power")
 
 
 def turn_on_charger(reason: str = ""):
-    global ev_charging_turned_on_by_automation
-    is_charging = get(Charger.control_switch, False)
-    if not is_charging:
+    charger_enabled = get(Charger.control_switch, False)
+    if not charger_enabled:
         log.warning(f"Turning on ev charger {reason}")
         service.call("switch", "turn_on", entity_id=Charger.control_switch)
         task.sleep(5)
         new_state = get(Charger.control_switch, False)
-        ev_charging_turned_on_by_automation = new_state is True
-        set("input_boolean.ev_charging_turned_on_by_automation", new_state)
         return new_state
 
 
 def turn_off_charger(reason: str = ""):
-    global ev_charging_turned_on_by_automation
     is_charging = get(Charger.control_switch, False)
-    if is_charging and not ev_charging_turned_on_by_automation:
-        log.warning(f"EV charger turned on manually - skipping turn off. Reason for request: {reason}")
-        return is_charging
+
+    if get(Charger.force_charge, False):
+        log.warning(f"Not turning off charging, force charge in on. Reason for request {reason}")
     elif is_charging:
         log.warning(f"Turning off ev charger. Reason for request: {reason}")
         service.call("switch", "turn_off", entity_id=Charger.control_switch)
-        task.sleep(2)
+        task.sleep(5)
         new_state = get(Charger.control_switch, False)
-        ev_charging_turned_on_by_automation = new_state is True
-        set("input_boolean.ev_charging_turned_on_by_automation", new_state)
         return new_state
+
     return get(Charger.control_switch, False)
 
 
 def set_current(current, reason: str | None = None):
-    configured_current = get(Charger.current_setting, -1) 
+    configured_current = get(Charger.current_setting, -1)
     if configured_current != current:
         if not Const.min_current <= current <= Const.max_current:
-            log.warning(f"Current out of bounds {current} - skipping phase change. Reason: {reason or 'no reason provided'}")
+            log.warning(
+                f"Current out of bounds {current} - skipping phase change. Reason: {reason or 'no reason provided'}"
+            )
             return
         service.call("number", "set_value", entity_id=Charger.current_setting, value=current)
-        if reason:
-            log.warning(f"Setting current from {configured_current:.0f}A to {current}A because {reason or 'no reason provided'}")
+        log.warning(
+            f"Setting current from {configured_current:.0f}A to {current}A. Reason: {reason or 'no reason provided'}"
+        )
     else:
         log.warning(f"Current of {current} already set - skipping current change")
 
@@ -179,21 +166,20 @@ def set_current(current, reason: str | None = None):
 def set_phases_and_current(phases, current, reason: str | None = None):
     global last_ev_charging_phase_change
 
-    is_charging = get(Charger.control_switch, False)
+    charger_enabled = get(Charger.control_switch, False)
 
-    set_current(current)
+    set_current(current, reason)
 
     configured_phases = get(Charger.phases, 3)
 
     if configured_phases != phases:
         if last_ev_charging_phase_change > now() - timedelta(minutes=15):
-            log.warning(f"Phase change too frequent - cooldown active. Reason for change: {reason}")
+            log.warning(f"Phase change too frequent - cooldown active. Reason: {reason or 'no reason provided'}")
             return
 
-        if reason:
-            log.warning(f"Setting phases: {phases}, current: {current}A - {reason}")
+        log.warning(f"Setting phases: {phases}, current: {current}A. Reason: {reason or 'no reason provided'}")
 
-        if is_charging:
+        if charger_enabled:
             turn_off_charger(f"Phase change from {configured_phases} -> {phases}")
 
         service.call("vestel_ecv04", "set_phases_and_current", current=Const.max_current, num_phases=phases)
@@ -202,27 +188,30 @@ def set_phases_and_current(phases, current, reason: str | None = None):
         task.sleep(Const.ev_phase_switch_delay)
         log.warning(f"Phase change completed. Phase is now set to: {get(Charger.phases) or 'unknown'}")
 
-        if is_charging:
+        if charger_enabled:
             turn_on_charger()
     else:
         log.warning(f"Phases of {phases} already set - skipping phase change")
 
 
 # set(Charger.force_charge, "off")
-_force_charge = get(Charger.force_charge)
-_charger_ready = get(Charger.ready)
-_auto_ev_charging = get(Automation.auto_ev_charging) 
-_control_switch = get(Charger.control_switch)
-log.warning(
-    f"Condition: force_charge {_force_charge}=='off' {_force_charge == 'off'} "
-    f" and auto_ev_charging {_auto_ev_charging}==on: {_auto_ev_charging == 'on'} "
-    f"and (Charger.ready == 'on' {_charger_ready == 'on'} or Charger.control_switch == 'on' {_control_switch == 'on'})"
-)
-condition = _force_charge == 'off' and _auto_ev_charging == 'on' and (_charger_ready == 'on' or _control_switch == 'on')
-log.warning(f"Condition: {condition}")
- 
+# _force_charge = get(Charger.force_charge)
+# _charger_ready = get(Charger.ready)
+# _auto_ev_charging = get(Automation.auto_ev_charging)
+# _control_switch = get(Charger.control_switch)
+# log.warning(
+#     f"Condition: force_charge {_force_charge}=='off' {_force_charge == 'off'} "
+#     f" and auto_ev_charging {_auto_ev_charging}==on: {_auto_ev_charging == 'on'} "
+#     f"and (Charger.ready == 'on' {_charger_ready == 'on'} or Charger.control_switch == 'on' {_control_switch == 'on'})"
+# )
+# condition = _force_charge == "off" and _auto_ev_charging == "on" and (_charger_ready == "on" or _control_switch == "on")
+# log.warning(f"Condition: {condition}")
+
+
 @time_trigger("period(now, 15sec)")
-@state_active(f"{Charger.force_charge} == 'off' and {Automation.auto_ev_charging} == 'on' and ({Charger.ready} == 'on' or {Charger.control_switch} == 'on')")
+@state_active(
+    f"{Charger.force_charge} == 'off' and {Automation.auto_ev_charging} == 'on' and ({Charger.ready} == 'on' or {Charger.control_switch} == 'on')"
+)
 async def auto_ev_charging():
     """Combined EV charging control with excess power, price and temperature awareness"""
     global last_ev_charging_phase_change
@@ -249,17 +238,22 @@ async def auto_ev_charging():
     # it is dynamically updated by a separate automation
     target_excess = get(Excess.target, 0)  # in kW
     # surplus energy is the amount of energy that is likely available after accounting for house loads in the near future
-    surplus_energy = get(House.energy_surplus, 0) # in kWh  
+    surplus_energy = get(House.energy_surplus, 0)  # in kWh
 
     # this is the maximum charge current that the vehicle should be charge with right now
-    configured_current = get(Charger.current_setting, 6) 
-    configured_phases = get(Charger.phases, 3) 
+    configured_current = get(Charger.current_setting, 6)
+    configured_phases = get(Charger.phases, 3)
 
     debug_info = f"Current SOC: {current_soc}%, Required SOC: {required_soc}%, Surplus {surplus_energy:.2f} Excess: {excess_power:.2f} kW, Target: {target_excess:.2f} kW "
-    
+
     # Calculate energy requirements
+    smart_charge_limit = get(EV.smart_charge_limit, required_soc)
+    smart_limiter_active = get(Automation.auto_charge_limit, False)
+    if smart_limiter_active:
+        required_soc = min(smart_charge_limit, required_soc)
+
     energy_needed = max(0, (required_soc - current_soc) / 100 * Const.ev_capacity)
-    if energy_needed <= 0:
+    if energy_needed <= 0 and surplus_energy < 1:
         turn_off_charger(reason="No energy needed - turning off charger")
         return
 
@@ -276,7 +270,7 @@ async def auto_ev_charging():
         hours_available_to_charge = (next_drive - now()).total_seconds() / 3600
     else:
         # TODO: we need to track the point in time when the car was last used to track this default properly
-        hours_available_to_charge = Const.ev_days_allowed_to_reach_target * 24 
+        hours_available_to_charge = 999  # Const.ev_days_allowed_to_reach_target * 24
 
     # Calculate minimum time needed to charge the vehicle, we subtract 1 to account for charging inefficiencies
     min_hours_needed = energy_needed / (3 * VOLTAGE * (MAX_CURRENT - 1) / 1000)  # in hours
@@ -291,50 +285,53 @@ async def auto_ev_charging():
         f"excess_power > target_excess: {excess_power > target_excess}"
     )
 
-    log.warning(debug_info)
-
     is_charging = get(Charger.control_switch, False)
 
     #  -------------------------- Charging Strategy Logic -----------------------------------
     #  - when there's time to charge is running out to reach target SOC, charge with max current
-    #  - when price is low and less than 24h left, charge with max current  
+    #  - when price is low and less than 24h left, charge with max current
     #  - when there's excess power and no time constraints, charge with excess power
     #  - when charging already active, control the charge amps to meet target excess
     #  - when price is high and time is not constrained, turn off the charger
     #  -------------------------------------------------------------------------------------
-    
+
     # if no more charging needed, turn off the charger
-    if is_charging and current_soc >= required_soc and surplus_energy <= 0:
-        turn_off_charger("required SoC was reached")
+    if current_soc >= required_soc and surplus_energy <= 1:
+        turn_off_charger(f"required SoC was reached, stopping charge with surplus of {surplus_energy:.0f}kWh")
+    elif smart_limiter_active and current_soc >= smart_charge_limit:
+        turn_off_charger(f"Smart charge limit of {smart_charge_limit} reached.")
     # Emergency charge, independently of price or excess power
-    elif (hours_available_to_charge < 2 or hours_available_to_charge < min_hours_needed) and current_soc < required_soc - 1:
+    elif (
+        hours_available_to_charge < 2 or hours_available_to_charge < min_hours_needed
+    ) and current_soc < required_soc - 1:
         set_phases_and_current(3, MAX_CURRENT, f"Emergency charge - SOC: {current_soc}% < Target: {required_soc}%")
         turn_on_charger(f"Emergency charge - SOC: {current_soc}% < Target: {required_soc}%")
     # Charge when price is low and not much time left (likely not possible to charge via excess)
     elif low_price and hours_available_to_charge < 24:  # Use cheap electricity
-        battery_discharging = get(Victron.mode_sensor, default="off").lower() == "on" and not get(Battery.force_charge_switch, False)
+        battery_discharging = get(Victron.mode_sensor, default="off").lower() == "on" and not get(
+            Battery.force_charge_switch, False
+        )
         if battery_discharging:  # in case we're discharging from battery, we should limit the current accordingly
             log.warning("Charging at low price, with battery discharging")
             adj = calculate_charger_current_adjustment(
                 excess_power, target_excess, configured_phases=3, configured_current=configured_current
-            ) # Calculate current adjustment
+            )  # Calculate current adjustment
             set_phases_and_current(3, configured_current + adj, "Charging at low price, with battery discharging")
         else:
             log.warning("Charging at low price, no battery discharging")
             set_phases_and_current(3, MAX_CURRENT, "Charging at low price, no battery discharging")
         turn_on_charger(reason="Low price charging")
     # PV surplus charging, when sufficient excess is available and no time constraints
-    elif excess_power > target_excess and (surplus_energy > 0 or excess_power > 1.5 and battery_soc > 90):
-        log.warning(f"Excess power detected: {excess_power:.2f} kW, Target: {target_excess:.2f} kW")
-        available_power = excess_power - target_excess  # Already in kW
+    elif excess_power > target_excess and (surplus_energy > 5 or excess_power > 2 and battery_soc > 90):
+        available_power = (excess_power - target_excess) * 1000  # convert kW to W
         # Hysteresis logic with proper unit conversion (W->kW)
-        min_3phase_power = (3 * VOLTAGE * MIN_CURRENT) / 1000  # Convert W to kW
+        min_3phase_power = 3 * VOLTAGE * MIN_CURRENT  # in W
         if configured_phases == 3:
             phase_switch_threshold = min_3phase_power - HYSTERESIS_BUFFER
         else:
             phase_switch_threshold = min_3phase_power + HYSTERESIS_BUFFER
 
-        current_power = configured_phases * configured_current * VOLTAGE / 1000  # kW
+        current_power = configured_phases * configured_current * VOLTAGE  # W
         phases = 3 if (current_power + available_power) >= phase_switch_threshold else 1
         # Calculate current with bounds checking and explicit type conversion
 
@@ -342,12 +339,15 @@ async def auto_ev_charging():
         set_phases_and_current(
             phases, configured_current + adj, f"Target Power for EV: {current_power + available_power:.2f} kW"
         )
-        turn_on_charger()
+        turn_on_charger(reason=f"Excess power detected: {excess_power:.2f} kW, Target: {target_excess:.2f} kW")
+
     # When charging already active, need to control the charge amps to meet target excess
     elif is_charging and excess_power < target_excess:
         deficit = target_excess - excess_power
         # Consider phase reduction if we're at minimum current for 3-phase
-        log.warning(f"Excess {excess_power} target {target_excess} deficit: {deficit:.2f} kW, configured_current: {configured_current}A, configured_phases: {configured_phases}")
+        log.warning(
+            f"Excess {excess_power} target {target_excess} deficit: {deficit:.2f} kW, configured_current: {configured_current}A, configured_phases: {configured_phases}"
+        )
         if configured_current == MIN_CURRENT:
             if configured_phases == 3:
                 # Calculate max current for 1 phase and set it
@@ -359,7 +359,9 @@ async def auto_ev_charging():
                     1, configured_current + adj, f"Reducing phases to meet deficit of {deficit:.2f} kW"
                 )
             else:
-                turn_off_charger(f"Excess {excess_power:.1f}kW below target of {target_excess:.1f}kW, current {configured_current}A already at minimum, unable to reduce further")
+                turn_off_charger(
+                    f"Excess {excess_power:.1f}kW below target of {target_excess:.1f}kW, current {configured_current}A already at minimum, unable to reduce further"
+                )
         else:
             log.warning(f"Adjusting current to meet deficit: {deficit:.2f} kW")
             adj = calculate_charger_current_adjustment(
@@ -369,9 +371,14 @@ async def auto_ev_charging():
                 max(MIN_CURRENT, configured_current + adj), f"Reducing current to meet deficit of {deficit:.2f} kW"
             )
 
-    elif high_price and surplus_energy <= 0 and excess_power < (target_excess -1):
+    elif high_price and surplus_energy <= 0 and excess_power < (target_excess - 1):
         # Only charge if time-constrained with explicit unit conversion
         charge_rate_kw = (3 * VOLTAGE * MAX_CURRENT) / 1000  # Convert W to kW
         min_required_time = energy_needed / charge_rate_kw  # Hours
         if not (hours_available_to_charge < min_required_time - 0.5):
             turn_off_charger("high electricity price and still time available")
+
+    else:
+        return
+
+    log.warning(debug_info)

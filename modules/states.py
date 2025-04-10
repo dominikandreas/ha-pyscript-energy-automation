@@ -4,12 +4,14 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     # ruff: noqa: I
-    from modules.utils import log, service
+    pass
+
 
 class ElectricityPrices:
     low_price = "binary_sensor.low_electricity_price"
     high_price = "binary_sensor.high_electricity_price"
     current_price = "sensor.electricity_price"
+    epex_forecast_prices = "sensor.epex_spot_data_price"
 
 
 class Environment:
@@ -47,6 +49,8 @@ class Battery:
     """The discharge power limit of the battery"""
     charge_limit = "input_number.victron_charge_power_limit"
     """The charge power limit of the battery"""
+    power = "sensor.victron_battery_power"
+
 
 class Charger:
     """Charger configuration states"""
@@ -61,7 +65,7 @@ class Charger:
     """The status of the charger connector"""
     control_switch = "switch.charger_charge_control"
     """The switch to control the charger"""
-    power = "sensor.charger_power_active_import"
+    power = "sensor.wallbox_power"
     """The power being drawn by the charger"""
     ready = "binary_sensor.ev_charger_ready"
     """Whether the EV charger is ready to charge the vehicle"""
@@ -82,7 +86,8 @@ class EV:
     """The automatic state of charge limit for the EV"""
     planned_drives = "schedule.tesla_planned_drives"
     """The planned drives schedule for the EV"""
-    """The desired soc of the EV for the next drive (duplicate of required_soc?)"""
+    planned_distance = "input_number.tesla_planned_distance"
+    """The planned distance of the next drive"""
     short_term_demand = "sensor.tesla_short_term_demand"
     """The short term demand for the EV"""
     is_charging = "binary_sensor.is_charging"
@@ -93,13 +98,21 @@ class EV:
     """The opportunistic price for PV energy"""
     electricity_price = "sensor.electricity_price"
     """The current electricity price"""
-    house_daily_average_power = "input_number.house_daily_average_power"
-    """The average power consumption of the house during the day"""
+    energy = "sensor.ev_energy"
+    """The energy of the EV"""
+    energy_until_full = "sensor.ev_energy_until_full"
+    """The energy the EV needs until it is full"""
+    smart_charge_limit = "sensor.tesla_smart_charge_limit"
+    """The smart charge limit for the EV"""
 
 
 class House:
     """House energy consumption related states"""
 
+    loads = "sensor.house_loads"
+    """All power consumption belonging to the house (i.e. excluding wallbox)"""
+    loads_known_devices = "sensor.house_loads_known_devices"
+    """Power consumption of known devices in the house"""
     nightly_average_power = "input_number.house_nightly_average_power"
     """The average power consumption of the house during the night"""
     daily_average_power = "input_number.house_daily_average_power"
@@ -111,12 +124,17 @@ class House:
     upcoming_demand = "sensor.upcoming_demand"
     """The upcoming energy extra demand to plan for (e.g. washing machine, EV charging)"""
     energy_surplus = "sensor.energy_surplus"
-    """Energy surplus in kWh"""
+    """Energy surplus in kWh, energy that exceeds the expected house consumption (excluding EV charging)"""
+    energy_to_burn = "sensor.energy_to_burn"
+    """Energy to burn in kWh, energy that exceeds expected consumption and storage capacity (including EV). 
+    This can be used to e.g. heat water or drive dehumidifiers."""
 
 
 class PVForecast:
     """PV forecast states"""
 
+    forecast_today_remaining = "sensor.solcast_pv_forecast_forecast_remaining_today"
+    """The forecast PV production remaining today"""
     forecast_today = "sensor.solcast_pv_forecast_forecast_today"
     """The forecast for today's PV production"""
     forecast_tomorrow = "sensor.solcast_pv_forecast_forecast_tomorrow"
@@ -179,6 +197,14 @@ class Grid:
     """AC power from grid"""
     power_1m_average = "sensor.grid_1m_average"
     """1 minute average grid power"""
+    power_setpoint_target = "sensor.grid_power_setpoint_target"
+    """Target grid power setpoint"""
+    power_setpoint = "input_number.victron_setpoint"
+    """Active setpoint for grid power"""
+    max_feedin_target = "input_number.max_feedin_target"
+    """Maximum feed-in target"""
+    max_pv_feedin_target = "input_number.max_pv_feedin_target"
+    """Maximum feed-in target for PV"""
 
 
 class Automation:
@@ -198,3 +224,7 @@ class Automation:
     """Required energy calculated by automation"""
     minimal_soc = "sensor.minimal_soc"
     """Minimal SOC calculated by automation"""
+    auto_setpoint = "input_boolean.auto_update_setpoint"
+    """Switch to enable/disable automatic setpoint updates"""
+    auto_charge_limit = "input_boolean.auto_charge_limit"
+    """Switch to enable/disable automatic charge limit calculation"""

@@ -1,6 +1,12 @@
 # Home Assistant Energy Automation
 This repo contains my scriots to manage ev charging and home battery charging / discharging with dynamic electricity prices and solar excess charging.
 
+## Motivation
+Why pyscript instead of templates / ha automation yaml files?
+- python code is easier to read and maintain
+- template triggering is hard to control and can lead to high cpu overhead for entities that change frequently
+
+
 ## Installation
 Install pyscript via hacs
 

@@ -6,11 +6,14 @@ if TYPE_CHECKING:
 
     # These are provided by typescript and do not need to be imported in the actual script
     # They are only needed for type checking (linting), which development easier
-    from modules.utils import log, service, state, state_trigger, get, set, time_trigger
+    from modules.states import EV, Automation, Battery, Charger, Excess, Grid, House, PVForecast  # noqa
+    from modules.utils import get, log, service, set, state, state_trigger, time_trigger
     from modules.victron import Victron
 else:
-    from victron import Victron
+    from states import EV, Automation, Battery, Charger, Excess, Grid, House, PVForecast  # noqa
     from utils import get, set
+
+    from victron import Victron
 
 # Mapping between mode names and MQTT payloads
 # MODE_TO_PAYLOAD = {
@@ -27,12 +30,60 @@ power_kw_attributes = {
     "state_class": "measurement",
 }
 
+power_w_attributes = {
+    "unit_of_measurement": "W",
+    "device_class": "power",
+    "state_class": "measurement",
+}
+
 
 @state_trigger(Victron.inverter_mode_sensor)
 def sync_input_select_from_sensor():
     """Synchronize the input_select state with the MQTT sensor state."""
     sensor_value = state.get(Victron.inverter_mode_sensor)
     Victron.set_inverter_mode(sensor_value)
+
+
+@state_trigger(Grid.power_setpoint)
+def update_setpoint_change():
+    value = get(Grid.power_setpoint, 0)
+    service.call(
+        "mqtt",
+        "publish",
+        topic=Victron.setpoint_topic,
+        payload=f'{{"max": 10000, "min": -10000, "value": {int(value)}}}',
+    )
+
+
+prev_house_loads = None
+
+
+@time_trigger
+@time_trigger("period(now, 5sec)")
+def auto_apply_setpoint():
+    if not get(Automation.auto_setpoint, False):
+        return
+
+    global prev_house_loads
+    if prev_house_loads is None:
+        prev_house_loads = get(House.loads, 500)
+
+    house_power_long_term_average = get(House.daily_average_power, 0)  # W
+    current_house_loads = get(House.loads, prev_house_loads)
+    house_loads = prev_house_loads * 0.9 + 0.1 * current_house_loads  # prevent oscillations
+    setpoint_target = get(Grid.power_setpoint_target, 0)
+
+    if setpoint_target < -20:
+        current_diff_from_avg = house_power_long_term_average - house_loads
+        setpoint = round(min(-20, setpoint_target - current_diff_from_avg))
+    else:
+        setpoint = min(-20, setpoint_target)
+
+    if get(EV.is_charging, False):
+        log.warning("setpoint adjusted to -20 since EV is charging")
+        setpoint = -20
+
+    set(Grid.power_setpoint, setpoint)
 
 
 @state_trigger(Victron.inverter_mode_input_select)
@@ -53,11 +104,12 @@ def publish_mqtt_on_input_select_change():
             retain=True,
         )
 
+
 moving_averages = {}
 
+
 def update_moving_average_power(
-    state_name, factor=0.1, avg_state_name=None, new_val=None, slack: int | float = None,
-    decimals=2, **attributes
+    state_name, factor=0.1, avg_state_name=None, new_val=None, slack: int | float = None, decimals=2, **attributes
 ):
     """Set the average power of the Victron inverter."""
     power_now = new_val or get(state_name, None, mapper=float)
@@ -68,7 +120,7 @@ def update_moving_average_power(
             slack = None
             prev_power = power_now
         avg_power = moving_averages.get(avg_state_name, prev_power)
-        a, b = 1-factor, factor
+        a, b = 1 - factor, factor
         update = a * avg_power + b * power_now
         moving_averages[avg_state_name] = update
         # log.warning(f"set {avg_state_name} power: {update}")
@@ -84,9 +136,7 @@ def set_average_power():
     """Set the average power of the Victron inverter."""
 
     update_moving_average_power("sensor.victron_dc_power", 0.01, **power_kw_attributes, decimals=3, slack=0.05)
-    update_moving_average_power(
-        "sensor.victron_battery_power", 0.01, **power_kw_attributes, decimals=3, slack=0.05
-    )
+    update_moving_average_power("sensor.victron_battery_power", 0.01, **power_kw_attributes, decimals=3, slack=0.05)
 
 
 @time_trigger
@@ -103,7 +153,7 @@ def set_victron_efficiency():
     else:
         efficiency = round(dc_power / battery_power * 100, 4)
     # outlier filtering
-    if max(abs(dc_power), abs(battery_power)) < 50 or efficiency < 50:
+    if efficiency < 10 or efficiency > 100:
         return
     # log.warning(f"efficiency: {efficiency}")
     update_moving_average_power(
@@ -113,7 +163,7 @@ def set_victron_efficiency():
         efficiency,
         unit_of_measurement="%",
         state_class="measurement",
-        slack=1
+        slack=1,
     )
 
 
@@ -127,13 +177,6 @@ def set_victron_power():
     if dc_power == -1 or battery_power == -1:
         return
     power = abs(dc_power - battery_power)
-    # log.warning(f"dc power {dc_power} battery power {battery_power} power: {power}")
     update_moving_average_power(
-        Victron.inverter_power,
-        0.1,
-        Victron.inverter_power,
-        power * 1000,
-        unit_of_measurement="W",
-        state_class="measurement",
-        slack=5,
+        Victron.inverter_power, 0.1, Victron.inverter_power, power * 1000, slack=5, **power_w_attributes
     )
