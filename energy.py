@@ -656,14 +656,44 @@ def gaussian(x, mean, std):
 
 
 @pyscript_compile
-def map_setpoint(setpoint, price, prices_mean, prices_std, max_feedin=4000, setpoint_spread=1, min_setpoint=-20):
-    prices_std = max(0.1, prices_std)
+def map_setpoint(
+    setpoint,
+    price,
+    prices_mean,
+    prices_std,
+    battery_energy,
+    battery_min_limit,
+    pv_power,
+    house_power,
+    max_feedin=4000,
+    setpoint_spread=1,
+    min_setpoint=-20,
+):
+    price = price * 100
+    prices_mean = prices_mean * 100
+    prices_std = prices_std * 100
+
+    prices_std = max(5, prices_std)
+
     if price > prices_mean + prices_std:
         price = prices_mean + prices_std
 
-    gaus_prob = gaussian(price, prices_mean + prices_std, setpoint_spread * 2 * prices_std)
+    mean = prices_mean + prices_std
+    std = setpoint_spread * prices_std
 
-    setpoint = gaus_prob * setpoint / 0.4
+    max_prob = gaussian(mean, mean, std)
+    gaus_prob = gaussian(price, mean, std) / max_prob
+
+    # print(f"p: {gaus_prob:.2f} price: {price:.2f} mean: {mean:.2f} std: {std:.2f} spread {setpoint_spread:.2f}")
+
+    setpoint = gaus_prob * setpoint
+
+    # quadratically going from 1 to 0 from battery_min_limit + 2 to battery_min_limit
+    if battery_energy < battery_min_limit + 2:
+        new_setpoint = setpoint * ((battery_energy - battery_min_limit) / 2) ** 4
+        if pv_power > house_power:
+            new_setpoint = max(setpoint, min(new_setpoint, -pv_power + house_power))
+        setpoint = new_setpoint
     return max(-max_feedin, min(min_setpoint, setpoint))
 
 
@@ -676,6 +706,8 @@ def forecast_setpoint(
     forecast_dampening=0.8,
     battery_energy: float = 2.0,
     setpoint_spread=1,
+    battery_min_energy: float = 2,
+    battery_charge_limit: float = 10000,
 ):
     t_now = now()
 
@@ -718,7 +750,18 @@ def forecast_setpoint(
         start: datetime = entry.period_start
         power_production: float = entry.pv_estimate * forecast_dampening * 1000
 
-        this_setpoint = map_setpoint(setpoint, price, prices_mean, prices_std, feed_in_limit, setpoint_spread)
+        this_setpoint = map_setpoint(
+            setpoint,
+            price,
+            prices_mean,
+            prices_std,
+            max(0, battery_energy + accumulated_energy),
+            battery_min_energy,
+            power_production,
+            daily_power if 7 < start.hour < 19 else nightly_power,
+            feed_in_limit,
+            setpoint_spread,
+        )
 
         house_power = daily_power if 7 < start.hour < 19 else nightly_power
         power_draw = house_power - this_setpoint
@@ -739,10 +782,12 @@ def forecast_setpoint(
             else:
                 continue
 
-        accumulated_energy += energy_production - energy_use
+        net_energy = energy_production - energy_use
+        max_intake = battery_charge_limit / 1000 * period_hours
+        accumulated_energy += min(max_intake, net_energy)
         new_battery_energy = min(battery_capacity, battery_energy + accumulated_energy)
 
-        feedin = 0
+        feedin = 0 if net_energy < max_intake else net_energy - max_intake
         if new_battery_energy == battery_capacity:
             feedin = max(0, power_production - power_draw)
 
@@ -861,7 +906,7 @@ def get_forecast_with_prices(t_start: datetime, t_end: datetime, epex_prices: li
 
 @time_trigger("period(now, 30sec)")
 @state_trigger(f"{Automation.auto_setpoint} == 'on' or {Grid.max_feedin_target} or {Grid.max_pv_feedin_target}")
-def auto_setpoint_target_update():
+def auto_setpoint_target():
     # if not get(Automation.auto_setpoint, False):
     #     return
     t_now = now()
@@ -870,12 +915,10 @@ def auto_setpoint_target_update():
     max_feedin_limit = get(Grid.max_feedin_target, 4000)
     max_pv_feedin = get(Grid.max_pv_feedin_target, 4000)
 
-    high_battery_power_threshold = 4000
-
     forecast_dampening = 0.9  # dampen the forecast to account for inaccuracies
     battery_min_energy = 2
     battery_energy = get(Battery.energy, 0)
-    min_feedin_price = 0.08
+    min_feedin_price = 0
 
     battery_capacity = get(Battery.capacity, 0)
 
@@ -901,24 +944,16 @@ def auto_setpoint_target_update():
             forecast_dampening=forecast_dampening,
             battery_energy=current_battery_energy,
             setpoint_spread=setpoint_spread,
+            battery_min_energy=battery_min_energy,
         )
 
-    # if (res := forecast_setpoint_local(forecast, -20)).max_feedin < 100 or surplus <= 0:
-    #     log.warning(
-    #         f"No significant feedin expected, setting setpoint target to -20: {replace(res, detail=None)}"
-    #         + "\n"
-    #         + "\n ".join([entry.format() for entry in res.detail[:10][::-1]])
-    #     )
-    #     return set(Grid.power_setpoint_target, -20, detail=res.detail)
 
-    accuracy = 10  # Desired accuracy in watts
-
-    # log_msg = ""
+    accuracy = 100  # Desired accuracy in watts
 
     # Binary search for optimal setpoint
     current_battery_energy = battery_energy
 
-    def setpoint_binary_search(forecast, min_setpoint=-max_feedin_limit, max_setpoint=-20, setpoint_spread=0.1):
+    def setpoint_binary_search(forecast, min_setpoint=-max_feedin_limit, max_setpoint=-20, setpoint_spread=1):
         search_results = []
         for itr in range(20):
             mid_setpoint = (min_setpoint + max_setpoint) // 2
@@ -930,7 +965,7 @@ def auto_setpoint_target_update():
                 current_battery_energy,
             )
             search_results.append(r)
-            if r.min_bat < battery_min_energy:
+            if r.min_bat < battery_min_energy + 1:
                 # If battery is too low, we need a more positive setpoint
                 min_setpoint = mid_setpoint
             elif r.max_feedin > max_pv_feedin / 2:
@@ -944,78 +979,91 @@ def auto_setpoint_target_update():
                 break
         return search_results
 
-    def price_setpoint_spread_search(
-        forecast, setpoint, battery_energy, setpoint_spread=0.2, t_start=None, t_end=None, max_iters=10
+    @pyscript_compile
+    async def price_setpoint_spread_search(
+        forecast,
+        setpoint,
+        battery_energy,
+        forecast_fn,
+        setpoint_spread=1,
+        t_start=None,
+        t_end=None,
+        max_iters=10,
+        max_feedin_limit=500,
     ):
         """Search for the optimal setpoint spread depending on feedin price."""
+        print(f"Searching for setpoint spread for {t_start} to {t_end} with setpoint {setpoint:.0f} and spread {setpoint_spread:.2f}")
 
         for itr in range(max_iters):
-            # the update factor quadratically decreases from 1.5 to 1.05
-            update_factor = 1 + (1.5 - 1) * (1 - (itr / max_iters) ** 0.5)
+            # the update factor decreases to 1.0 over time
+            update_factor = 1 + 1 * (1 - (itr / max_iters))
 
-            r = forecast_setpoint_local(forecast, setpoint, setpoint_spread, battery_energy, t_start, t_end)
+            r = await forecast_fn(forecast, setpoint, setpoint_spread, battery_energy, t_start, t_end)
 
-            high_battery_power = next(
-                iter([el.battery_power for el in r.detail if abs(el.battery_power) > high_battery_power_threshold]),
-                False,
-            )
-
-            if r.min_bat < battery_min_energy:
-                setpoint_spread *= 1 / update_factor
-                setpoint *= 1 / update_factor
-
-            if r.max_feedin > 2000:
+            if r.max_feedin > max_feedin_limit:
                 setpoint_spread *= update_factor
-                setpoint *= update_factor
-
             else:
-                if high_battery_power:
-                    setpoint_spread *= update_factor
-                    setpoint *= update_factor
-                else:
-                    break
+                setpoint_spread /= update_factor
 
-        return replace(r, setpoint=setpoint, setpoint_spread=setpoint_spread)
+            print(f"itr {itr} - setpoint {setpoint:.0f} with spread {setpoint_spread:.2f} min_bat: {r.min_bat:.1f} max_feedin: {r.max_feedin:.1f}")
+
+        return replace(r, setpoint_spread=setpoint_spread)
 
     epex_prices = get_attr(ElectricityPrices.epex_forecast_prices, "data", [])
 
     forecast = get_forecast_with_prices(t_start=t_now, t_end=t_now + timedelta(hours=24), epex_prices=epex_prices)
 
-    search_results = setpoint_binary_search(forecast, -max_feedin_limit, -20, setpoint_spread=0.2)
+    search_results = setpoint_binary_search(
+        forecast,
+        min_setpoint=-max_feedin_limit,
+        max_setpoint=-20,
+        setpoint_spread=1,
+    )
+
     setpoint_result = search_results[-1]
-    t_start = t_now
+    if setpoint_result.min_bat < battery_min_energy:
+        setpoint_result = forecast_setpoint_local(forecast, -20, 1, current_battery_energy)
+    
+    t_start = t_now 
     t_end = t_now + timedelta(hours=24)
     start_battery_energy = battery_energy
-    for _ in range(4):
+    for itr in range(4):
         t_max_feedin = t_min_bat = None
         setpoint_forecast = [e for e in setpoint_result.detail if t_start <= e.period_start <= t_end]
-        t_max_feedin = next(iter([e.period_start for e in setpoint_forecast if e.feedin > max_feedin_limit]), None)
+        # t_max_feedin = next(iter([e.period_start for e in setpoint_forecast if e.feedin > max_feedin_limit]), None)
+        feedins = [(idx, e.feedin) for idx, e in enumerate(setpoint_forecast) if e.feedin > max_feedin_limit and e.period_start.day == t_start.day]
+        if len(feedins) > 0:
+            idx, t_max_feedin = max(feedins, key=lambda x: x[1])
+            t_max_feedin = setpoint_forecast[idx].period_start
+        else:
+            t_max_feedin = None
 
         if t_max_feedin is not None:
-            log.warning(f"t_max_feedin: {t_max_feedin}")
-            t_end = t_max_feedin + timedelta(hours=1)
-            t_min_bat = next(
-                iter(
-                    [
-                        e.period_start
-                        for e in setpoint_forecast
-                        if e.battery_energy < (battery_min_energy + 1) and e.period_start < t_end
-                    ]
-                ),
-                None,
+            feedins = {e.period_start: e.feedin for e in setpoint_forecast if t_start < e.period_start < t_end}
+
+            t_feedin_stop = next(
+                iter([t for t, f in feedins.items() if f < max_feedin_limit / 5 and t > t_max_feedin and t.day == t_max_feedin.day]),
+                t_max_feedin,
             )
+
+            t_end = t_feedin_stop
+            bat_energies = [(e.period_start, e.battery_energy) for e in setpoint_forecast if e.period_start < t_end]
+            t_min_bat = min(bat_energies, key=lambda x: x[1])[0]
+
             if t_min_bat is not None:
-                t_start = t_min_bat  # + timedelta(hours=1)
+                t_start = next(iter([e.period_start for e in setpoint_forecast if e.period_start >= t_min_bat and e.battery_energy > battery_min_energy + 1]), t_start)
             else:
                 t_start = setpoint_result.t_max_feedin - timedelta(hours=4)
+
+            setpoint = setpoint_result.setpoint - (sum(feedins.values()) / len(feedins) * 2 if len(feedins) > 0 else 0)
         else:
             t_end = t_now + timedelta(hours=24)
+            setpoint = setpoint_result.setpoint
 
         if (t_end - t_start) < timedelta(hours=1):
-            log.warning(f" too short time: {t_start} to {t_end}")
             break
 
-        log.warning(f"checking setpoint for {t_start} to {t_end}")
+        # log.warning(f"checking setpoint for {t_start.strftime('%H:%M')} to {t_end.strftime('%H:%M')} with mean feedin of { -setpoint:.0f} W")
 
         start_battery_energy = next(
             iter([e.battery_energy for e in setpoint_result.detail if e.period_start >= t_start]), start_battery_energy
@@ -1023,44 +1071,50 @@ def auto_setpoint_target_update():
 
         new_setpoint_result = price_setpoint_spread_search(
             forecast,
-            setpoint_result.setpoint,
+            setpoint,
             start_battery_energy,
-            setpoint_spread=setpoint_result.setpoint_spread,
+            forecast_fn=forecast_setpoint_local,
+            setpoint_spread=1,
             t_start=t_start,
             t_end=t_end,
+            max_feedin_limit=max_feedin_limit,
         )
+        # log.warning(
+        #     f"itr {itr} - now {t_now.strftime('%d-%H:%M')}  start {t_start.strftime('%d-%H:%M')} to {t_end.strftime('%d-%H:%M')}: setpoint {new_setpoint_result.setpoint:.0f} with spread {new_setpoint_result.setpoint_spread:.2f} "
+        # )
 
-        if t_start == t_now:
+        if (t_start - t_now) < timedelta(minutes=30):
             setpoint_result = new_setpoint_result
         else:
             setpoint_result = merge_setpoint_results(setpoint_result, new_setpoint_result, t_start)
 
         t_start = t_end + timedelta(minutes=1)
         t_end = t_now + timedelta(hours=24)
-
+    
     price = max(min_feedin_price, get(ElectricityPrices.epex_forecast_prices, min_feedin_price))
+
+    pv_power_total = get(PVProduction.total_power, 0)
+    house_power = get(House.loads, 0)
 
     setpoint = map_setpoint(
         setpoint_result.setpoint,
         price,
         setpoint_result.prices_mean,
         setpoint_result.prices_std,
+        battery_energy,
+        battery_min_energy,
+        pv_power_total,
+        house_power,
         max_feedin_limit,
         setpoint_result.setpoint_spread,
     )
 
     log.warning(
-        f"Mapped setpoint: {setpoint_result.setpoint} to {setpoint} with spread {setpoint_result.setpoint_spread} "
+        f"Mapped setpoint: {setpoint_result.setpoint:.0f} to {setpoint} with spread {setpoint_result.setpoint_spread} "
         f"price now {price:.2f} mean {setpoint_result.prices_mean:.2f} price std {setpoint_result.prices_std:.2f} "
         f"min_bat {setpoint_result.min_bat:.1f} at {setpoint_result.t_min_bat.strftime('%H:%M')} "
     )
 
-    # log_msg += (
-    #     f"\n\t -> calculated setpoint at {setpoint} with min batt {r.min_bat:.1f} at {r.t_max_bat.strftime('%H:%M')} "
-    #     f"max batt {r.max_bat:.1f} at {r.t_max_bat.strftime('%H:%M')} max feedin {r.max_feedin:.0f} at {r.t_max_feedin.strftime('%H:%M')}"
-    # )
-
-    # current_setpoint = get(Grid.power_setpoint, 0)
 
     # Print setpoint results in tablular format (without forecast details)
     lines = []
@@ -1072,19 +1126,13 @@ def auto_setpoint_target_update():
         return f"{k:.0f}"
 
     lines = [
-        f"{str(r.setpoint):>{7}}{r.setpoint_spread:9.1f}{r.min_bat:9.1f}{'':6s}{ft(r.t_min_bat):10s}{r.max_bat:5.1f}{'':6s}{ft(r.t_max_bat):12s}{fi(r.max_feedin):12s}{ft(r.t_max_feedin):10s}"
+        f"{r.setpoint:.0f}   {r.setpoint_spread:8.3f}{r.min_bat:9.1f}{'':6s}{ft(r.t_min_bat):10s}{r.max_bat:5.1f}{'':6s}{ft(r.t_max_bat):12s}{fi(r.max_feedin):12s}{ft(r.t_max_feedin):10s}"
         for r in [*search_results, setpoint_result]
     ]
     log.warning(
         f"Setpoint results:\n{'setpoint':<11s}{'spread':<10s}{'min_bat':<10s}{'t_min_bat':<11s}{'max_bat':<11s}{'t_max_bat':<11s}{'max_feedin':<11s}{'t_max_feedin':<10s}\n"
         + "\n".join(lines)
     )
-
-    # detail = []
-    # for setpoint_result in setpoint_results:
-    #     for entry in setpoint_result.detail:
-    #         if len(detail) == 0 or entry.period_start > detail[-1].period_start:
-    #             detail.append(entry)
 
     set(
         Grid.power_setpoint_target,
