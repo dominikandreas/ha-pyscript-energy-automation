@@ -12,14 +12,14 @@ if TYPE_CHECKING:
 
     # These are provided by typescript and do not need to be imported in the actual script
     # They are only needed for type checking (linting), which development easier
-    from modules.utils import log, now, time_trigger, with_timezone, state_active, state_trigger, service, task, set
+    from modules.utils import log, now, time_trigger, with_timezone, state_active, state_trigger, service, task, set_state
 
     from modules.states import Automation, Charger, ElectricityPrices, EV, Excess, Battery, House, PVProduction
     from modules.victron import Victron
 
 else:
     from const import EV as Const
-    from utils import clip, get, set, get_attr, now, with_timezone
+    from utils import clip, get, set_state, get_attr, now, with_timezone
     from states import Automation, Charger, ElectricityPrices, EV, Excess, Battery, House, PVProduction
     from victron import Victron
 
@@ -58,7 +58,7 @@ def smart_charge_limit():
         else:
             smart_charge_limit = 85
 
-    set(EV.smart_charge_limit, smart_charge_limit)
+    set_state(EV.smart_charge_limit, smart_charge_limit)
 
 
 def get_ev_requested_energy_today():
@@ -114,12 +114,12 @@ def ev_energy():
     """Calculate the energy needed to charge the EV to the required state of charge"""
     current_soc = get(EV.soc, 0)
     ev_energy = (current_soc) / 100 * Const.ev_capacity
-    set(EV.energy, ev_energy)
+    set_state(EV.energy, ev_energy)
 
 
 @state_trigger(f"{Charger.force_charge}.lower() == 'on'")
 def enable_force_charge():
-    set(Charger.control_switch, True)
+    set_state(Charger.control_switch, True)
     set_phases_and_current(3, 16, "Force charge enabled, setting max power")
 
 

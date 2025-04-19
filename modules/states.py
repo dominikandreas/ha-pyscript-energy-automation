@@ -50,6 +50,7 @@ class Battery:
     charge_limit = "input_number.victron_charge_power_limit"
     """The charge power limit of the battery"""
     power = "sensor.victron_battery_power"
+    """The current power of the battery (positive when charging, negative when discharging)."""
 
 
 class Charger:

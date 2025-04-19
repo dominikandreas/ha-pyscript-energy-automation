@@ -11,14 +11,14 @@ class State:
 if TYPE_CHECKING:
     # the type checker (linter) does not know that utils can directly be imported in the pyscript engine.
     # Therefore during type checking we pretend to import them from modules.utils, which it can resolve.
-    from modules.utils import get, set
+    from modules.utils import get, set_state
 
     # These are provided by typescript and do not need to be imported in the actual script
     # They are only needed for type checking (linting), which development easier
     from modules.utils import time_trigger
 
 else:
-    from utils import get, set
+    from utils import get, set_state
 
 
 @time_trigger
@@ -29,7 +29,7 @@ def garage_energy():
         return
 
     garage_energy = sum(energies)
-    set(
+    set_state(
         State.garage_pv_energy,
         round(garage_energy, 2),
         state_class="total_increasing",
@@ -48,7 +48,7 @@ def garage_energy_today():
         return
 
     garage_energy = sum(energies) / 1000
-    set(
+    set_state(
         State.garage_pv_energy_today,
         round(garage_energy, 2),
         state_class="total",
@@ -66,7 +66,7 @@ def shed_pv_energy_today():
     if daily_yield == -1:
         return
 
-    set(
+    set_state(
         State.shed_pv_energy_today,
         round(daily_yield / 1000, 2),
         state_class="total",

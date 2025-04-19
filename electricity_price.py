@@ -4,16 +4,16 @@ from typing import TYPE_CHECKING
 if not TYPE_CHECKING:
     # pyscript providese these imports from the subfolder modules directly
     from states import EV, ElectricityPrices
-    from utils import now, set
+    from utils import now, set_state
 else:
     # The type checker (linter) does not know that utils can directly be imported in the pyscript engine.
     from modules.states import EV, ElectricityPrices
-    from modules.utils import now, set, time_trigger, log
+    from modules.utils import now, set_state, time_trigger, log
 
 
 @time_trigger
 async def set_pv_opportunistic_price():
-    set(EV.pv_opportunistic_price, 0.08, unit_of_measurement="EUR/kWh")
+    set_state(EV.pv_opportunistic_price, 0.08, unit_of_measurement="EUR/kWh")
 
 
 @time_trigger
@@ -45,7 +45,7 @@ async def set_prices():
 
     log.warning(f"{t.hour}:{t.minute} current price: {price}€")
 
-    set(
+    set_state(
         ElectricityPrices.current_price,
         price,
         unit_of_measurement="EUR/kWh",
@@ -56,8 +56,8 @@ async def set_prices():
     )
 
     if price < 0.2:
-        set(ElectricityPrices.low_price, "on")
-        set(ElectricityPrices.high_price, "off")
+        set_state(ElectricityPrices.low_price, "on")
+        set_state(ElectricityPrices.high_price, "off")
     else:
-        set(ElectricityPrices.low_price, "off")
-        set(ElectricityPrices.high_price, "on")
+        set_state(ElectricityPrices.low_price, "off")
+        set_state(ElectricityPrices.high_price, "on")

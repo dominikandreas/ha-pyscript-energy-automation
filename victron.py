@@ -7,11 +7,11 @@ if TYPE_CHECKING:
     # These are provided by typescript and do not need to be imported in the actual script
     # They are only needed for type checking (linting), which development easier
     from modules.states import EV, Automation, Battery, Charger, Excess, Grid, House, PVForecast  # noqa
-    from modules.utils import get, log, service, set, state, state_trigger, time_trigger
+    from modules.utils import get, log, service, set_state, state, state_trigger, time_trigger
     from modules.victron import Victron
 else:
     from states import EV, Automation, Battery, Charger, Excess, Grid, House, PVForecast  # noqa
-    from utils import get, set
+    from utils import get, set_state
 
     from victron import Victron
 
@@ -83,7 +83,7 @@ def auto_apply_setpoint():
         log.warning("setpoint adjusted to -20 since EV is charging")
         setpoint = -20
 
-    set(Grid.power_setpoint, setpoint)
+    set_state(Grid.power_setpoint, setpoint)
 
 
 @state_trigger(Victron.inverter_mode_input_select)
@@ -127,7 +127,7 @@ def update_moving_average_power(
         if slack is not None and abs(prev_power - power_now) <= slack:
             return
         # log.info(f"{avg_state_name}: slack  {abs(prev_power - power_now):.3f} > {slack:2.2f} : {prev_power:.3f}-> {update:.3f}")
-        set(avg_state_name, round(update, decimals), **attributes)
+        set_state(avg_state_name, round(update, decimals), **attributes)
 
 
 @time_trigger

@@ -260,7 +260,7 @@ class OutputStateRegistry:
 
 output_state_registry = OutputStateRegistry()
 
-async def set(id: str, value, **attributes):
+async def set_state(id: str, value, **attributes):
     state.set(id, value)  # type: ignore # noqa: F821
     if attributes:
         output_state_registry.set(id, attributes)

@@ -11,11 +11,12 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     # The type checker (linter) does not know that utils can directly be imported in the pyscript engine.
     # Therefore during type checking we pretend to import them from modules.utils, which it can resolve.
-    from modules.utils import clip, get, get_attr, set, service
+    from modules.utils import clip, get, get_attr, service, set_state
     from modules.const import EV as EVConst
 
-    # These are provided by typescript and do not need to be imported in the actual script
-    # They are only needed for type checking (linting), which development easier
+    # These are provided pyscript and defined for type inference only. They do not need to
+    # (or rather must not) be imported in the actual script. They are only needed for type
+    # checking (linting), which makes development easier
     from modules.utils import (
         log,
         now,
@@ -41,7 +42,7 @@ if TYPE_CHECKING:
 
 else:
     from const import EV as EVConst
-    from utils import clip, get, get_attr, now, set, with_timezone
+    from utils import clip, get, get_attr, now, set_state, with_timezone
     from states import (
         Automation,
         Battery,
@@ -103,7 +104,7 @@ def update_battery_charge_discharge_times(battery_capacity, battery_energy, powe
     else:
         result = 48
 
-    set(Battery.time_until_charged, round(result, 2), **energy_kwh_attributes)
+    set_state(Battery.time_until_charged, round(result, 2), **energy_kwh_attributes)
 
     required_for_empty = battery_energy
     if power < 0:
@@ -112,7 +113,7 @@ def update_battery_charge_discharge_times(battery_capacity, battery_energy, powe
     else:
         result = 48
 
-    set(Battery.time_until_discharged, round(result, 2), **energy_kwh_attributes)
+    set_state(Battery.time_until_discharged, round(result, 2), **energy_kwh_attributes)
 
 
 @time_trigger
@@ -159,7 +160,7 @@ def upcoming_demand():
     # log.warning(f"ongoing drive {ongoing_drive} planned_leaving_soon {planned_leave_soon} required charge {required_charge:.0f} expected consumption {expected_consumption} wash {washing_energy}")
     ev_energy = required_charge + expected_consumption
 
-    set(
+    set_state(
         House.upcoming_demand,
         round(ev_energy + washing_energy, 2),
         **energy_kwh_attributes,
@@ -193,7 +194,7 @@ def house_energy_until_production_meets_demand():
 
     log.info(f"House energy until production meets demand: {total_energy:.2f} kWh")
 
-    set(
+    set_state(
         House.energy_demand,
         f"{total_energy:.2f}",
         **energy_kwh_attributes,
@@ -218,7 +219,7 @@ def excess_power_1m_average():
     excess = get(Excess.power, default=0)
     excess_avg = get(Excess.power_1m_average, default=0)
     excess_avg = round(0.9 * excess_avg + 0.1 * excess, 2)
-    set(
+    set_state(
         Excess.power_1m_average,
         f"{excess_avg:.2f}",
         **power_kw_attributes,
@@ -232,7 +233,7 @@ def grid_1m_average():
     grid_now = get(Grid.power_ac, default=0)  # in kW
     grid_avg = get(Grid.power_1m_average, default=grid_now)
     grid_avg = round(0.8 * grid_avg + 0.2 * grid_now, 2)
-    set(
+    set_state(
         Grid.power_1m_average,
         grid_avg,
         **power_kw_attributes,
@@ -291,10 +292,10 @@ def auto_victron_set_inverter_mode():
             f"Enabling force charge switch and setting charge limit, {battery_soc} < {target_soc}, < {charge_limit}"
         )
         service.call("switch", "turn_on", entity_id=Battery.force_charge_switch)
-        set(Battery.charge_limit, 1550)
+        set_state(Battery.charge_limit, 1550)
     elif get(Battery.force_charge_switch, False):
         log.warning("Disabling force charge switch and resetting charge limit")
-        set(Battery.charge_limit, -1)
+        set_state(Battery.charge_limit, -1)
         service.call("switch", "turn_off", entity_id=Battery.force_charge_switch)
 
     new_mode = Victron.PAYLOAD_TO_MODE.get(new_mode)
@@ -306,7 +307,7 @@ def auto_victron_set_inverter_mode():
             f"pv_power: {pv_power}, min_charge_power {min_charge_power} daily_avg_power {daily_avg_power}"
         )
 
-    set(Victron.inverter_mode_input_select, value=new_mode)
+    set_state(Victron.inverter_mode_input_select, value=new_mode)
 
 
 @time_trigger
@@ -362,7 +363,7 @@ def battery_use_until_pv_meets_demand():
 
     log.info(f"battery use until pv meets demand: {result}")
 
-    set(
+    set_state(
         Battery.use_until_pv_meets_demand,
         round(result, 3),
         **energy_kwh_attributes,
@@ -424,18 +425,18 @@ def auto_battery_target_soc():
         0 if surplus > 0 else min(battery_capacity, battery_energy - surplus),
     )
 
-    set(Automation.req_energy, round(req_energy, 2), **energy_kwh_attributes)
+    set_state(Automation.req_energy, round(req_energy, 2), **energy_kwh_attributes)
 
     max_soc = 95 if battery_cells_balanced else 100
 
     minimal_soc = min(max_soc, (max(0, req_energy) / battery_capacity * 100) + reserve_soc)
-    set(Automation.minimal_soc, round(minimal_soc, 2), unit_of_measurement="%")  # different attributes
+    set_state(Automation.minimal_soc, round(minimal_soc, 2), unit_of_measurement="%")  # different attributes
 
     # prevent discharging of the battery if the EV is charging and insufficient surplus
     result_soc = max(battery_soc + 1, minimal_soc) if ev_is_charging and surplus < 1 else minimal_soc
 
     print(f"auto battery target soc: {result_soc}")
-    set(
+    set_state(
         Automation.battery_target_soc,
         round(result_soc, 2),
         unit_of_measurement="%",  # different attributes
@@ -486,7 +487,7 @@ async def auto_excess_target():
                 else:
                     log.warning(f"Updating excess target from {power} to {pv_power - 2000}W because EV is charging")
                     power = max(power, pv_power - 2000)
-    set(
+    set_state(
         Excess.target,
         round(power / 1000, 2),
         **power_kw_attributes,
@@ -501,7 +502,7 @@ def battery_energy():
     if battery_capacity == 0 or battery_soc == -1:
         return
 
-    set(
+    set_state(
         Battery.energy,
         round(battery_soc / 100 * battery_capacity, 2),
         **energy_kwh_attributes,
@@ -552,7 +553,7 @@ def calculate_energy_surplus():
         f"\n\t remaining_next_three_days {remaining_next_three_days:.1f} - surplus_energy_target = {remaining_next_three_days - surplus_energy_target:.1f}"
     )
 
-    set(
+    set_state(
         House.energy_surplus,
         round(result, 2),
         **energy_kwh_attributes,
@@ -947,7 +948,6 @@ def auto_setpoint_target():
             battery_min_energy=battery_min_energy,
         )
 
-
     accuracy = 100  # Desired accuracy in watts
 
     # Binary search for optimal setpoint
@@ -992,7 +992,9 @@ def auto_setpoint_target():
         max_feedin_limit=500,
     ):
         """Search for the optimal setpoint spread depending on feedin price."""
-        print(f"Searching for setpoint spread for {t_start} to {t_end} with setpoint {setpoint:.0f} and spread {setpoint_spread:.2f}")
+        print(
+            f"Searching for setpoint spread for {t_start} to {t_end} with setpoint {setpoint:.0f} and spread {setpoint_spread:.2f}"
+        )
 
         for itr in range(max_iters):
             # the update factor decreases to 1.0 over time
@@ -1005,7 +1007,9 @@ def auto_setpoint_target():
             else:
                 setpoint_spread /= update_factor
 
-            print(f"itr {itr} - setpoint {setpoint:.0f} with spread {setpoint_spread:.2f} min_bat: {r.min_bat:.1f} max_feedin: {r.max_feedin:.1f}")
+            print(
+                f"itr {itr} - setpoint {setpoint:.0f} with spread {setpoint_spread:.2f} min_bat: {r.min_bat:.1f} max_feedin: {r.max_feedin:.1f}"
+            )
 
         return replace(r, setpoint_spread=setpoint_spread)
 
@@ -1023,15 +1027,19 @@ def auto_setpoint_target():
     setpoint_result = search_results[-1]
     if setpoint_result.min_bat < battery_min_energy:
         setpoint_result = forecast_setpoint_local(forecast, -20, 1, current_battery_energy)
-    
-    t_start = t_now 
+
+    t_start = t_now
     t_end = t_now + timedelta(hours=24)
     start_battery_energy = battery_energy
     for itr in range(4):
         t_max_feedin = t_min_bat = None
         setpoint_forecast = [e for e in setpoint_result.detail if t_start <= e.period_start <= t_end]
         # t_max_feedin = next(iter([e.period_start for e in setpoint_forecast if e.feedin > max_feedin_limit]), None)
-        feedins = [(idx, e.feedin) for idx, e in enumerate(setpoint_forecast) if e.feedin > max_feedin_limit and e.period_start.day == t_start.day]
+        feedins = [
+            (idx, e.feedin)
+            for idx, e in enumerate(setpoint_forecast)
+            if e.feedin > max_feedin_limit and e.period_start.day == t_start.day
+        ]
         if len(feedins) > 0:
             idx, t_max_feedin = max(feedins, key=lambda x: x[1])
             t_max_feedin = setpoint_forecast[idx].period_start
@@ -1042,7 +1050,13 @@ def auto_setpoint_target():
             feedins = {e.period_start: e.feedin for e in setpoint_forecast if t_start < e.period_start < t_end}
 
             t_feedin_stop = next(
-                iter([t for t, f in feedins.items() if f < max_feedin_limit / 5 and t > t_max_feedin and t.day == t_max_feedin.day]),
+                iter(
+                    [
+                        t
+                        for t, f in feedins.items()
+                        if f < max_feedin_limit / 5 and t > t_max_feedin and t.day == t_max_feedin.day
+                    ]
+                ),
                 t_max_feedin,
             )
 
@@ -1051,7 +1065,16 @@ def auto_setpoint_target():
             t_min_bat = min(bat_energies, key=lambda x: x[1])[0]
 
             if t_min_bat is not None:
-                t_start = next(iter([e.period_start for e in setpoint_forecast if e.period_start >= t_min_bat and e.battery_energy > battery_min_energy + 1]), t_start)
+                t_start = next(
+                    iter(
+                        [
+                            e.period_start
+                            for e in setpoint_forecast
+                            if e.period_start >= t_min_bat and e.battery_energy > battery_min_energy + 1
+                        ]
+                    ),
+                    t_start,
+                )
             else:
                 t_start = setpoint_result.t_max_feedin - timedelta(hours=4)
 
@@ -1090,7 +1113,7 @@ def auto_setpoint_target():
 
         t_start = t_end + timedelta(minutes=1)
         t_end = t_now + timedelta(hours=24)
-    
+
     price = max(min_feedin_price, get(ElectricityPrices.epex_forecast_prices, min_feedin_price))
 
     pv_power_total = get(PVProduction.total_power, 0)
@@ -1115,7 +1138,6 @@ def auto_setpoint_target():
         f"min_bat {setpoint_result.min_bat:.1f} at {setpoint_result.t_min_bat.strftime('%H:%M')} "
     )
 
-
     # Print setpoint results in tablular format (without forecast details)
     lines = []
 
@@ -1134,7 +1156,7 @@ def auto_setpoint_target():
         + "\n".join(lines)
     )
 
-    set(
+    set_state(
         Grid.power_setpoint_target,
         setpoint,
         **power_w_attributes,

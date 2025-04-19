@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from .utils import log, service, state
 
-from utils import set
+from utils import set_state
 
 
 class Victron:
@@ -49,4 +49,4 @@ class Victron:
         if not new_mode:
             raise ValueError(f"Invalid mode: {mode_or_payload}")
         log.warning(f"Inverter mode changed to {new_mode}")
-        set(Victron.inverter_mode_input_select, new_mode)
+        set_state(Victron.inverter_mode_input_select, new_mode)

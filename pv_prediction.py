@@ -5,12 +5,12 @@ from typing import TYPE_CHECKING
 
 if not TYPE_CHECKING:
     # pyscript providese these imports from the subfolder modules directly
-    from utils import now, set, get, get_attr
+    from utils import now, set_state, get, get_attr
     from states import House, PVForecast, PVProduction
 else:
     # The type checker (linter) does not know that utils can directly be imported in the pyscript engine.
     # Therefore during type checking we pretend to import them from modules.utils, which it can resolve.
-    from modules.utils import get, set, get_attr
+    from modules.utils import get, set_state, get_attr
 
     # These are provided by pscript and do not need to be imported in the actual script
     # They are only needed for type checking (linting), which development easier
@@ -38,8 +38,8 @@ def calculate_target_time_and_energy():
         energy_until_target = (time_to_reach_target - current_time).seconds / 3600 * house_demand
 
     log.info(f"Time to reach target: {time_to_reach_target}, Energy until target: {energy_until_target}")
-    set(PVProduction.next_meet_demand, time_to_reach_target)
-    set(
+    set_state(PVProduction.next_meet_demand, time_to_reach_target)
+    set_state(
         PVProduction.energy_until_production_meets_demand,
         energy_until_target,
         unit_of_measurement="kWh",
