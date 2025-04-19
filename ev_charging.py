@@ -3,6 +3,7 @@
 from datetime import timedelta
 from typing import TYPE_CHECKING
 
+
 if TYPE_CHECKING:
     # The type checker (linter) does not know that utils can directly be imported in the pyscript engine.
     # Therefore during type checking we pretend to import them from modules.utils, which it can resolve.
@@ -13,13 +14,13 @@ if TYPE_CHECKING:
     # They are only needed for type checking (linting), which development easier
     from modules.utils import log, now, time_trigger, with_timezone, state_active, state_trigger, service, task, set
 
-    from modules.states import Automation, Charger, ElectricityPrices, EV, Excess, Battery, House
+    from modules.states import Automation, Charger, ElectricityPrices, EV, Excess, Battery, House, PVProduction
     from modules.victron import Victron
 
 else:
     from const import EV as Const
     from utils import clip, get, set, get_attr, now, with_timezone
-    from states import Automation, Charger, ElectricityPrices, EV, Excess, Battery, House
+    from states import Automation, Charger, ElectricityPrices, EV, Excess, Battery, House, PVProduction
     from victron import Victron
 
 
@@ -234,6 +235,8 @@ async def auto_ev_charging():
     excess_power = get(Excess.power, 0)  # in kW
     battery_soc = get(Battery.soc, 0)
 
+    pv_total_power = get(PVProduction.total_power, 0)  # in W
+
     # target excess is the amount of power requested by the home battery to be able to cover the house loads in the near future
     # it is dynamically updated by a separate automation
     target_excess = get(Excess.target, 0)  # in kW
@@ -258,19 +261,17 @@ async def auto_ev_charging():
         return
 
     # next drive is the point in time where the user needs to have the car charged to the required soc
-    next_drive = get_attr(EV.planned_drives, "next_event")
     ongoing = get(EV.planned_drives, False)
+    next_drive = get_attr(EV.planned_drives, "next_event")
 
     if ongoing:
-        log.warning("Drive ongoing - skipping charging control")
-        return
+        next_drive = None  # if ongoing, next_drive is actually next_return, so we ignore it
 
-    if next_drive:
+    elif next_drive:
         next_drive = with_timezone(next_drive)
         hours_available_to_charge = (next_drive - now()).total_seconds() / 3600
     else:
-        # TODO: we need to track the point in time when the car was last used to track this default properly
-        hours_available_to_charge = 999  # Const.ev_days_allowed_to_reach_target * 24
+        hours_available_to_charge = 999
 
     # Calculate minimum time needed to charge the vehicle, we subtract 1 to account for charging inefficiencies
     min_hours_needed = energy_needed / (3 * VOLTAGE * (MAX_CURRENT - 1) / 1000)  # in hours
@@ -296,14 +297,14 @@ async def auto_ev_charging():
     #  -------------------------------------------------------------------------------------
 
     # if no more charging needed, turn off the charger
-    if current_soc >= required_soc and surplus_energy <= 1:
+    if current_soc > required_soc and surplus_energy <= 1:
         turn_off_charger(f"required SoC was reached, stopping charge with surplus of {surplus_energy:.0f}kWh")
     elif smart_limiter_active and current_soc >= smart_charge_limit:
         turn_off_charger(f"Smart charge limit of {smart_charge_limit} reached.")
     # Emergency charge, independently of price or excess power
     elif (
         hours_available_to_charge < 2 or hours_available_to_charge < min_hours_needed
-    ) and current_soc < required_soc - 1:
+    ) and current_soc < (required_soc - 1):
         set_phases_and_current(3, MAX_CURRENT, f"Emergency charge - SOC: {current_soc}% < Target: {required_soc}%")
         turn_on_charger(f"Emergency charge - SOC: {current_soc}% < Target: {required_soc}%")
     # Charge when price is low and not much time left (likely not possible to charge via excess)
@@ -322,7 +323,13 @@ async def auto_ev_charging():
             set_phases_and_current(3, MAX_CURRENT, "Charging at low price, no battery discharging")
         turn_on_charger(reason="Low price charging")
     # PV surplus charging, when sufficient excess is available and no time constraints
-    elif excess_power > target_excess and (surplus_energy > 5 or excess_power > 2 and battery_soc > 90):
+    elif (
+        excess_power > target_excess
+        and (surplus_energy > 5 or excess_power > 2 and battery_soc > 90)
+        and (  # prevent charging by discharging from battery when we can excess charge the next day
+            pv_total_power > 1000 or hours_available_to_charge < 24 and current_soc <= required_soc
+        )
+    ):
         available_power = (excess_power - target_excess) * 1000  # convert kW to W
         # Hysteresis logic with proper unit conversion (W->kW)
         min_3phase_power = 3 * VOLTAGE * MIN_CURRENT  # in W
@@ -379,6 +386,6 @@ async def auto_ev_charging():
             turn_off_charger("high electricity price and still time available")
 
     else:
-        return
+        turn_off_charger("None of the conditions for auto charging matched")
 
     log.warning(debug_info)
