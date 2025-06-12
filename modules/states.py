@@ -83,6 +83,8 @@ class EV:
     """The current state of charge of the EV battery (tesla integration)"""
     required_soc = "input_number.tesla_requried_soc"
     """The required state of charge of the EV battery for the next planned drive"""
+    capacity = 60
+    """The total capacity of the EV battery in kWh"""
     auto_soc_limit = "sensor.tesla_auto_soc_limit"
     """The automatic state of charge limit for the EV"""
     planned_drives = "schedule.tesla_planned_drives"
@@ -105,6 +107,8 @@ class EV:
     """The energy the EV needs until it is full"""
     smart_charge_limit = "sensor.tesla_smart_charge_limit"
     """The smart charge limit for the EV"""
+    energy_needed = "sensor.tesla_energy_needed"
+    """The energy needed for the next drive (set automatically)."""
 
 
 class House:
@@ -119,7 +123,7 @@ class House:
     daily_average_power = "input_number.house_daily_average_power"
     """The average power consumption of the house during the day"""
     energy_demand = "sensor.house_energy_until_production_meets_demand"
-    """The energy the house needs until the PV production meets the demand"""
+    """The energy the house needs until the PV production next meets the demand"""
     last_washing = "input_datetime.last_washing"
     """The last time the washing machine was used"""
     upcoming_demand = "sensor.upcoming_demand"
@@ -165,6 +169,7 @@ class PVProduction:
     """The energy the PV needs to produce until it meets the demand"""
     next_meet_demand = "sensor.next_pv_meet_demand"
     """The next time the PV production is expected to meet the demand"""
+    power_now_estimated = "sensor.solcast_pv_forecast_power_now"
 
 
 class Excess:
@@ -173,7 +178,7 @@ class Excess:
     power = "sensor.excess_power"
     """The excess power, i.e. the difference between production and consumption"""
     target = "input_number.excess_target"
-    """The target excess power"""
+    """The target excess power, in W"""
     power_1m_average = "sensor.excess_power_1m_average"
     """The 1 minute average of the excess power"""
     above_target_1k = "binary_sensor.excess_1k_above_target"

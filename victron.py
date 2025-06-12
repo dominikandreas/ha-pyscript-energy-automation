@@ -72,10 +72,12 @@ def auto_apply_setpoint():
     current_house_loads = get(House.loads, prev_house_loads)
     house_loads = prev_house_loads * 0.9 + 0.1 * current_house_loads  # prevent oscillations
     setpoint_target = get(Grid.power_setpoint_target, 0)
+    max_setpoint_target = get(Grid.max_feedin_target, 0)
 
     if setpoint_target < -20:
         current_diff_from_avg = house_power_long_term_average - house_loads
-        setpoint = round(min(-20, setpoint_target - current_diff_from_avg))
+        setpoint = round(max(-max_setpoint_target, min(-20, setpoint_target - current_diff_from_avg)))
+        log.warning(f"updating setpoint {setpoint_target} diff with {current_diff_from_avg} to {setpoint}")
     else:
         setpoint = min(-20, setpoint_target)
 

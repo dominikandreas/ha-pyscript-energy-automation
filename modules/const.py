@@ -1,4 +1,3 @@
-
 class EV:
     ev_capacity = 60
     """The capacity of the EV battery in kWh"""
@@ -17,3 +16,6 @@ class EV:
     max_current = 16
     """The maximum current the EV charger can provide"""
     min_current = 6
+    """The minimum current the EV charger can provide"""
+    voltage = 230
+    """The voltage of the EV charger"""

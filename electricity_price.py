@@ -8,12 +8,24 @@ if not TYPE_CHECKING:
 else:
     # The type checker (linter) does not know that utils can directly be imported in the pyscript engine.
     from modules.states import EV, ElectricityPrices
-    from modules.utils import now, set_state, time_trigger, log
+    from modules.utils import log, now, set_state, time_trigger
 
 
 @time_trigger
 async def set_pv_opportunistic_price():
     set_state(EV.pv_opportunistic_price, 0.08, unit_of_measurement="EUR/kWh")
+
+
+def get_price(hour: int, minute: int) -> float:
+    """Return price based on time of day."""
+    if (hour == 23 and minute >= 30) or (hour <= 4) or (hour == 5 and minute < 30):
+        return 0.175
+    return 0.255
+
+
+def is_low_price(price: float) -> bool:
+    """Check if the price is considered low."""
+    return price < 0.2
 
 
 @time_trigger
@@ -22,13 +34,6 @@ async def set_prices():
     t = now()
     today, tomorrow = [], []
 
-    def get_price(hour: int, minute: int) -> float: 
-        """Return price based on time of day."""
-        # TODO: change this to hour 23
-        if (hour == 23 and minute >= 30) or (hour <= 4) or (hour == 5 and minute < 30):
-            return 0.175
-        return 0.255
- 
     for day_offset in (0, 1):
         for hour in range(0, 24):
             for minute in (0, 30):
@@ -55,9 +60,7 @@ async def set_prices():
         tomorrow=tomorrow,
     )
 
-    if price < 0.2:
-        set_state(ElectricityPrices.low_price, "on")
-        set_state(ElectricityPrices.high_price, "off")
-    else:
-        set_state(ElectricityPrices.low_price, "off")
-        set_state(ElectricityPrices.high_price, "on")
+    is_low = is_low_price(price)
+
+    set_state(ElectricityPrices.low_price, "on" if is_low else "off")
+    set_state(ElectricityPrices.high_price, "off" if is_low else "on")
