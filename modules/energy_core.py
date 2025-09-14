@@ -110,6 +110,18 @@ def _get_charge_action(
     # Calculate minimum time needed to charge the vehicle, we subtract 1 to account for charging inefficiencies
     min_hours_needed = energy_needed / (3 * Const.voltage * (Const.max_current - 1) / 1000)  # in hours
 
+    # Adjust target excess and surplus energy to account for inefficiencies, leave room for other devices
+    surplus_energy = surplus_energy - 4
+
+    # Charging hysteresis to prevent rapid changes in charging state
+    if not is_charging and smart_charge_limit < 100:
+        # 1 % hysteresis for charge limit
+        smart_charge_limit = smart_charge_limit - 1
+        # 2 kWh hysteresis for surplus energy
+        surplus_energy = surplus_energy - 2
+        # 1 kWh for target access
+        target_excess = target_excess + 1
+
     if smart_charge_limit == 100:
         smart_limiter_active = False
     # if no more charging needed, turn off the charger
@@ -141,13 +153,13 @@ def _get_charge_action(
     # PV surplus charging, when sufficient excess is available and no time constraints
     elif (
         excess_power > target_excess
-        and (surplus_energy > 5 or excess_power > 2 and battery_soc > 90)
+        and (surplus_energy > 10)
         and (  # prevent charging by discharging from battery when we can excess charge the next day
             battery_soc > 90
-            or pv_total_power > 1000
-            and 10 <= t_now.hour <= 17
+            or pv_total_power > 1500
+            # and 10 <= t_now.hour <= 17
             or hours_available_to_charge < 24
-            and current_soc <= required_soc
+            # and current_soc <= required_soc
         )
     ):
         available_power = (excess_power - target_excess) * 1000  # convert kW to W
@@ -176,23 +188,24 @@ def _get_charge_action(
         deficit = target_excess - excess_power
         # Consider phase reduction if we're at minimum current for 3-phase
         if configured_current == Const.min_current:
-            if configured_phases == 3:
+            if configured_phases > Const.min_phases:
                 # Calculate max current for 1 phase and set it
                 adj = calculate_charger_current_adjustment(
                     excess_power, target_excess, configured_phases=1, configured_current=Const.max_current
                 )
+                new_current = clip(Const.max_current + adj, Const.min_current, Const.max_current)
                 return (
                     ChargeAction.on,
                     1,
-                    configured_current + adj,
-                    f"Reducing phases to meet deficit of {deficit:.2f} kW",
+                    new_current,
+                    f"ON->ON {configured_phases}P-{new_current}A: Reducing phases to meet deficit of {deficit:.2f} kW",
                 )
             else:
                 return (
                     "off",
                     1,
                     6,
-                    f"Excess {excess_power:.1f}kW below target of {target_excess:.1f}kW, current {configured_current}A"
+                    f"ON->OFF: Excess {excess_power:.1f}kW below target of {target_excess:.1f}kW, current {configured_current}A"
                     f" already at minimum, unable to reduce further",
                 )
         else:

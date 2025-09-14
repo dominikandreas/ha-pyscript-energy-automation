@@ -85,8 +85,6 @@ class EV:
     """The required state of charge of the EV battery for the next planned drive"""
     capacity = 60
     """The total capacity of the EV battery in kWh"""
-    auto_soc_limit = "sensor.tesla_auto_soc_limit"
-    """The automatic state of charge limit for the EV"""
     planned_drives = "schedule.tesla_planned_drives"
     """The planned drives schedule for the EV"""
     planned_distance = "input_number.tesla_planned_distance"
@@ -109,7 +107,8 @@ class EV:
     """The smart charge limit for the EV"""
     energy_needed = "sensor.tesla_energy_needed"
     """The energy needed for the next drive (set automatically)."""
-
+    able_to_charge_on_arrival = "input_boolean.ev_able_to_charge_on_arrival"
+    """Whether it should be assumed that EV can charge when scheduled to arrive."""
 
 class House:
     """House energy consumption related states"""
@@ -211,6 +210,8 @@ class Grid:
     """Maximum feed-in target"""
     max_pv_feedin_target = "input_number.max_pv_feedin_target"
     """Maximum feed-in target for PV"""
+    max_setpoint = "input_number.max_setpoint"
+    """Max setpoint to use."""
 
 
 class Automation:

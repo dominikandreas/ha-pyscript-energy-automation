@@ -262,9 +262,9 @@ output_state_registry = OutputStateRegistry()
 
 async def set_state(id: str, value, **attributes):
     state.set(id, value)  # type: ignore # noqa: F821
-    if attributes:
-        output_state_registry.set(id, attributes)
-        await output_state_registry.write()
+    # if attributes:
+    #     output_state_registry.set(id, attributes)
+    #     await output_state_registry.write()
 
     if id.startswith("input_boolean"):
         if type(value) is bool:

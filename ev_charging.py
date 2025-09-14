@@ -151,6 +151,8 @@ def set_current(current, reason: str | None = None):
 
 
 def set_phases_and_current(phases, current, reason: str | None = None):
+    task.unique("control_ev_charging", kill_me=False)
+
     global last_ev_charging_phase_change
 
     charger_enabled = get(Charger.control_switch, False)
@@ -158,13 +160,16 @@ def set_phases_and_current(phases, current, reason: str | None = None):
     set_current(current, reason)
 
     configured_phases = get(Charger.phases, 3)
+    configured_current = get(Charger.current_setting, -1)
+
+    desc = f"ON->ON: {configured_phases}P-{configured_current}A -> {phases}P-{current}A"
 
     if configured_phases != phases:
         if last_ev_charging_phase_change > now() - timedelta(minutes=15):
             log.warning(f"Phase change too frequent - cooldown active. Reason: {reason or 'no reason provided'}")
             return
 
-        log.warning(f"Setting phases: {phases}, current: {current}A. Reason: {reason or 'no reason provided'}")
+        log.warning(f"{desc}. Reason: {reason or 'no reason provided'}")
 
         if charger_enabled:
             turn_off_charger(f"Phase change from {configured_phases} -> {phases}", check_phase_change_cooldown=False)
@@ -296,18 +301,29 @@ async def auto_ev_charging():
 
     hours_available_to_charge = ((next_drive - t_now).total_seconds() / 3600) if next_drive else 999
 
-    log.warning(f"""excess_power > target_excess: {excess_power:.2f} > {target_excess:.2f}: {excess_power > target_excess}
-        and surplus_energy {surplus_energy:.2f} > 5 or excess_power {excess_power:.2f} > 2 and battery_soc {battery_soc} > 90: {(surplus_energy > 5 or excess_power > 2 and battery_soc > 90)}
-        and ( 
-            {pv_power_estimated} > 1000 and 10 <= t_now.hour {t_now.hour} < 17: {pv_power_estimated > 1000 and 10 <= t_now.hour < 17}
-            or hours_available_to_charge {hours_available_to_charge:.2f} < 24 and current_soc {current_soc} <= required_soc {required_soc}:
-        )""")
-    log.warning(f"Got charge action: {action} phases {phases} current {current}: {reason}")
+    # excess_power > target_excess
+    # and (surplus_energy > 10 or excess_power > 2 and battery_soc > 90)
+    # and (  # prevent charging by discharging from battery when we can excess charge the next day
+    #     battery_soc > 90
+    #     or pv_total_power > 1500
+    #     # and 10 <= t_now.hour <= 17
+    #     or hours_available_to_charge < 24
+    #     # and current_soc <= required_soc
+    # )
+    log.warning(f"""
+    Got charge action: {action} phases {phases} current {current}: {reason}
+
+    excess_power > target_excess: {excess_power:.2f} > {target_excess:.2f}: {excess_power > target_excess}
+    and (surplus_energy {surplus_energy:.2f} > 10 or excess_power {excess_power:.2f} > 2 and battery_soc {battery_soc} > 90): {(surplus_energy > 10 or excess_power > 2 and battery_soc > 90)}
+    and ( 
+        {pv_power_estimated} > 1000 and 10 <= t_now.hour {t_now.hour} < 17: {pv_power_estimated > 1000 and 10 <= t_now.hour < 17}
+        or hours_available_to_charge {hours_available_to_charge:.2f} < 24 and current_soc {current_soc} <= required_soc {required_soc}:
+    )""")
 
     if action == "on":
         set_phases_and_current(phases, current, reason)
         turn_on_charger(reason)
     elif action == "off":
-        turn_off_charger(reason)
+        turn_off_charger(reason, check_phase_change_cooldown=surplus_energy > 2)
     else:
         log.warning(f"Skipping unknown action: {action}")

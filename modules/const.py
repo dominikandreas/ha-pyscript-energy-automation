@@ -17,5 +17,9 @@ class EV:
     """The maximum current the EV charger can provide"""
     min_current = 6
     """The minimum current the EV charger can provide"""
+    min_phases = 1
+    """The minimum number of phases the EV charger can provide"""
+    max_phases = 3
+    """The maximum number of phases the EV charger can provide"""
     voltage = 230
     """The voltage of the EV charger"""
