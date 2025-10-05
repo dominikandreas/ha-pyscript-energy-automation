@@ -110,6 +110,7 @@ class EV:
     able_to_charge_on_arrival = "input_boolean.ev_able_to_charge_on_arrival"
     """Whether it should be assumed that EV can charge when scheduled to arrive."""
 
+
 class House:
     """House energy consumption related states"""
 
@@ -146,15 +147,9 @@ class PVForecast:
     forecast_day_3 = "sensor.solcast_pv_forecast_forecast_day_3"
     """The forecast for the day after tomorrow's PV production"""
     forecast_day_4 = "sensor.solcast_pv_forecast_forecast_day_4"
-    """The forecast for the day after the day after tomorrow's PV production"""
-    forecast_today = "sensor.solcast_pv_forecast_forecast_today"
-    """The forecast for today's PV production"""
-    forecast_tomorrow = "sensor.solcast_pv_forecast_forecast_tomorrow"
-    """The forecast for tomorrow's PV production"""
-    forecast_day_3 = "sensor.solcast_pv_forecast_forecast_day_3"
-    """The forecast for the day after tomorrow's PV production"""
-    forecast_day_4 = "sensor.solcast_pv_forecast_forecast_day_4"
-    """The forecast for the day after the day after tomorrow's PV production"""
+    """The forecast for the 4th day after tomorrow's PV production"""
+    forecast_day_5 = "sensor.solcast_pv_forecast_forecast_day_5"
+    """The forecast for the 5th day's PV production"""
 
 
 class PVProduction:
@@ -235,3 +230,5 @@ class Automation:
     """Switch to enable/disable automatic setpoint updates"""
     auto_charge_limit = "input_boolean.auto_charge_limit"
     """Switch to enable/disable automatic charge limit calculation"""
+    efficient_discharge = "input_boolean.efficient_discharge"
+    """Switch to enable/disable efficient discharge mode"""

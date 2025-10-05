@@ -1,9 +1,9 @@
 import time
 import typing
+from collections import defaultdict
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any
 from zoneinfo import ZoneInfo
-from collections import defaultdict
 
 if TYPE_CHECKING:
     import asyncio
@@ -124,6 +124,7 @@ def now():
     return datetime.now(local_timezone)
 
 
+@pyscript_compile
 def with_timezone(naive_datetime):
     if naive_datetime is None:
         return None
@@ -139,6 +140,7 @@ def with_timezone(naive_datetime):
 
 
 start_time = now()
+
 
 def get(id, default="unknown", mapper=None):
     if mapper is None:
@@ -180,10 +182,12 @@ def get_attr(id, name=None, default=None, mapper=None) -> dict | None:
 def indent(str, indentation):
     return "\n".join(indentation + line for line in str.split("\n"))
 
+
 @pyscript_compile
 def write_output_states(state_attributes):
-    import yaml
     from pathlib import Path
+
+    import yaml
 
     input_number_states = []
 
@@ -192,7 +196,7 @@ def write_output_states(state_attributes):
         if "name" not in v:
             v["name"] = id.replace("_", " ").title()
         if "unique_id" not in v:
-            v['unique_id'] = id
+            v["unique_id"] = id
 
     for k, v in list(state_attributes.items()):
         if k.startswith("input_number"):
@@ -200,26 +204,24 @@ def write_output_states(state_attributes):
             del state_attributes[k]
 
     if input_number_states:
-        Path("/config/pyscript_input_numbers.yaml").write_text(
-            indent(yaml.dump(input_number_states), "  ")
-        )
+        Path("/config/pyscript_input_numbers.yaml").write_text(indent(yaml.dump(input_number_states), "  "))
 
     sensors = []
     for k, v in state_attributes.items():
         id = k.split(".")[1]
-        if not "name" in v:
+        if "name" not in v:
             v["name"] = id.replace("_", " ").title()
-        v['unique_id'] = id
-        v['template'] = "{}"
+        v["unique_id"] = id
+        v["template"] = "{}"
         sensors.append(v)
-        
-    Path("/config/pyscript_template_sensors.yaml").write_text(
-        indent(yaml.dump([dict(sensor=sensors)]), "  ")
-    )
+
+    Path("/config/pyscript_template_sensors.yaml").write_text(indent(yaml.dump([dict(sensor=sensors)]), "  "))
+
 
 def load_output_states():
-    import yaml
     from pathlib import Path
+
+    import yaml
 
     state_attributes = defaultdict(dict)
 
@@ -229,13 +231,15 @@ def load_output_states():
 
     sensors = yaml.safe_load(Path("/config/pyscript_template_sensors.yaml").read_text())
     if type(sensors) is list and len(sensors) > 0:
-        for v in sensors[0].get('sensor', []):
+        for v in sensors[0].get("sensor", []):
             state_attributes[f"sensor.{v['unique_id']}"] = v
 
     return state_attributes
 
+
 class OutputStateRegistry:
     _attribute_keys = {"device_class", "friendly_name", "icon", "state_class", "unit_of_measurement"}
+
     def __init__(self):
         self._last_written_keys = None
         self._state_attributes = defaultdict(dict)
@@ -255,10 +259,30 @@ class OutputStateRegistry:
             self._last_written = state_keys
             return awaitable
 
+    def lazy_write(self, delay=60):
+        if not hasattr(self, "_delayed_write_task"):
+            self._delayed_write_task = None
+
+        async def delayed_write():
+            await asyncio.sleep(delay)
+            await self.write()
+            self._delayed_write_task = None
+
+        # Cancel any existing delayed_write task
+        if self._delayed_write_task is not None:
+            try:
+                task.cancel(self._delayed_write_task)
+            except Exception:
+                pass
+
+        self._delayed_write_task = task.create(delayed_write())
+
     def get_all_states(self) -> dict:
         return dict(**self._state_attributes)
 
+
 output_state_registry = OutputStateRegistry()
+
 
 async def set_state(id: str, value, **attributes):
     state.set(id, value)  # type: ignore # noqa: F821
@@ -284,5 +308,3 @@ def set_attr(id: str, **attributes):
 
 def clip(val, minv, maxv):
     return max(minv, min(val, maxv))
-
-

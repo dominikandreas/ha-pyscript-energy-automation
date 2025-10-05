@@ -199,7 +199,7 @@ def ev_energy_needed():
     set_state(EV.energy_needed, energy_needed)
 
 
-@time_trigger("period(now, 15sec)")
+@time_trigger("period(now, 60sec)")
 @state_active(
     f"{Charger.force_charge} == 'off' and {Automation.auto_ev_charging} == 'on' and ({Charger.ready} == 'on' or {Charger.control_switch} == 'on')"
 )
@@ -221,18 +221,18 @@ async def auto_ev_charging():
     # required state of charge defined by the owner
     required_soc = get(EV.required_soc, 80)
     # the current excess power available, this is defined as power going into the battery or into the grid (or the opposite, depending on the sign)
-    excess_power = get(Excess.power, 1337)  # in kW
+    excess_power = get(Excess.power, 1337)  # in W
     if excess_power == 1337:
         log.warning("Excess power is not set, cannot proceed with charging control.")
         return
 
     battery_soc = get(Battery.soc, 0)
 
-    pv_power_estimated = get(PVProduction.power_now_estimated, 0)  # in W
+    pv_total_power = get(PVProduction.power_now_estimated, 0)  # in W
 
     # target excess is the amount of power requested by the home battery to be able to cover the house loads in the near future
     # it is dynamically updated by a separate automation
-    target_excess = get(Excess.target, 0) / 1000  # in kW
+    excess_target = get(Excess.target, 0)  # in W
     # surplus energy is the amount of energy that is likely available after accounting for house loads in the near future
     surplus_energy = get(House.energy_surplus, 0)  # in kWh
 
@@ -266,7 +266,7 @@ async def auto_ev_charging():
 
     log.warning(
         f"Current SOC: {current_soc}%, Required SOC: {required_soc}%, Surplus {surplus_energy:.2f}, "
-        f"Excess: {excess_power:.2f} kW, Target: {target_excess:.2f} kW "
+        f"Excess: {excess_power:.2f} kW, Target: {excess_target:.2f} kW "
         f"Energy needed: {energy_needed:.2f} kWh, Time needed: {min_hours_needed:.2f}h, "
         f"low price: {low_price}, high price: {high_price}, next drive: {next_drive}, "
         f"EV charge limit: {ev_charge_limit:.0f}%"
@@ -285,14 +285,14 @@ async def auto_ev_charging():
         required_soc=required_soc,
         energy_needed=energy_needed,
         excess_power=excess_power,
-        target_excess=target_excess,
+        excess_target=excess_target,
         surplus_energy=surplus_energy,
         smart_charge_limit=ev_charge_limit,
         smart_limiter_active=smart_limiter_active,
         configured_phases=configured_phases,
         configured_current=configured_current,
         is_low_price=low_price,
-        pv_total_power=pv_power_estimated,
+        pv_total_power=pv_total_power,
         battery_soc=battery_soc,
         hysteresis=HYSTERESIS_BUFFER,
         is_charging=is_charging,
@@ -313,12 +313,18 @@ async def auto_ev_charging():
     log.warning(f"""
     Got charge action: {action} phases {phases} current {current}: {reason}
 
-    excess_power > target_excess: {excess_power:.2f} > {target_excess:.2f}: {excess_power > target_excess}
-    and (surplus_energy {surplus_energy:.2f} > 10 or excess_power {excess_power:.2f} > 2 and battery_soc {battery_soc} > 90): {(surplus_energy > 10 or excess_power > 2 and battery_soc > 90)}
-    and ( 
-        {pv_power_estimated} > 1000 and 10 <= t_now.hour {t_now.hour} < 17: {pv_power_estimated > 1000 and 10 <= t_now.hour < 17}
-        or hours_available_to_charge {hours_available_to_charge:.2f} < 24 and current_soc {current_soc} <= required_soc {required_soc}:
-    )""")
+        excess_power > excess_target and (surplus_energy > 3)
+        and (battery_soc > 90 or pv_total_power > 1500 or hours_available_to_charge < 14)
+        --------------------------------------------------------
+        {excess_power:.0f} > {excess_target:.0f} and ({surplus_energy} > 3)
+        and ({battery_soc} > 90 or {pv_total_power} > 1500 or {hours_available_to_charge} < 14)
+        --------------------------------------------------------
+        {excess_power > excess_target:.0f} and ({surplus_energy > 3})
+        and {battery_soc > 90} or {pv_total_power > 1500} or {hours_available_to_charge < 14}
+        --------------------------------------------------------
+        {excess_power > excess_target and surplus_energy > 3} and {battery_soc > 90 or pv_total_power > 1500 or hours_available_to_charge < 14}
+        """
+    )
 
     if action == "on":
         set_phases_and_current(phases, current, reason)
