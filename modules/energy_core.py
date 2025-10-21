@@ -164,8 +164,22 @@ def _get_charge_action(
             f"Excess power detected: {excess_power:.0f} W, Target: {excess_target:.0f} W, current power {current_power:.0f} W, "
             f"Target Power for EV: {current_power + available_power:.0f} W",
         )
+        return (ChargeAction.on, phases, current, reason)#
+    
+    # Charge when price is low and not much time left (likely not possible to charge via excess)
+    elif is_low_price and hours_available_to_charge < 14:  # Use cheap electricity
+        battery_discharging = get(Victron.mode_sensor, default="off").lower() == "on" and not get(
+            Battery.force_charge_switch, False
+        )
+        if battery_discharging:  # in case we're discharging from battery, we should limit the current accordingly
+            adj = calculate_charger_current_adjustment(
+                excess_power, excess_target, configured_phases=3, configured_current=configured_current
+            )  # Calculate current adjustment
+            phases, current, reason = (3, configured_current + adj, "Charging at low price, with battery discharging")
+        else:
+            phases, current, reason = (3, Const.max_current, "Charging at low price, no battery discharging")
         return (ChargeAction.on, phases, current, reason)
-
+    
     # When charging already active, need to control the charge amps to meet target excess
     elif is_charging and excess_power < excess_target:
         deficit = excess_target - excess_power
@@ -203,19 +217,6 @@ def _get_charge_action(
                 f"Reducing current to meet deficit of {deficit:.2f} W",
             )
 
-    # Charge when price is low and not much time left (likely not possible to charge via excess)
-    elif is_low_price and hours_available_to_charge < 14:  # Use cheap electricity
-        battery_discharging = get(Victron.mode_sensor, default="off").lower() == "on" and not get(
-            Battery.force_charge_switch, False
-        )
-        if battery_discharging:  # in case we're discharging from battery, we should limit the current accordingly
-            adj = calculate_charger_current_adjustment(
-                excess_power, excess_target, configured_phases=3, configured_current=configured_current
-            )  # Calculate current adjustment
-            phases, current, reason = (3, configured_current + adj, "Charging at low price, with battery discharging")
-        else:
-            phases, current, reason = (3, Const.max_current, "Charging at low price, no battery discharging")
-        return (ChargeAction.on, phases, current, reason)
 
     elif high_price and surplus_energy <= 0 and excess_power < excess_target:
         # Only charge if time-constrained with explicit unit conversion

@@ -1049,7 +1049,7 @@ def forecast_setpoint(
                 smart_limiter_active=smart_limiter_active,
                 configured_phases=charge_phases,
                 configured_current=charge_current,
-                is_low_price=low_price,  # TODO
+                is_low_price=low_price,
                 pv_total_power=power_production,
                 battery_soc=new_battery_soc,
                 is_charging=is_charging_ev,
@@ -1061,9 +1061,9 @@ def forecast_setpoint(
             charge_phases = new_charge_phases
 
             is_charging_ev = charge_action == ChargeAction.on
-            # if is_charging:
+            # if is_charging_ev or start.hour > 20:
             #     log.warning(
-            #         f"{start.day} {start.hour}:{start.minute:02d} - EV charge action {charge_action} phases {charge_phases} current {charge_current} due to {reason} "
+            #         f"{start.day} {start.hour}:{start.minute:02d} - EV charge action \n{charge_action} phases {charge_phases} current {charge_current} due to {reason} "
             #         f"(needed {ev_energy_needed:.1f} kWh, excess {power_production - house_power:.0f}W, target_excess {excess_target:.0f}W, surplus {surplus:.1f}kWh, "
             #         f"smart_limit {smart_charge_limit:.1f}kWh, ev_soc {ev_soc:.1f}%, req_soc {ev_required_soc}%, battery_soc {new_battery_soc:.1f}%)"
             #     )
@@ -1113,28 +1113,31 @@ def forecast_setpoint(
         net_energy = energy_production - energy_use
 
         battery_full = battery_energy + accumulated_energy + net_energy >= battery_capacity
+        battery_empty = battery_energy + accumulated_energy <= 1
 
         if battery_full and net_energy > 0:
             remaining_battery_energy = battery_capacity - (battery_energy + accumulated_energy)
             max_battery_power = min(battery_charge_limit, remaining_battery_energy / period_hours * 1000)
+        elif battery_empty and net_energy < 0:
+            max_battery_power = 0
         else:
             max_battery_power = min(battery_charge_limit, max_battery_power_target)
 
         max_intake_energy = max_battery_power / 1000 * period_hours
         added_battery_energy = min(max_intake_energy, net_energy)
         accumulated_energy += added_battery_energy
-        new_battery_energy = max(0, min(battery_capacity, battery_energy + accumulated_energy))
 
         feedin = (net_energy - added_battery_energy) * 1000 / period_hours
         battery_power = min(max_battery_power, net_energy / period_hours * 1000 - feedin)
 
-        battery_empty = battery_energy + accumulated_energy <= 1
-
         if (battery_empty or inverter_mode in (InverterMode.off, InverterMode.charger_only)) and battery_power < 0:
+            accumulated_energy -= added_battery_energy
             power_from_grid = -battery_power
             battery_power = 0
         else:
             power_from_grid = max(0, power_draw - power_production)
+
+        new_battery_energy = max(0, min(battery_capacity, battery_energy + accumulated_energy))
 
         if inverter_mode in (InverterMode.on, InverterMode.charger_only) and is_force_charging:
             battery_power = charge_power_limit
