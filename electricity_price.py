@@ -3,10 +3,12 @@ from typing import TYPE_CHECKING
 
 if not TYPE_CHECKING:
     # pyscript providese these imports from the subfolder modules directly
+    from electricity_price import get_price, is_low_price
     from states import EV, ElectricityPrices
     from utils import now, set_state
 else:
     # The type checker (linter) does not know that utils can directly be imported in the pyscript engine.
+    from modules.electricity_price import get_price, is_low_price
     from modules.states import EV, ElectricityPrices
     from modules.utils import log, now, set_state, time_trigger
 
@@ -14,18 +16,6 @@ else:
 @time_trigger
 async def set_pv_opportunistic_price():
     set_state(EV.pv_opportunistic_price, 0.08, unit_of_measurement="EUR/kWh")
-
-
-def get_price(hour: int, minute: int) -> float:
-    """Return price based on time of day."""
-    if (hour == 23 and minute >= 30) or (hour <= 4) or (hour == 5 and minute < 30):
-        return 0.175
-    return 0.255
-
-
-def is_low_price(price: float) -> bool:
-    """Check if the price is considered low."""
-    return price < 0.2
 
 
 @time_trigger

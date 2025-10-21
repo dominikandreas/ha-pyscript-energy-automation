@@ -25,7 +25,7 @@ else:
 @time_trigger("cron(*/2 * * * *)")
 def garage_energy():
     energies = [get(f"sensor.hms_1600_4t_{idx}_yieldtotal", -1.0) for idx in range(1, 4)]
-    if min(energies) == -1.0:
+    if min(energies) < 1.0:
         return
 
     garage_energy = sum(energies)
@@ -36,7 +36,7 @@ def garage_energy():
         unit_of_measurement="kWh",
         device_class="energy",
         icon="mdi:solar-power-variant",
-        friendly_name="Garage PV Energy Today",
+        friendly_name="Garage PV Energy Total",
     )
 
 
@@ -44,7 +44,7 @@ def garage_energy():
 @time_trigger("cron(*/2 * * * *)")
 def garage_energy_today():
     energies = [get(f"sensor.hms_1600_4t_{idx}_yieldday", -1.0) for idx in range(1, 4)]
-    if min(energies) == -1:
+    if min(energies) < 1:
         return
 
     garage_energy = sum(energies) / 1000

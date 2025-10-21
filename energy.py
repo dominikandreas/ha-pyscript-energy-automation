@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     # The type checker (linter) does not know that utils can directly be imported in the pyscript engine.
     # Therefore during type checking we pretend to import them from modules.utils, which it can resolve.
-    from modules.utils import clip, get, get_attr, service, set_state
+    from modules.utils import clip, get, get_attr, set_state
     from modules.const import EV as EVConst
     from modules.energy_core import _get_ev_smart_charge_limit, ChargeAction
 
@@ -41,8 +41,9 @@ if TYPE_CHECKING:
         Charger,
         PVForecast,
     )
-    from modules.victron import Victron
+    from modules.victron import Victron, get_auto_inverter_mode, InverterMode
     from modules.energy_core import _get_ev_energy_needed, _get_charge_action
+    from electricity_price import is_low_price, get_price
 
 else:
     from const import EV as EVConst
@@ -59,13 +60,14 @@ else:
         Charger,
         PVForecast,
     )
-    from victron import Victron
+    from victron import Victron, get_auto_inverter_mode, InverterMode
     from energy_core import (
         _get_ev_smart_charge_limit,
         _get_ev_energy_needed,
         _get_charge_action,
         ChargeAction,
     )  # noqa: F401
+    from electricity_price import is_low_price, get_price
 
 
 class Const:
@@ -231,7 +233,7 @@ def bilinear_interpolate(y, y1, y2, x1, x2):
 @time_trigger
 @time_trigger("period(now, 10sec)")
 def excess_power_1m_average():
-    excess = get(Excess.power, default=0)   # in W
+    excess = get(Excess.power, default=0)  # in W
     excess_avg = get(Excess.power_1m_average, default=0)
     excess_avg = round(0.9 * excess_avg + 0.1 * excess, 2)
     set_state(
@@ -267,59 +269,49 @@ def auto_victron_set_inverter_mode():
     electricity_price = float(get(ElectricityPrices.current_price, default=0))
     min_discharge_price = float(get(Automation.min_discharge_price, default=0))
     ev_is_charging = get(EV.is_charging, False)
-    surplus_energy = get(House.energy_surplus, 0)
-    battery_soc = get(Battery.soc, 0)
-    target_soc = get(Automation.battery_target_soc, 0)
-    pv_power = get(PVProduction.total_power, 0)  # in kW
-    daily_avg_power = get(House.nightly_average_power, 0)
-    min_charge_power = 6 * 230  # 6A amps minimum
-
-    # Determine if the current time is between 18:00 and 06:00
-    is_night_time = now.hour >= 18 or now.hour < 6
-
-    new_mode = Victron.InverterMode.off
-
-    reason = "Default mode"
-    new_mode = Victron.InverterMode.on
-
-    if ev_is_charging:
-        if surplus_energy > 0 or pv_power > (min_charge_power + daily_avg_power) and battery_soc > target_soc:
-            reason = f"EV is charging with surplus energy of {surplus_energy} or pv_power > (min_charge_power + daily_avg_power)  {pv_power} > ({min_charge_power} + {daily_avg_power})"
-            new_mode = Victron.InverterMode.on
-        else:
-            reason = f"EV is charging at {'night' if is_night_time else 'day'}"
-            new_mode = Victron.InverterMode.off if is_night_time else Victron.InverterMode.charger_only
-    else:
-        if electricity_price < min_discharge_price and battery_soc < max(5, target_soc, -5):
-            if is_night_time:
-                reason = f"night time, battery {battery_soc}% < target {target_soc}% and price is low"
-                new_mode = Victron.InverterMode.off
-            else:
-                reason = f"battery {battery_soc}% < target {target_soc}% and price is low"
-                new_mode = Victron.InverterMode.charger_only
-
+    surplus_energy = get(House.energy_surplus, -1337)
+    battery_soc = get(Battery.soc, -1337)
+    target_soc = get(Automation.battery_target_soc, -1337)
+    pv_power = get(PVProduction.total_power, -1337)  # in kW
+    daily_avg_power = get(House.daily_average_power, -1337)
     charge_limit = get(Battery.force_charge_up_to, 0)
-    if electricity_price < get(Battery.max_charge_price, 0) and battery_soc < target_soc and battery_soc < charge_limit:
-        reason = "Setting Victron inverter mode to 'On' due to low price"
-        new_mode = Victron.InverterMode.on
-        # turn on switch.victron_victron_force_charge
-        log.warning(
-            f"Enabling force charge switch and setting charge limit, {battery_soc} < {target_soc}, < {charge_limit}"
-        )
-        service.call("switch", "turn_on", entity_id=Battery.force_charge_switch)
-        set_state(Battery.charge_limit, 1550)
-    elif get(Battery.force_charge_switch, False):
-        log.warning("Disabling force charge switch and resetting charge limit")
-        set_state(Battery.charge_limit, -1)
-        service.call("switch", "turn_off", entity_id=Battery.force_charge_switch)
+    max_charge_price = get(Battery.max_charge_price, 0)
+    force_charge_switch = get(Battery.force_charge_switch, False)
+    current_mode = get(Victron.inverter_mode_input_select)
+
+    for v in (surplus_energy, battery_soc, target_soc, pv_power, daily_avg_power):
+        if v == -1337:
+            log.error(
+                f"Not all required states are available yet: surplus_energy={surplus_energy}, battery_soc={battery_soc}, target_soc={target_soc}, pv_power={pv_power}, daily_avg_power={daily_avg_power}, skipping auto victron inverter mode"
+            )
+            return
+
+    new_mode, new_charge_limit, new_force_charge_switch_state, reason = get_auto_inverter_mode(
+        ev_is_charging,
+        surplus_energy,
+        pv_power,
+        daily_avg_power,
+        battery_soc,
+        target_soc,
+        electricity_price,
+        min_discharge_price,
+        max_charge_price,
+        charge_limit,
+        force_charge_switch,
+    )
+
+    if new_charge_limit is not None:
+        set_state(Battery.charge_limit, new_charge_limit)
+
+    if new_force_charge_switch_state is not None:
+        set_state(Battery.force_charge_switch, new_force_charge_switch_state)
 
     new_mode = Victron.PAYLOAD_TO_MODE.get(new_mode)
-    current_mode = get(Victron.inverter_mode_input_select)
     if current_mode != new_mode:
         log.warning(
             f"{current_mode} -> {new_mode}: {reason}. "
             f"ev: {ev_is_charging}, surplus: {surplus_energy}, soc: {battery_soc}, target soc: {target_soc}, "
-            f"pv_power: {pv_power}, min_charge_power {min_charge_power} daily_avg_power {daily_avg_power}"
+            f"pv_power: {pv_power}, daily_avg_power {daily_avg_power}"
         )
 
     set_state(Victron.inverter_mode_input_select, value=new_mode)
@@ -473,6 +465,8 @@ def auto_battery_target_soc():
     set_state(
         Automation.battery_target_soc,
         round(result_soc, 2),
+        min=0,
+        max=100,
         unit_of_measurement="%",  # different attributes
     )
 
@@ -591,13 +585,13 @@ def calculate_energy_surplus():
     set_energy_surplus(energy_surplus)
 
 
-def set_energy_surplus(energy_surplus, **kwargs):
+def set_energy_surplus(surplus, entity, **kwargs):
     set_state(
-        House.energy_surplus,
-        round(energy_surplus, 2),
+        entity,
+        round(surplus, 2),
         **energy_kwh_attributes,
         icon="mdi:home",
-        friendly_name="Energy Surplus",
+        friendly_name=" ".join(entity.split(".")[-1].split("_")).title(),
         **kwargs,
     )
 
@@ -689,42 +683,51 @@ def get_ev_schedule():
 @time_trigger
 @time_trigger("cron(*/2 * * * *)")
 def forecast_surplus():
+    task.unique("forecast_surplus", kill_me=True)
     epex_prices = get_attr(ElectricityPrices.epex_forecast_prices, "data", [])
     t_now = now()
     t_end = t_now + timedelta(hours=80)
 
+    battery_capacity = get(Battery.capacity, 1337)
+    battery_energy = get(Battery.energy, 1337)
+
+    if 1337 in (battery_capacity, battery_energy):
+        log.warning("Battery capacity or energy not available yet, cannot calculate surplus")
+        return
+
     pv_forecast = get_pv_forecast_with_prices(t_start=t_now, t_end=t_end, epex_prices=epex_prices)
     if not pv_forecast or len(pv_forecast) < 2:
         log.warning("Not enough PV forecast data to calculate surplus")
-        set_energy_surplus(0)
         return
     period_hours = (pv_forecast[1].period_start - pv_forecast[0].period_start).total_seconds() / 3600
 
-    forecast = forecast_setpoint(
+    forecast_no_ev = forecast_setpoint(
         forecast=pv_forecast,
-        battery_capacity=get(Battery.capacity, 0),
-        battery_energy=get(Battery.energy, 0),
+        battery_capacity=battery_capacity,
+        battery_energy=battery_energy,
         setpoint=-20,
         forecast_dampening=0.75,
         with_ev_charging=False,
         logging=False,
     )
-    
+
     idx = 0
     total_feedin = 0
-    min_battery_energy = min([el.battery_energy for el in forecast.detail] or [0])
+    min_battery_energy = min([el.battery_energy for el in forecast_no_ev.detail] or [0])
     surplus = round(max(0, min_battery_energy - 10), 2)
 
-    while (detail := forecast.detail[idx]).battery_energy > min_battery_energy and (idx := idx + 1) < len(forecast.detail):
-        total_feedin += detail.feedin / 1000 * period_hours 
+    while (detail := forecast_no_ev.detail[idx]).battery_energy > min_battery_energy and (idx := idx + 1) < len(
+        forecast_no_ev.detail
+    ):
+        total_feedin += detail.feedin / 1000 * period_hours
 
     if total_feedin > 0:
         surplus += total_feedin
 
     ev_schedule = get_ev_schedule()
     if ev_schedule:
-        forecast = forecast_setpoint(
-        forecast=pv_forecast,
+        forecast_with_ev = forecast_setpoint(
+            forecast=pv_forecast,
             battery_capacity=get(Battery.capacity, 0),
             battery_energy=get(Battery.energy, 0),
             setpoint=-20,
@@ -732,25 +735,33 @@ def forecast_surplus():
             with_ev_charging=True,
             ev_schedule=ev_schedule,
             logging=False,
-            ev_schedule=ev_schedule,
             surplus_energy=surplus,
+            ev_energy=get(EV.energy, 0),
         )
- 
-    # log.warning(
-    #     f"""#################### Forecast Surplus
-    #     Min battery: {min_battery_energy:.2f} kWh
-    #     Final battery energy: {forecast.detail[-1].battery_energy:.2f} kWh
-    #     Surplus: {surplus:.2f} kWh
-    #     last entry date: {forecast.detail[-1].period_start if len(forecast.detail) > 0 else "n/a"}
-    #     total feedin: {total_feedin:.2f} kWh
-    #     ####################
-    # """
-    # )
-    # ev energies in detail: {[f"{el.ev_energy:.1f}" for el in forecast.detail]}
-    detail_vectorized = {
-        k: [getattr(el, k) for el in forecast.detail] for k in ForecastEntry.__annotations__.keys()
+
+    min_battery_energy = min([el.battery_energy for el in forecast_with_ev.detail] or [0])
+    surplus_after_ev_charging = round(max(0, min_battery_energy - 10), 2)
+    log.warning(
+        f"""#################### Forecast Surplus
+        Min battery: {min_battery_energy:.2f} kWh
+        Final battery energy: {forecast_no_ev.detail[-1].battery_energy:.2f} kWh
+        Surplus: {surplus:.2f} kWh
+        Surplus after EV charging: {surplus_after_ev_charging:.2f} kWh
+        last entry date: {forecast_no_ev.detail[-1].period_start if len(forecast_no_ev.detail) > 0 else "n/a"}
+        total feedin: {total_feedin:.2f} kWh
+        ####################
+        """
+    )
+    detail_with_ev_vectorized = {
+        k: [getattr(el, k) for el in forecast_with_ev.detail] for k in ForecastEntry.__annotations__.keys()
     }
-    set_energy_surplus(surplus, detail=detail_vectorized)
+    detail_without_ev_vectorized = {
+        k: [getattr(el, k) for el in forecast_no_ev.detail] for k in ForecastEntry.__annotations__.keys()
+    }
+    set_energy_surplus(surplus, House.energy_surplus, detail=detail_without_ev_vectorized)
+    set_energy_surplus(
+        surplus_after_ev_charging, House.energy_surplus_after_ev_charging, detail=detail_with_ev_vectorized
+    )
 
 
 @pyscript_compile
@@ -794,6 +805,7 @@ def define_interfaces():
         ev_charge_power: float
         excess_target: float
         surplus: float
+        power_from_grid: float
 
         def format(self):
             return fix_entry_repr(str(self))[len(type(self).__name__) + 1 : -1]
@@ -887,7 +899,6 @@ def forecast_setpoint(
     setpoint: float,
     battery_capacity: int,
     min_feedin_price: int = 0,
-    feed_in_limit=5500,
     forecast_dampening=0.8,
     battery_energy: float = 2.0,
     setpoint_spread=1,
@@ -897,7 +908,6 @@ def forecast_setpoint(
     ev_energy: float | None = None,
     max_battery_power_target: float = 4000,
     max_pv_feedin_target: float = 1000,
-    able_to_charge_on_arrival=True,
     max_setpoint=-20,
     logging=False,
     ev_schedule: list[EVScheduleEntry] | None = None,
@@ -909,16 +919,10 @@ def forecast_setpoint(
     prices_mean = sum(prices) / len(prices) if len(prices) > 0 else 0
     prices_std = sqrt(sum([(p - prices_mean) ** 2 for p in prices]) / len(prices)) if len(prices) > 0 else 0
 
-    schedule = get_attr(EV.planned_drives, "next_event")
-
-    if ev_energy is None:
-        ev_start_energy = ev_energy = get(EV.energy, 60)
-    else:
-        ev_start_energy = ev_energy
-
+    smart_charge_limit = 80
     ev_required_soc = get(EV.required_soc, 80)
     ev_soc = get(EV.soc, 100)
-    is_charging = get(EV.is_charging, False)
+    is_charging_ev = get(EV.is_charging, False)
 
     smart_limiter_active = get(Automation.auto_charge_limit, False)
 
@@ -926,8 +930,14 @@ def forecast_setpoint(
     nightly_power = get(House.nightly_average_power, 0)  # W
 
     charger_ready = get(Charger.ready, False)
-    currently_charging = get(Charger.control_switch, False)
+    # TODO: is this sufficient to determine if the EV is actually charging?
+    #       or should we also check the charger power?
+    is_charging_ev = get(Charger.control_switch, False)
     ongoing_drive = None
+    next_drive = next(iter([s for s in ev_schedule if s.start > t_now]), None) if ev_schedule else None
+
+    if with_ev_charging:
+        assert ev_energy is not None, "ev_energy must be provided if with_ev_charging is True"
 
     def is_charging_possible(dt, ev_energy, smart_charge_limit):
         if not with_ev_charging:
@@ -935,9 +945,32 @@ def forecast_setpoint(
         ongoing_drive = next(iter([s for s in ev_schedule if s.start <= dt < s.end]), None)
         return (
             with_ev_charging
-            and ((charger_ready or currently_charging) and ongoing_drive is None)
+            and ((charger_ready or is_charging_ev or dt > next_drive.end) and ongoing_drive is None)
             and ev_energy < EVConst.ev_capacity * smart_charge_limit / 100
         )
+
+    charge_limit = get(Battery.force_charge_up_to, 0)
+    max_charge_price = get(Battery.max_charge_price, 0)
+    force_charge_switch = get(Battery.force_charge_switch, False)
+    min_discharge_price = float(get(Automation.min_discharge_price, default=0))
+    surplus = surplus_energy or get(House.energy_surplus, 0)  # TODO, ensure this is passed
+
+    def get_inverter_mode(pv_power, target_soc, current_soc, electricity_price):
+        assert surplus is not None
+        new_mode, new_charge_power_limit, new_force_charge_switch_state, reason = get_auto_inverter_mode(
+            is_charging_ev,
+            surplus,
+            pv_power,
+            daily_power,
+            current_soc,
+            target_soc,
+            electricity_price,
+            min_discharge_price,
+            max_charge_price,
+            charge_limit,
+            force_charge_switch,
+        )
+        return new_mode, new_charge_power_limit, new_force_charge_switch_state, reason
 
     full_period_minutes = (forecast[1].period_start - forecast[0].period_start).total_seconds() / 60
 
@@ -949,7 +982,6 @@ def forecast_setpoint(
     detail: list[ForecastEntry] = []
 
     eff_dis = get(Automation.efficient_discharge, False)
-    surplus = surplus_energy or get(House.energy_surplus, 0)
     charge_phases, charge_current = 1, 7
     msg = ""
     next_drive_event = None
@@ -973,7 +1005,9 @@ def forecast_setpoint(
         power_production: float = entry.pv_estimate * forecast_dampening * 1000
         house_power = daily_power if 7 < start.hour < 19 else nightly_power
 
-        smart_charge_limit = _get_ev_smart_charge_limit(schedule, start, active_schedule=False)
+        if next_drive_event:
+            smart_charge_limit = _get_ev_smart_charge_limit(next_drive_event.start, start, active_schedule=False)
+
         ev_energy_needed = _get_ev_energy_needed(ev_required_soc, ev_soc, smart_charge_limit, smart_limiter_active)
 
         could_charge_ev = ev_energy_needed > 0 and is_charging_possible(start, ev_energy, smart_charge_limit)
@@ -981,21 +1015,26 @@ def forecast_setpoint(
         new_battery_energy = min(max(0, battery_energy + accumulated_energy), battery_capacity)
         new_battery_soc = new_battery_energy / battery_capacity * 100
 
+        battery_target_soc = max(5, new_battery_soc - (surplus / battery_capacity * 100))
+
+        electricity_price = get_price(hour=start.hour, minute=start.minute)
+        low_price = is_low_price(electricity_price)
+
+        inverter_mode, charge_power_limit, is_force_charging, inverter_mode_reason = get_inverter_mode(
+            power_production, battery_target_soc, new_battery_soc, electricity_price
+        )
 
         excess_target = _get_excess_target(
-            battery_target_soc=max(5, new_battery_soc - (surplus / battery_capacity * 100)),
+            battery_target_soc=battery_target_soc,
             battery_soc=new_battery_soc,
             ev_required_soc=ev_required_soc,
-            ev_is_charging=is_charging,
+            ev_is_charging=is_charging_ev,
             next_planned_drive=next_drive_event.start if next_drive_event else None,
-            pv_power=power_production, 
+            pv_power=power_production,
             ev_soc=ev_soc,
             t_now=start,
             efficient_discharge=eff_dis,
         )
-        # TODO: this is currently hard coded and needs to be fixed
-        t = start.hour * 60 + start.minute
-        is_low_price = t > (23 * 60 + 30) or t < (6 * 60 + 30)
 
         if could_charge_ev:
             charge_action, new_charge_phases, charge_current, reason = _get_charge_action(
@@ -1010,10 +1049,10 @@ def forecast_setpoint(
                 smart_limiter_active=smart_limiter_active,
                 configured_phases=charge_phases,
                 configured_current=charge_current,
-                is_low_price=is_low_price,  # TODO
+                is_low_price=low_price,  # TODO
                 pv_total_power=power_production,
                 battery_soc=new_battery_soc,
-                is_charging=is_charging,
+                is_charging=is_charging_ev,
                 t_now=start,
             )
             if new_charge_phases != charge_phases:
@@ -1021,7 +1060,7 @@ def forecast_setpoint(
 
             charge_phases = new_charge_phases
 
-            is_charging = charge_action == ChargeAction.on
+            is_charging_ev = charge_action == ChargeAction.on
             # if is_charging:
             #     log.warning(
             #         f"{start.day} {start.hour}:{start.minute:02d} - EV charge action {charge_action} phases {charge_phases} current {charge_current} due to {reason} "
@@ -1030,7 +1069,7 @@ def forecast_setpoint(
             #     )
 
         else:
-            is_charging, charge_phases, charge_current = False, 1, 6
+            is_charging_ev, charge_phases, charge_current = False, 1, 6
 
         this_setpoint = map_setpoint(
             setpoint,
@@ -1047,7 +1086,7 @@ def forecast_setpoint(
         )
 
         ev_charge_power = charge_phases * charge_current * 230  # W
-        if is_charging and ev_charge_power > 1:
+        if is_charging_ev and ev_charge_power > 1:
             ev_energy = min(smart_charge_limit, ev_energy + ev_charge_power * period_hours / 1000)
             free_capacity = smart_charge_limit - ev_energy + battery_capacity - battery_energy
             this_setpoint = -20
@@ -1065,13 +1104,16 @@ def forecast_setpoint(
             )
 
         # assume ev energy is never completely depleted
-        ev_energy = max(5, ev_energy)
+        if ev_energy is not None:
+            ev_energy = max(5, ev_energy)
+
         power_draw = house_power - this_setpoint + ev_charge_power
         energy_use = power_draw * period_hours / 1000  # kWh per forecast period
         energy_production = power_production * (period_hours) / 1000  # kWh
         net_energy = energy_production - energy_use
 
         battery_full = battery_energy + accumulated_energy + net_energy >= battery_capacity
+
         if battery_full and net_energy > 0:
             remaining_battery_energy = battery_capacity - (battery_energy + accumulated_energy)
             max_battery_power = min(battery_charge_limit, remaining_battery_energy / period_hours * 1000)
@@ -1081,10 +1123,22 @@ def forecast_setpoint(
         max_intake_energy = max_battery_power / 1000 * period_hours
         added_battery_energy = min(max_intake_energy, net_energy)
         accumulated_energy += added_battery_energy
-        new_battery_energy = min(battery_capacity, battery_energy + accumulated_energy)
+        new_battery_energy = max(0, min(battery_capacity, battery_energy + accumulated_energy))
 
         feedin = (net_energy - added_battery_energy) * 1000 / period_hours
         battery_power = min(max_battery_power, net_energy / period_hours * 1000 - feedin)
+
+        battery_empty = battery_energy + accumulated_energy <= 1
+
+        if (battery_empty or inverter_mode in (InverterMode.off, InverterMode.charger_only)) and battery_power < 0:
+            power_from_grid = -battery_power
+            battery_power = 0
+        else:
+            power_from_grid = max(0, power_draw - power_production)
+
+        if inverter_mode in (InverterMode.on, InverterMode.charger_only) and is_force_charging:
+            battery_power = charge_power_limit
+            power_from_grid = charge_power_limit + power_draw - power_production
 
         if logging:
             msg += (
@@ -1128,9 +1182,11 @@ def forecast_setpoint(
                 ev_energy=ev_energy,
                 ev_charge_power=ev_charge_power,
                 excess_target=excess_target,
-                surplus=surplus
+                surplus=surplus,
+                power_from_grid=power_from_grid,
             )
         )
+        task.sleep(0.0001)  # yield to other tasks
 
     if logging:
         log.warning("\n" + msg)
@@ -1221,14 +1277,13 @@ def get_pv_forecast_with_prices(t_start: datetime, t_end: datetime, epex_prices:
 
 
 @time_trigger("period(now, 120sec)")
-@state_trigger(
-    f"{Grid.max_feedin_target} or {Grid.max_pv_feedin_target} or {Automation.auto_setpoint} or {EV.able_to_charge_on_arrival}"
-)
+@state_trigger(f"{Grid.max_feedin_target} or {Grid.max_pv_feedin_target} or {Automation.auto_setpoint}")
 def auto_setpoint_target():
     task.unique("auto setpoint target", kill_me=True)
     t_now = now()
     setpoint = 0
     logging = False
+    forecast_hours = 24
 
     max_feedin_limit = get(Grid.max_feedin_target, 4000)
     max_pv_feedin = get(Grid.max_pv_feedin_target, 4000)
@@ -1240,11 +1295,15 @@ def auto_setpoint_target():
 
     house_avg_power = get(House.daily_average_power, 0)  # W
 
-    battery_capacity = get(Battery.capacity, 0)
+    battery_capacity = get(Battery.capacity, 1337)
+
+    if battery_capacity == 1337:
+        log.error("Battery capacity not available yet, cannot calculate setpoint")
+        return
+
     battery_min_energy = 0.1 * battery_capacity  # 10% of battery capacity
     if logging:
         log.warning(f"battery capacity: {battery_capacity} min energy: {battery_min_energy}")
-    able_to_charge_on_arrival = get(EV.able_to_charge_on_arrival, False)
 
     ev_schedule = (schedule.get_schedule(entity_id="schedule.tesla_planned_drives") or {}).get(
         "schedule.tesla_planned_drives", {}
@@ -1253,6 +1312,8 @@ def auto_setpoint_target():
     # data = {'monday': [], 'tuesday': [], 'wednesday': [{'from': datetime.time(7, 30), 'to': datetime.time(17, 0)}], 'thursday': [], 'friday': [], 'saturday': [], 'sunday': [{'from': datetime.time(9, 30), 'to': datetime.time(10, 0), 'data': {'required_charge': 50}}]}
     ev_required_soc = get(EV.required_soc, 80)
     ev_schedule = parse_full_schedule(ev_schedule, default_required_soc=ev_required_soc)
+    ev_energy = get(EV.energy, EVConst.ev_capacity)
+    current_setpoint = get(Grid.power_setpoint_target, max_setpoint)
 
     def forecast_setpoint_local(
         forecast,
@@ -1271,12 +1332,11 @@ def auto_setpoint_target():
             forecast = [entry for entry in forecast if t_start < entry.period_start]
         elif t_end is not None:
             forecast = [entry for entry in forecast if entry.period_start < t_end]
-        return forecast_setpoint(
+        result = forecast_setpoint(
             forecast,
             setpoint=setpoint,
             battery_capacity=battery_capacity,
             min_feedin_price=min_feedin_price,
-            feed_in_limit=max_feedin_limit,
             forecast_dampening=forecast_dampening,
             battery_energy=current_battery_energy,
             setpoint_spread=setpoint_spread,
@@ -1285,12 +1345,12 @@ def auto_setpoint_target():
             ev_energy=ev_energy,
             max_battery_power_target=max_battery_power_target,
             max_pv_feedin_target=max_pv_feedin,
-            able_to_charge_on_arrival=able_to_charge_on_arrival,
             max_setpoint=max_setpoint,
             logging=logging,
             ev_schedule=ev_schedule,
         )
-        task.sleep(0.5)
+        task.sleep(0.01)  # sleep to allow other tasks to run
+        return result
 
     # Binary search for optimal setpoint
     current_battery_energy = battery_energy
@@ -1303,12 +1363,8 @@ def auto_setpoint_target():
     pv_power_total = get(PVProduction.total_power, 0)
 
     epex_pv_forecast = get_pv_forecast_with_prices(
-        t_start=t_now, t_end=t_now + timedelta(hours=80), epex_prices=epex_prices
+        t_start=t_now, t_end=t_now + timedelta(hours=forecast_hours), epex_prices=epex_prices
     )
-
-    ev_energy = get(EV.energy, EVConst.ev_capacity)
-
-    current_setpoint = get(Grid.power_setpoint_target, max_setpoint)
 
     skip_automation_message = ""
     if automation_disabled := get(Automation.auto_setpoint, False) is False:
@@ -1517,20 +1573,10 @@ def auto_setpoint_target():
         log.warning(format_setpoint_results(search_results, "update spread"))
         new_result = search_results[-1]
 
-        # forecast_setpoint_local(
-        #     price_forecast,
-        #     setpoint=new_result.setpoint,
-        #     setpoint_spread=new_result.setpoint_spread,
-        #     current_battery_energy=start_detail.battery_energy,
-        #     with_ev_charging=True,
-        #     ev_energy=ev_energy,
-        #     max_battery_power_target=8000,
-        #     logging=True
-        # )
-
-        log.warning(
-            f" \n\nnew_result.max_feedin {new_result.max_feedin:0f} > max_pv_feedin {max_pv_feedin:0f}: {new_result.max_feedin > max_pv_feedin}\n\n!!"
-        )
+        if logging:
+            log.warning(
+                f" \n\nnew_result.max_feedin {new_result.max_feedin:0f} > max_pv_feedin {max_pv_feedin:0f}: {new_result.max_feedin > max_pv_feedin}\n\n!!"
+            )
         msg = ""
         while new_result.max_feedin > max_pv_feedin and new_result.max_battery_power_target > 100:
             new_result = forecast_setpoint_local(
@@ -1548,7 +1594,9 @@ def auto_setpoint_target():
                 f"\nupdated max battery power target: {new_result.max_battery_power_target:.1f} W, "
                 f"setpoint: {new_result.setpoint:.1f} W, max_feedin: {new_result.max_feedin:.1f} W"
             )
-        log.warning(msg)
+
+        if logging:
+            log.warning(msg)
 
         # if the end time is before the time limit, need to forecast again for the remaining time
         rest_forecast = [el for el in epex_pv_forecast if el.period_start > t_end]
@@ -1618,77 +1666,3 @@ def auto_setpoint_target():
         **power_w_attributes,
         detail=setpoint_result.detail,
     )
-
-
-# @time_trigger("period(now, 30sec)")
-# @state_trigger(f"{Grid.max_feedin_target} or {Grid.max_pv_feedin_target}")
-def auto_setpoint_target2():
-    # if not get(Automation.auto_setpoint, False):
-    #     return
-    t_now = now()
-    setpoint = 0
-
-    max_feedin_limit = get(Grid.max_feedin_target, 4000)
-    max_pv_feedin = get(Grid.max_pv_feedin_target, 4000)
-
-    forecast_dampening = 0.9  # dampen the forecast to account for inaccuracies
-    battery_min_energy = 2
-    battery_energy = get(Battery.energy, 0)
-    min_feedin_price = 0
-
-    battery_capacity = get(Battery.capacity, 0)
-    epex_prices = get_attr(ElectricityPrices.epex_forecast_prices, "data", [])
-    battery_energy = get(Battery.energy, 0)
-
-    forecast = get_pv_forecast_with_prices(t_start=t_now, t_end=t_now + timedelta(hours=80), epex_prices=epex_prices)
-    period_hours = (forecast[1].period_start - forecast[0].period_start).total_seconds() / 60 / 60
-
-    future = forecast_setpoint(
-        forecast,
-        setpoint=max_setpoint,
-        battery_capacity=battery_capacity,
-        min_feedin_price=min_feedin_price,
-        feed_in_limit=max_feedin_limit,
-        forecast_dampening=forecast_dampening,
-        battery_energy=battery_energy,
-        setpoint_spread=1,
-        battery_min_energy=battery_min_energy,
-        max_pv_feedin_target=max_pv_feedin,
-    )
-
-    if future.t_max_feedin > max_feedin_limit:
-        ev_charging_available = get(Charger.ready, False) or get(EV.is_charging, False)
-        current_soc = get(EV.soc, 0)
-        ev_max_energy_intake = (get(EV.smart_charge_limit, 0) - current_soc) * Const.ev_capacity
-
-        feedins = {e.period_start: e.feedin for e in future if e.period_start.day == future.t_max_feedin.day}
-
-        t_feedin_start = next(
-            iter([t for t, f in feedins.items()[::-1] if f < max_feedin_limit / 5 and t < future.t_max_feedin]),
-            future.t_max_feedin,
-        )
-        t_feedin_stop = next(
-            iter([t for t, f in feedins.items() if f < max_feedin_limit / 5 and t > future.t_max_feedin]),
-            future.t_max_feedin,
-        )
-
-        feedin_energy = sum(
-            [e.feedin * period_hours * 1000 for e in future.detail if t_feedin_start < e.period_start < t_feedin_stop]
-        )
-
-        min_bat, t_min_bat = min(
-            [(e.min_bat, e.t_min_bat) for e in future.detail if e.period_start < future.t_max_feedin],
-            default=(0, None),
-        )
-
-        if min_bat > battery_min_energy:
-            energy_to_spend = min_bat - battery_min_energy
-
-        feedin_price_zones = sorted(
-            [(e.period_start, e.price) for e in future.detail if e.period_start < future.t_max_feedin],
-            key=lambda x: x[1],
-            reverse=True,
-        )
-
-        if ev_charging_available and ev_max_energy_intake > 0:
-            energy_to_spend -= ev_max_energy_intake

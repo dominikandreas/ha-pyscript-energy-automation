@@ -1,7 +1,7 @@
 # ruff: noqa: I001
 
 from datetime import timedelta
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 
 if TYPE_CHECKING:
@@ -199,6 +199,70 @@ def ev_energy_needed():
     set_state(EV.energy_needed, energy_needed)
 
 
+@pyscript_compile
+def define_interfaces():
+    from dataclasses import dataclass
+    from datetime import datetime
+
+    @dataclass
+    class EVScheduleEntry:
+        start: datetime
+        end: datetime
+        distance: float | None = None
+        required_soc: float | None = None
+
+    return EVScheduleEntry
+
+EVScheduleEntry = define_interfaces()
+
+
+@pyscript_compile
+def parse_full_schedule(
+    schedule_data: dict[str, list[dict[str, Any]]], default_required_soc: float
+) -> list["EVScheduleEntry"]:
+    from datetime import date, datetime
+    today = date.today()
+    today_weekday = today.weekday()
+    day_map = {
+        name: i for i, name in enumerate(["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"])
+    }
+
+    entries = []
+    for day_name, events in schedule_data.items():
+        event_weekday = day_map.get(day_name, -1)
+        if event_weekday == -1:
+            continue
+
+        day_offset = (event_weekday - today_weekday + 7) % 7
+        event_date = today + timedelta(days=day_offset)
+
+        for event in events:
+            soc = event.get("data", {}).get("required")
+            distance = event.get("data", {}).get("distance")  # km
+            if not soc and distance:
+                soc = distance / 100 * Const.kwh_per_100km / Const.ev_capacity * 100 * 1.2  # add 20% margin
+            elif not soc:
+                soc = default_required_soc
+
+            entries.append(
+                EVScheduleEntry(
+                    start=with_timezone(datetime.combine(event_date, event["from"])),
+                    end=with_timezone(datetime.combine(event_date, event["to"])),
+                    required_soc=float(soc) if soc is not None else None,
+                    distance=float(distance) if distance is not None else None,
+                )
+            )
+
+    return sorted(entries, key=lambda x: x.start)
+
+def get_ev_schedule():
+    ev_schedule = (schedule.get_schedule(entity_id="schedule.tesla_planned_drives") or {}).get(
+        "schedule.tesla_planned_drives", {}
+    )
+    ev_required_soc = get(EV.required_soc, 80)
+    return parse_full_schedule(ev_schedule, default_required_soc=ev_required_soc)
+
+
 @time_trigger("period(now, 60sec)")
 @state_active(
     f"{Charger.force_charge} == 'off' and {Automation.auto_ev_charging} == 'on' and ({Charger.ready} == 'on' or {Charger.control_switch} == 'on')"
@@ -218,8 +282,13 @@ async def auto_ev_charging():
     if current_soc < 0:
         log.warning("EV SOC is not set, cannot proceed with charging control.")
         return
+    
+    ev_schedule = get_ev_schedule()
+    t_now = now()
+    
     # required state of charge defined by the owner
     required_soc = get(EV.required_soc, 80)
+
     # the current excess power available, this is defined as power going into the battery or into the grid (or the opposite, depending on the sign)
     excess_power = get(Excess.power, 1337)  # in W
     if excess_power == 1337:
@@ -247,7 +316,19 @@ async def auto_ev_charging():
 
     # next drive is the point in time where the user needs to have the car charged to the required soc
     ongoing = get(EV.planned_drives, False)
-    next_drive = get_attr(EV.planned_drives, "next_event")
+    if ev_schedule is not None:
+        ongoing = next(iter([s for s in ev_schedule if s.start <= t_now < s.end]), None)
+        if ongoing is None:
+            next_drive_event = next(iter([s for s in ev_schedule if s.start > t_now]), None)
+            if next_drive_event:
+                next_drive = next_drive_event.start
+                if next_drive_event.required_soc:
+                    required_soc = next_drive_event.required_soc
+                elif next_drive_event.distance:
+                    required_soc = next_drive_event.distance / 100 * Const.kwh_per_100km
+                energy_needed = max(0, current_soc - required_soc) / 100 * Const.ev_capacity
+    else:
+        next_drive = get_attr(EV.planned_drives, "next_event")
     is_charging = get(Charger.control_switch, False)
 
     if ongoing:

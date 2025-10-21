@@ -130,6 +130,8 @@ class House:
     """The upcoming energy extra demand to plan for (e.g. washing machine, EV charging)"""
     energy_surplus = "sensor.energy_surplus"
     """Energy surplus in kWh, energy that exceeds the expected house consumption (excluding EV charging)"""
+    energy_surplus_after_ev_charging = "sensor.energy_surplus_after_ev_charging"
+    """Energy surplus in kWh after accounting for planned EV charging"""
     energy_to_burn = "sensor.energy_to_burn"
     """Energy to burn in kWh, energy that exceeds expected consumption and storage capacity (including EV). 
     This can be used to e.g. heat water or drive dehumidifiers."""

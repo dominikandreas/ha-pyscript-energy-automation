@@ -189,22 +189,27 @@ def write_output_states(state_attributes):
 
     import yaml
 
-    input_number_states = []
+    input_number_states = {}
 
     for k, v in state_attributes.items():
         id = k.split(".")[1]
         if "name" not in v:
             v["name"] = id.replace("_", " ").title()
-        if "unique_id" not in v:
-            v["unique_id"] = id
+
+        # not supported in input_number
+        for k in ("device_class", "unique_id", "state_class"):
+            if k in v:
+                v.pop(k)
 
     for k, v in list(state_attributes.items()):
         if k.startswith("input_number"):
-            input_number_states.append(v)
+            input_number_states[k.split(".")[1]] = v
             del state_attributes[k]
 
     if input_number_states:
-        Path("/config/pyscript_input_numbers.yaml").write_text(indent(yaml.dump(input_number_states), "  "))
+        Path("/config/generated/input_numbers/pyscript_input_numbers.yaml").write_text(
+            indent(yaml.dump(input_number_states), "  ")
+        )
 
     sensors = []
     for k, v in state_attributes.items():
@@ -212,27 +217,36 @@ def write_output_states(state_attributes):
         if "name" not in v:
             v["name"] = id.replace("_", " ").title()
         v["unique_id"] = id
-        v["template"] = "{}"
+        v["state"] = "{{-1}}"
+        for k in ("friendly_name",):
+            if k in v:
+                v.pop(k)
         sensors.append(v)
 
-    Path("/config/pyscript_template_sensors.yaml").write_text(indent(yaml.dump([dict(sensor=sensors)]), "  "))
+    Path("/config/generated/sensors/pyscript_template_sensors.yaml").write_text(indent(yaml.dump(sensors), "    "))
 
 
+@pyscript_compile
 def load_output_states():
+    import sys
     from pathlib import Path
 
     import yaml
 
     state_attributes = defaultdict(dict)
+    try:
+        input_number_states = yaml.safe_load(
+            Path("/config/generated/input_numbers/pyscript_input_numbers.yaml").read_text()
+        )
+        for unique_id, v in input_number_states.items():
+            state_attributes[f"input_number.{unique_id}"] = v
 
-    input_number_states = yaml.safe_load(Path("/config/pyscript_input_numbers.yaml").read_text())
-    for v in input_number_states:
-        state_attributes[f"input_number.{v['unique_id']}"] = v
-
-    sensors = yaml.safe_load(Path("/config/pyscript_template_sensors.yaml").read_text())
-    if type(sensors) is list and len(sensors) > 0:
-        for v in sensors[0].get("sensor", []):
-            state_attributes[f"sensor.{v['unique_id']}"] = v
+        sensors = yaml.safe_load(Path("/config/generated/sensors/pyscript_template_sensors.yaml").read_text())
+        if type(sensors) is list and len(sensors) > 0:
+            for v in sensors:
+                state_attributes[f"sensor.{v['unique_id']}"] = v
+    except Exception as e:
+        print(f"Error loading output states: {e}", file=sys.stderr)  # type: ignore  # noqa: F821
 
     return state_attributes
 
@@ -241,9 +255,13 @@ class OutputStateRegistry:
     _attribute_keys = {"device_class", "friendly_name", "icon", "state_class", "unit_of_measurement"}
 
     def __init__(self):
-        self._last_written_keys = None
+        loaded = await hass.async_add_executor_job(load_output_states)
+
+        self._last_written_keys = loaded.keys()
+        if self._last_written_keys:
+            log.warning(f"Loaded output states for: {self._last_written_keys}")  # type: ignore  # noqa: F821
         self._state_attributes = defaultdict(dict)
-        for k, v in load_output_states().items():
+        for k, v in loaded.items():
             self._state_attributes[k] = v
 
         self._last_written = {*self._state_attributes}
@@ -251,31 +269,13 @@ class OutputStateRegistry:
     def set(self, id, attributes):
         self._state_attributes[id] = {k: v for k, v in attributes.items() if k in self._attribute_keys}
 
-    def write(self):
+    def write_if_necessary(self):
         all_states = self.get_all_states()
-        state_keys = {*all_states.keys()}
-        if self._last_written_keys is None or state_keys > self._last_written_keys:
+        state_keys = set(all_states.keys())
+        if self._last_written_keys is None or state_keys != self._last_written_keys:
             awaitable = hass.async_add_executor_job(write_output_states, all_states)
             self._last_written = state_keys
             return awaitable
-
-    def lazy_write(self, delay=60):
-        if not hasattr(self, "_delayed_write_task"):
-            self._delayed_write_task = None
-
-        async def delayed_write():
-            await asyncio.sleep(delay)
-            await self.write()
-            self._delayed_write_task = None
-
-        # Cancel any existing delayed_write task
-        if self._delayed_write_task is not None:
-            try:
-                task.cancel(self._delayed_write_task)
-            except Exception:
-                pass
-
-        self._delayed_write_task = task.create(delayed_write())
 
     def get_all_states(self) -> dict:
         return dict(**self._state_attributes)
@@ -286,9 +286,9 @@ output_state_registry = OutputStateRegistry()
 
 async def set_state(id: str, value, **attributes):
     state.set(id, value)  # type: ignore # noqa: F821
-    # if attributes:
-    #     output_state_registry.set(id, attributes)
-    #     await output_state_registry.write()
+    if attributes:
+        output_state_registry.set(id, attributes)
+        await output_state_registry.write_if_necessary()
 
     if id.startswith("input_boolean"):
         if type(value) is bool:
