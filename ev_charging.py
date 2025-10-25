@@ -93,9 +93,18 @@ def ev_energy():
 
 
 @state_trigger(f"{Charger.force_charge}.lower() == 'on'")
-def enable_force_charge():
-    set_state(Charger.control_switch, True)
-    set_phases_and_current(3, 16, "Force charge enabled, setting max power")
+@time_trigger
+@time_trigger("period(now, 300sec)")
+def force_charge():
+    if not get(Charger.force_charge, False):
+        return
+    if (val := get(Charger.control_switch, default=None, mapper=bool)) is False:
+        log.warning("Force charge enabled, turning on EV charger")
+        set_state(Charger.control_switch, True)
+        if get(Charger.phases, 3) != 3 or get(Charger.current_setting, -1) != 16:
+            set_phases_and_current(3, 16, "Force charge enabled, setting max power")
+    else:
+        log.warning(f"Force charge enabled, EV charger already on: {val}")
 
 
 def turn_on_charger(reason: str = ""):
