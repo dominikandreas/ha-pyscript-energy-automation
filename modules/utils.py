@@ -153,7 +153,7 @@ def get(id, default="unknown", mapper=None):
             log.warning(f"Error getting {id}, returning default: {default}")
         return default
 
-    if type(default) is bool:
+    if mapper is bool:
         if val in ("on", "On", "off", "Off"):
             val = val.lower() == "on"
         if val in ("true", "True", "false", "False"):
@@ -285,16 +285,18 @@ output_state_registry = OutputStateRegistry()
 
 
 async def set_state(id: str, value, **attributes):
-    state.set(id, value)  # type: ignore # noqa: F821
-    if attributes:
-        output_state_registry.set(id, attributes)
-        await output_state_registry.write_if_necessary()
-
-    if id.startswith("input_boolean"):
+    if id.split(".", 1)[0] in ("input_boolean", "switch"):
         if type(value) is bool:
             value = "on" if value else "off"
         else:
             assert value in ("on", "off"), f"got {value}, expected boolean or 'on' or 'off'"
+
+    state.set(id, value)  # type: ignore # noqa: F821
+
+    if attributes:
+        output_state_registry.set(id, attributes)
+        await output_state_registry.write_if_necessary()
+
     if attributes:
         if "friendly_name" not in attributes:
             attributes["friendly_name"] = id.split(".")[-1].replace("_", " ").title()
