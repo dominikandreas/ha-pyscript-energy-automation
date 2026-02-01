@@ -169,6 +169,10 @@ def get(id, default="unknown", mapper=None):
 
 
 def get_attr(id, name=None, default=None, mapper=None) -> dict | None:
+    if name == "last_changed" or name == "last_updated":
+        # special handling for last_changed/last_updated
+        id = f"{id}.{name}"  # type: ignore  # noqa: F821
+        return eval(id)
     if name is None:
         val = state.getattr(id)  # type: ignore  # noqa: F821
     else:
@@ -184,12 +188,32 @@ def indent(str, indentation):
 
 
 @pyscript_compile
+def write_entity_definitions(domain, states_dict):
+    import sys
+    from pathlib import Path
+
+    import yaml
+
+    if not states_dict:
+        return
+
+    path = Path(f"/config/generated/{domain}s/pyscript_{domain}s.yaml")
+    print(f"Writing entity definitions for {domain}s to {path}: {states_dict}", file=sys.stderr)  # type: ignore  # noqa: F821
+    path.parent.mkdir(exist_ok=True)
+
+    path.write_text(indent(yaml.dump(states_dict), "  "))
+
+
+@pyscript_compile
 def write_output_states(state_attributes):
     from pathlib import Path
 
     import yaml
 
     input_number_states = {}
+    input_select_states = {}
+
+    domain_states = {}
 
     for k, v in state_attributes.items():
         id = k.split(".")[1]
@@ -202,14 +226,16 @@ def write_output_states(state_attributes):
                 v.pop(k)
 
     for k, v in list(state_attributes.items()):
-        if k.startswith("input_number"):
-            input_number_states[k.split(".")[1]] = v
-            del state_attributes[k]
+        state_id = k.split(".")[1]
+        for domain in ("input_number", "input_boolean", "input_select"):
+            if k.startswith(domain):
+                if domain not in domain_states:
+                    domain_states[domain] = {}
+                domain_states[domain][state_id] = v
+                del state_attributes[k]
 
-    if input_number_states:
-        Path("/config/generated/input_numbers/pyscript_input_numbers.yaml").write_text(
-            indent(yaml.dump(input_number_states), "  ")
-        )
+    for domain, states in domain_states.items():
+        write_entity_definitions(domain, states)
 
     sensors = []
     for k, v in state_attributes.items():
@@ -217,13 +243,13 @@ def write_output_states(state_attributes):
         if "name" not in v:
             v["name"] = id.replace("_", " ").title()
         v["unique_id"] = id
-        v["state"] = "{{-1}}"
+        v["state"] = "undefined"
         for k in ("friendly_name",):
             if k in v:
                 v.pop(k)
         sensors.append(v)
 
-    Path("/config/generated/sensors/pyscript_template_sensors.yaml").write_text(indent(yaml.dump(sensors), "    "))
+    Path("/config/generated/sensors/pyscript_sensors.yaml").write_text(indent(yaml.dump(sensors), "    "))
 
 
 @pyscript_compile
@@ -235,16 +261,21 @@ def load_output_states():
 
     state_attributes = defaultdict(dict)
     try:
-        input_number_states = yaml.safe_load(
-            Path("/config/generated/input_numbers/pyscript_input_numbers.yaml").read_text()
-        )
-        for unique_id, v in input_number_states.items():
-            state_attributes[f"input_number.{unique_id}"] = v
+        for domain in ("input_number", "sensor", "input_select", "input_boolean"):
+            path = Path(f"/config/generated/{domain}s/pyscript_{domain}s.yaml")
+            if not path.exists():
+                print(f"No output states file found for {domain} at {path}", file=sys.stderr)  # type: ignore  # noqa: F821
+                continue
+            loaded = yaml.safe_load(path.read_text())
+            if domain == "sensor":
+                if type(loaded) is list and len(loaded) > 0:
+                    for v in loaded:
+                        state_attributes[f"{domain}.{v['unique_id']}"] = v
+            else:
+                for unique_id, v in loaded.items():
+                    state_attributes[f"{domain}.{unique_id}"] = v
 
-        sensors = yaml.safe_load(Path("/config/generated/sensors/pyscript_template_sensors.yaml").read_text())
-        if type(sensors) is list and len(sensors) > 0:
-            for v in sensors:
-                state_attributes[f"sensor.{v['unique_id']}"] = v
+            print(f"Loaded output states from {path}: {loaded}", file=sys.stderr)  # type: ignore  # noqa: F821
     except Exception as e:
         print(f"Error loading output states: {e}", file=sys.stderr)  # type: ignore  # noqa: F821
 
@@ -252,7 +283,7 @@ def load_output_states():
 
 
 class OutputStateRegistry:
-    _attribute_keys = {"device_class", "friendly_name", "icon", "state_class", "unit_of_measurement"}
+    _attribute_keys = {"device_class", "friendly_name", "icon", "state_class", "unit_of_measurement", "min", "max"}
 
     def __init__(self):
         loaded = await hass.async_add_executor_job(load_output_states)
@@ -267,6 +298,8 @@ class OutputStateRegistry:
         self._last_written = {*self._state_attributes}
 
     def set(self, id, attributes):
+        if id.startswith("input_number") and not ("min" in attributes and "max" in attributes):
+            raise ValueError("input_number must have min and max attributes set")
         self._state_attributes[id] = {k: v for k, v in attributes.items() if k in self._attribute_keys}
 
     def write_if_necessary(self):
@@ -274,7 +307,7 @@ class OutputStateRegistry:
         state_keys = set(all_states.keys())
         if self._last_written_keys is None or state_keys != self._last_written_keys:
             awaitable = hass.async_add_executor_job(write_output_states, all_states)
-            self._last_written = state_keys
+            self._last_written_keys = state_keys
             return awaitable
 
     def get_all_states(self) -> dict:
@@ -284,28 +317,33 @@ class OutputStateRegistry:
 output_state_registry = OutputStateRegistry()
 
 
-async def set_state(id: str, value, **attributes):
-    if id.split(".", 1)[0] in ("input_boolean", "switch"):
+async def set_state(entity_id: str, value, **attributes):
+    if entity_id.startswith("input_boolean"):
         if type(value) is bool:
             value = "on" if value else "off"
         else:
             assert value in ("on", "off"), f"got {value}, expected boolean or 'on' or 'off'"
 
-    state.set(id, value)  # type: ignore # noqa: F821
+    if entity_id.startswith("switch"):
+        # use call service to turn on/off switches
+        if type(value) is bool:
+            value = "on" if value else "off"
+            service.call("switch", f"turn_{value}", entity_id=entity_id)
+
+    state.set(entity_id, value)  # type: ignore # noqa: F821
 
     if attributes:
-        output_state_registry.set(id, attributes)
+        output_state_registry.set(entity_id, attributes)
         await output_state_registry.write_if_necessary()
 
-    if attributes:
         if "friendly_name" not in attributes:
-            attributes["friendly_name"] = id.split(".")[-1].replace("_", " ").title()
-        set_attr(id, **attributes)
+            attributes["friendly_name"] = entity_id.split(".")[-1].replace("_", " ").title()
+        set_attr(entity_id, **attributes)
 
 
-def set_attr(id: str, **attributes):
+def set_attr(entity_id: str, **attributes):
     for name, value in attributes.items():
-        state.setattr(f"{id}.{name}", value)  # type: ignore # noqa: F821
+        state.setattr(f"{entity_id}.{name}", value)  # type: ignore # noqa: F821
 
 
 def clip(val, minv, maxv):
