@@ -12,7 +12,6 @@ else:
     from const import EV as Const
     from states import Battery
     from utils import clip, get
-
     from victron import Victron
 
 
@@ -24,6 +23,7 @@ class ChargeAction:
     off = "off"
 
 
+@pyscript_compile
 def _get_ev_smart_charge_limit(schedule, t_now, active_schedule=False):
     if not schedule:
         smart_charge_limit = 85
@@ -45,6 +45,7 @@ def _get_ev_smart_charge_limit(schedule, t_now, active_schedule=False):
     return smart_charge_limit
 
 
+@pyscript_compile
 def _get_ev_energy_needed(required_soc, current_soc, smart_charge_limit, smart_limiter_active):
     """Calculate the energy needed to charge the EV to the required state of charge"""
 
@@ -54,6 +55,7 @@ def _get_ev_energy_needed(required_soc, current_soc, smart_charge_limit, smart_l
     return max(0, (required_soc - current_soc) / 100 * Const.ev_capacity)
 
 
+@pyscript_compile
 def calculate_charger_current_adjustment(
     current_excess: float, target_excess: float, configured_phases: int, configured_current: float
 ) -> int:
@@ -74,6 +76,7 @@ def calculate_charger_current_adjustment(
     return adj
 
 
+@pyscript_compile
 def _get_charge_action(
     next_drive,
     current_soc,
@@ -140,12 +143,12 @@ def _get_charge_action(
     # PV surplus charging, when sufficient excess is available and no time constraints
     elif (
         excess_power > excess_target
-        and (surplus_energy > 0)
+        and (surplus_energy > 0 or excess_power > 5000)
         and (  # prevent charging by discharging from battery when we can excess charge the next day
-            battery_soc > 90 or pv_total_power > 1500 or hours_available_to_charge < 14 
+            battery_soc > 90 or pv_total_power > 1500 or hours_available_to_charge < 14
         )
     ):
-        available_power = (excess_power - excess_target) # in W
+        available_power = excess_power - excess_target  # in W
         # Hysteresis logic with proper unit conversion (W->kW)
         min_3phase_power = 3 * Const.voltage * Const.min_current  # in W
         if configured_phases == 3:
@@ -164,11 +167,11 @@ def _get_charge_action(
             f"Excess power detected: {excess_power:.0f} W, Target: {excess_target:.0f} W, current power {current_power:.0f} W, "
             f"Target Power for EV: {current_power + available_power:.0f} W",
         )
-        return (ChargeAction.on, phases, current, reason)#
-    
+        return (ChargeAction.on, phases, current, reason)  #
+
     # Charge when price is low and not much time left (likely not possible to charge via excess)
     elif is_low_price and hours_available_to_charge < 14:  # Use cheap electricity
-        battery_discharging = get(Victron.mode_sensor, default="off").lower() == "on" and not get(
+        battery_discharging = get(Victron.inverter_mode_sensor, default="off").lower() == "on" and not get(
             Battery.force_charge_switch, False
         )
         if battery_discharging:  # in case we're discharging from battery, we should limit the current accordingly
@@ -179,7 +182,7 @@ def _get_charge_action(
         else:
             phases, current, reason = (3, Const.max_current, "Charging at low price, no battery discharging")
         return (ChargeAction.on, phases, current, reason)
-    
+
     # When charging already active, need to control the charge amps to meet target excess
     elif is_charging and excess_power < excess_target:
         deficit = excess_target - excess_power
@@ -216,7 +219,6 @@ def _get_charge_action(
                 f"Excess power detected: {excess_power:.2f} W, Target: {excess_target:.2f} W "
                 f"Reducing current to meet deficit of {deficit:.2f} W",
             )
-
 
     elif high_price and surplus_energy <= 0 and excess_power < excess_target:
         # Only charge if time-constrained with explicit unit conversion

@@ -79,15 +79,22 @@ def auto_apply_setpoint():
     if setpoint_target < (max_setpoint - 30):
         current_diff_from_avg = house_power_long_term_average - house_loads
         setpoint = round(max(-max_setpoint_target, min(max_setpoint, setpoint_target - current_diff_from_avg)))
-        log.warning(f"updating setpoint {setpoint_target} diff with {current_diff_from_avg} to {setpoint}")
+        # log.warning(f"updating setpoint {setpoint_target} diff with {current_diff_from_avg} to {setpoint}")
     else:
         setpoint = min(max_setpoint, setpoint_target)
 
     if get(EV.is_charging, False):
-        log.warning("setpoint adjusted to -20 since EV is charging")
+        # log.warning("setpoint adjusted to -20 since EV is charging")
         setpoint = -20
 
     set_state(Grid.power_setpoint, round(setpoint))
+
+
+@time_trigger
+def setup_victron_mode_input_select():
+    """Setup the Victron inverter mode input select."""
+    current_mode = Victron.get_inverter_mode()
+    set_state(Victron.inverter_mode_input_select, current_mode, options=list(Victron.MODE_TO_PAYLOAD))
 
 
 @state_trigger(Victron.inverter_mode_input_select)

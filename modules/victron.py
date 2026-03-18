@@ -1,7 +1,7 @@
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from .utils import log, state
+    from .utils import log, set_state, state
 
 from utils import set_state
 
@@ -18,15 +18,13 @@ class Victron:
 
     device_id = "c0619ab445e5"
     inverter_mode_sensor = "sensor.victron_inverter_mode_set"
+    """Sensor for inverter mode"""
     inverter_mode_input_select = "input_select.victron_inverter_mode"
+    """Input select for inverter mode"""
+    auto_set_inverter_mode = "input_boolean.auto_victron_inverter_mode"
+    """Input boolean to enable/disable automatic inverter mode"""
     inverter_mode_mqtt_write_topic = f"victron/W/{device_id}/vebus/275/Mode"
     setpoint_topic = f"victron/W/{device_id}/settings/0/Settings/CGwacs/AcPowerSetPoint"
-
-    mode_input_select = "input_select.victron_inverter_mode"
-    """Input select for inverter mode"""
-    mode_sensor = "sensor.victron_inverter_mode_set"
-    """Sensor for inverter mode"""
-    mode = "input_select.victron_inverter_mode"  # duplicate of mode_input_select?
 
     inverter_efficiency = "sensor.victron_inverter_efficiency"
     inverter_power = "sensor.victron_inverter_power"
@@ -51,6 +49,7 @@ class Victron:
         set_state(Victron.inverter_mode_input_select, new_mode)
 
 
+@pyscript_compile
 def get_auto_inverter_mode(
     ev_is_charging,
     surplus_energy,
@@ -63,6 +62,7 @@ def get_auto_inverter_mode(
     max_charge_price,
     charge_limit_percent,
     force_charge_switch,
+    t_now,
 ):
     min_charge_power = 6 * 230  # 6A amps minimum
 
@@ -71,6 +71,9 @@ def get_auto_inverter_mode(
     new_charge_limit = None  # in W
     new_force_charge_switch_state = None
 
+    surplus_threshold = -daily_avg_power * 10 / 1000
+
+    # When ev is charging, disable inverter if no surplus energy or insufficient pv power
     if ev_is_charging:
         if surplus_energy > 0 or pv_power > (min_charge_power + daily_avg_power) and battery_soc > target_soc:
             reason = f"EV is charging with surplus energy of {surplus_energy} or pv_power > (min_charge_power + daily_avg_power)  {pv_power} > ({min_charge_power} + {daily_avg_power})"
@@ -79,7 +82,8 @@ def get_auto_inverter_mode(
             reason = f"EV is charging {'without' if pv_power < 10 else 'with'} PV power"
             new_mode = InverterMode.off if pv_power < 10 else InverterMode.charger_only
     else:
-        if electricity_price < min_discharge_price and battery_soc < max(5, target_soc, -5):
+        #
+        if electricity_price < min_discharge_price and (battery_soc < max(5, target_soc, -5) or surplus_energy <= 0):
             if pv_power == 0:
                 reason = f"no PV, battery {battery_soc}% < target {target_soc}% and price is low"
                 new_mode = InverterMode.off
@@ -94,9 +98,18 @@ def get_auto_inverter_mode(
         reason = f"Enabling force charge switch and setting charge limit, {battery_soc} < {target_soc}, < {charge_limit_percent}"
         new_force_charge_switch_state = True
         new_charge_limit = 3000
-    elif force_charge_switch:
-        reason = "Disabling force charge switch and resetting charge limit"
-        new_charge_limit = -1
-        new_force_charge_switch_state = False
+    else:
+        if force_charge_switch:
+            reason = "Disabling force charge switch and resetting charge limit"
+            new_charge_limit = -1
+            new_force_charge_switch_state = False
+        elif (
+            pv_power < 0.5 * daily_avg_power
+            and surplus_energy < surplus_threshold
+            and battery_soc < min(25, target_soc)
+        ):
+            reason = f"insufficient pv power for charnging, surplus_energy < {surplus_threshold}kWh, battery soc below target of {target_soc}%"
+            new_mode = InverterMode.off
+            new_charge_limit = -1
 
     return new_mode, new_charge_limit, new_force_charge_switch_state, reason

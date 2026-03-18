@@ -23,6 +23,7 @@ if TYPE_CHECKING:
         service,
         task,
         set_state,
+        pyscript_compile,
     )
     from modules.energy_core import _get_ev_smart_charge_limit, _get_ev_energy_needed, _get_charge_action  # noqa: F401
 
@@ -53,32 +54,6 @@ def smart_charge_limit():
     set_state(EV.smart_charge_limit, smart_charge_limit)
 
 
-def get_ev_requested_energy_today():
-    t_now = now()
-
-    ev_short_term_demand = get(EV.short_term_demand, default=5)
-    next_drive = get_attr(EV.planned_drives, "next_event")
-    drive_ongoing = get(EV.planned_drives, False)
-
-    required_energy_total = get(EV.energy_needed, default=0)
-
-    if drive_ongoing:
-        # If the car is already in use, we don't need to charge it
-        return 0
-
-    if next_drive is not None:
-        next_drive = with_timezone(next_drive)
-
-        leaving_soon = (next_drive - t_now) < timedelta(hours=8)
-
-        if leaving_soon:
-            return required_energy_total
-
-        return max(0, ev_short_term_demand)
-
-    return required_energy_total * 1 / Const.ev_days_allowed_to_reach_target
-
-
 last_ev_charging_phase_change = now() - timedelta(minutes=15)
 ev_charging_turned_on_by_automation = get(Charger.turned_on_by_automation, False)
 
@@ -92,12 +67,17 @@ def ev_energy():
     set_state(EV.energy, ev_energy)
 
 
-@state_trigger(f"{Charger.force_charge}.lower() == 'on'")
-@time_trigger
-@time_trigger("period(now, 300sec)")
+@state_trigger(f"{Charger.force_charge} == 'on' and {Charger.ready} == 'on' and {EV.plugged_in}")
+@time_trigger  # run when script is reloaded
+@time_trigger("period(now, 600sec)")
 def force_charge():
     if not get(Charger.force_charge, False):
+        log.warning("Force charge disabled")
         return
+    if not (state := get(EV.plugged_in, False)):
+        log.warning("No vehicle connected")
+        return
+    log.warning(f"state is {state}")
     if (val := get(Charger.control_switch, default=None, mapper=bool)) is False:
         log.warning("Force charge enabled, turning on EV charger")
         set_state(Charger.control_switch, True)
@@ -222,6 +202,7 @@ def define_interfaces():
 
     return EVScheduleEntry
 
+
 EVScheduleEntry = define_interfaces()
 
 
@@ -230,6 +211,7 @@ def parse_full_schedule(
     schedule_data: dict[str, list[dict[str, Any]]], default_required_soc: float
 ) -> list["EVScheduleEntry"]:
     from datetime import date, datetime
+
     today = date.today()
     today_weekday = today.weekday()
     day_map = {
@@ -249,7 +231,8 @@ def parse_full_schedule(
             soc = event.get("data", {}).get("required")
             distance = event.get("data", {}).get("distance")  # km
             if not soc and distance:
-                soc = distance / 100 * Const.kwh_per_100km / Const.ev_capacity * 100 * 1.2  # add 20% margin
+                energy_needed = min(Const.ev_capacity, distance / 100 * Const.kwh_per_100km)
+                soc = min(100, energy_needed / Const.ev_capacity * 100 + 10)
             elif not soc:
                 soc = default_required_soc
 
@@ -264,6 +247,7 @@ def parse_full_schedule(
 
     return sorted(entries, key=lambda x: x.start)
 
+
 def get_ev_schedule():
     ev_schedule = (schedule.get_schedule(entity_id="schedule.tesla_planned_drives") or {}).get(
         "schedule.tesla_planned_drives", {}
@@ -272,6 +256,7 @@ def get_ev_schedule():
     return parse_full_schedule(ev_schedule, default_required_soc=ev_required_soc)
 
 
+@time_trigger
 @time_trigger("period(now, 60sec)")
 @state_active(
     f"{Charger.force_charge} == 'off' and {Automation.auto_ev_charging} == 'on' and ({Charger.ready} == 'on' or {Charger.control_switch} == 'on')"
@@ -279,6 +264,8 @@ def get_ev_schedule():
 async def auto_ev_charging():
     """Combined EV charging control with excess power, price and temperature awareness"""
     global last_ev_charging_phase_change
+
+    log.warning(f"auto ev charging active {get(Charger.ready)}")
 
     # ensure only one instance of this task is running (phase switching can take a while)
     task.unique("control_ev_charging", kill_me=True)
@@ -291,10 +278,10 @@ async def auto_ev_charging():
     if current_soc < 0:
         log.warning("EV SOC is not set, cannot proceed with charging control.")
         return
-    
+
     ev_schedule = get_ev_schedule()
     t_now = now()
-    
+
     # required state of charge defined by the owner
     required_soc = get(EV.required_soc, 80)
 
@@ -323,6 +310,7 @@ async def auto_ev_charging():
 
     energy_needed = get(EV.energy_needed, 0)  # in kWh
 
+    next_drive = None
     # next drive is the point in time where the user needs to have the car charged to the required soc
     ongoing = get(EV.planned_drives, False)
     if ev_schedule is not None:
@@ -333,9 +321,13 @@ async def auto_ev_charging():
                 next_drive = next_drive_event.start
                 if next_drive_event.required_soc:
                     required_soc = next_drive_event.required_soc
+                    log.warning(f"required soc defined via next drive event {required_soc}")
                 elif next_drive_event.distance:
-                    required_soc = next_drive_event.distance / 100 * Const.kwh_per_100km
-                energy_needed = max(0, current_soc - required_soc) / 100 * Const.ev_capacity
+                    energy_needed = min(Const.ev_capacity, next_drive_event.distance / 100 * Const.kwh_per_100km)
+                    required_soc = min(100, (energy_needed) / Const.ev_capacity * 100 + 10)
+                    log.warning(f"setting requred soc to {required_soc}")
+                energy_needed = max(0, required_soc - current_soc) / 100 * Const.ev_capacity
+
     else:
         next_drive = get_attr(EV.planned_drives, "next_event")
     is_charging = get(Charger.control_switch, False)
@@ -355,7 +347,7 @@ async def auto_ev_charging():
     t_now = now()
 
     log.warning(
-        f"Current SOC: {current_soc}%, Required SOC: {required_soc}%, Surplus {surplus_energy:.2f}, "
+        f"Current SOC: {current_soc}%, Required SOC: {required_soc}%, Surplus {surplus_energy:.2f}, energy needed {energy_needed:.2f} "
         f"Excess: {excess_power:.2f} kW, Target: {excess_target:.2f} kW "
         f"Energy needed: {energy_needed:.2f} kWh, Time needed: {min_hours_needed:.2f}h, "
         f"low price: {low_price}, high price: {high_price}, next drive: {next_drive}, "
@@ -413,8 +405,7 @@ async def auto_ev_charging():
         and {battery_soc > 90} or {pv_total_power > 1500} or {hours_available_to_charge < 14}
         --------------------------------------------------------
         {excess_power > excess_target and surplus_energy > 3} and {battery_soc > 90 or pv_total_power > 1500 or hours_available_to_charge < 14}
-        """
-    )
+        """)
 
     if action == "on":
         set_phases_and_current(phases, current, reason)

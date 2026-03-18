@@ -11,7 +11,7 @@ class ElectricityPrices:
     low_price = "binary_sensor.low_electricity_price"
     high_price = "binary_sensor.high_electricity_price"
     current_price = "sensor.electricity_price"
-    epex_forecast_prices = "sensor.epex_spot_data_price"
+    epex_forecast_prices = "sensor.epex_spot_data_total_price"
 
 
 class Environment:
@@ -109,6 +109,7 @@ class EV:
     """The energy needed for the next drive (set automatically)."""
     able_to_charge_on_arrival = "input_boolean.ev_able_to_charge_on_arrival"
     """Whether it should be assumed that EV can charge when scheduled to arrive."""
+    plugged_in = "binary_sensor.tesla_plugged_in"
 
 
 class House:
@@ -132,6 +133,10 @@ class House:
     """Energy surplus in kWh, energy that exceeds the expected house consumption (excluding EV charging)"""
     energy_surplus_after_ev_charging = "sensor.energy_surplus_after_ev_charging"
     """Energy surplus in kWh after accounting for planned EV charging"""
+    energy_forecast = "sensor.energy_forecast"
+    """Energy forecast in kWh, expected excess energy based on PV forecast and house consumption"""
+    energy_forecast_with_ev = "sensor.energy_forecast_with_ev"
+    """Energy forecast in kWh including planned EV charging"""
     energy_to_burn = "sensor.energy_to_burn"
     """Energy to burn in kWh, energy that exceeds expected consumption and storage capacity (including EV). 
     This can be used to e.g. heat water or drive dehumidifiers."""
@@ -152,6 +157,7 @@ class PVForecast:
     """The forecast for the 4th day after tomorrow's PV production"""
     forecast_day_5 = "sensor.solcast_pv_forecast_forecast_day_5"
     """The forecast for the 5th day's PV production"""
+    power_now = "sensor.solcast_pv_forecast_power_now"
 
 
 class PVProduction:
@@ -199,6 +205,7 @@ class Grid:
     """AC power from grid"""
     power_1m_average = "sensor.grid_1m_average"
     """1 minute average grid power"""
+    power_setpoint_basis = "input_number.grid_setpoint_basis"
     power_setpoint_target = "sensor.grid_power_setpoint_target"
     """Target grid power setpoint"""
     power_setpoint = "input_number.victron_setpoint"
@@ -234,3 +241,12 @@ class Automation:
     """Switch to enable/disable automatic charge limit calculation"""
     efficient_discharge = "input_boolean.efficient_discharge"
     """Switch to enable/disable efficient discharge mode"""
+
+
+class OctopusEnergy:
+    """Octopus Energy related states"""
+
+    intelligent_dispatch_ev_charging = "binary_sensor.octopus_a_fe756afd_tesla_model_3_intelligent_dispatching_2"
+    """Whether intelligent dispatch is currently turned on. Attributes contain schedule"""
+    smart_control_in_progress = "sensor.octopus_a_fe756afd_tesla_model_3_status"
+    """Whether intelligent dispatching is enabled"""

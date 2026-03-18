@@ -210,9 +210,6 @@ def write_output_states(state_attributes):
 
     import yaml
 
-    input_number_states = {}
-    input_select_states = {}
-
     domain_states = {}
 
     for k, v in state_attributes.items():
@@ -227,7 +224,7 @@ def write_output_states(state_attributes):
 
     for k, v in list(state_attributes.items()):
         state_id = k.split(".")[1]
-        for domain in ("input_number", "input_boolean", "input_select"):
+        for domain in ("input_number",):
             if k.startswith(domain):
                 if domain not in domain_states:
                     domain_states[domain] = {}
@@ -298,8 +295,8 @@ class OutputStateRegistry:
         self._last_written = {*self._state_attributes}
 
     def set(self, id, attributes):
-        if id.startswith("input_number") and not ("min" in attributes and "max" in attributes):
-            raise ValueError("input_number must have min and max attributes set")
+        # if id.startswith("input_number") and not ("min" in attributes and "max" in attributes):
+        #     raise ValueError("input_number must have min and max attributes set")
         self._state_attributes[id] = {k: v for k, v in attributes.items() if k in self._attribute_keys}
 
     def write_if_necessary(self):
@@ -330,6 +327,11 @@ async def set_state(entity_id: str, value, **attributes):
             value = "on" if value else "off"
             service.call("switch", f"turn_{value}", entity_id=entity_id)
 
+    if entity_id.startswith("input_select"):
+        # use call service to turn on/off switches
+
+        service.call("input_select", "select_option", entity_id=entity_id, option=value)
+
     state.set(entity_id, value)  # type: ignore # noqa: F821
 
     if attributes:
@@ -346,5 +348,6 @@ def set_attr(entity_id: str, **attributes):
         state.setattr(f"{entity_id}.{name}", value)  # type: ignore # noqa: F821
 
 
+@pyscript_compile
 def clip(val, minv, maxv):
     return max(minv, min(val, maxv))

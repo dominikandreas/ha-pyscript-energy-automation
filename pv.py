@@ -25,7 +25,7 @@ else:
 @time_trigger("cron(*/2 * * * *)")
 def garage_energy():
     energies = [get(f"sensor.hms_1600_4t_{idx}_yieldtotal", -1.0) for idx in range(1, 4)]
-    if min(energies) < 1.0:
+    if min(energies) < 1000.0:  # for some reason the total yield can be very low after a restart
         return
 
     garage_energy = sum(energies)
@@ -44,7 +44,7 @@ def garage_energy():
 @time_trigger("cron(*/2 * * * *)")
 def garage_energy_today():
     energies = [get(f"sensor.hms_1600_4t_{idx}_yieldday", -1.0) for idx in range(1, 4)]
-    if min(energies) < 1:
+    if min(energies) < 0: 
         return
 
     garage_energy = sum(energies) / 1000
