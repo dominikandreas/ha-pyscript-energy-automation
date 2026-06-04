@@ -206,6 +206,7 @@ class Grid:
     power_1m_average = "sensor.grid_1m_average"
     """1 minute average grid power"""
     power_setpoint_basis = "input_number.grid_setpoint_basis"
+    """The basis for the grid power setpoint, used for automatic setpoint calculation"""
     power_setpoint_target = "sensor.grid_power_setpoint_target"
     """Target grid power setpoint"""
     power_setpoint = "input_number.victron_setpoint"

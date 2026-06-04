@@ -4,14 +4,12 @@ if TYPE_CHECKING:
     # The type checker (linter) does not know that utils can directly be imported in the pyscript engine.
     # Therefore during type checking we pretend to import them from modules.utils, which it can resolve.
     from modules.const import EV as Const
-    from modules.states import Battery
-    from modules.utils import clip, get
+    from modules.utils import clip
     from modules.victron import Victron
 
 else:
     from const import EV as Const
-    from states import Battery
-    from utils import clip, get
+    from utils import clip
     from victron import Victron
 
 
@@ -95,6 +93,8 @@ def _get_charge_action(
     hysteresis=HYSTERESIS_BUFFER,
     is_charging=False,
     t_now=None,
+    inverter_mode: str = "off",
+    battery_force_charge=False,
 ):
     """Calculate the action to take for EV charging based on various conditions.
 
@@ -106,6 +106,9 @@ def _get_charge_action(
      - when price is high and time is not constrained, turn off the charger
      -------------------------------------------------------------------------------------
     """
+
+    if inverter_mode in ("1", "2", "3", "4"):
+        inverter_mode = Victron.PAYLOAD_TO_MODE.get(inverter_mode)
 
     hours_available_to_charge = ((next_drive - t_now).total_seconds() / 3600) if next_drive else 999
     high_price = not is_low_price
@@ -143,9 +146,9 @@ def _get_charge_action(
     # PV surplus charging, when sufficient excess is available and no time constraints
     elif (
         excess_power > excess_target
-        and (surplus_energy > 0 or excess_power > 5000)
+        and (surplus_energy > 0 or excess_power > 3000)
         and (  # prevent charging by discharging from battery when we can excess charge the next day
-            battery_soc > 90 or pv_total_power > 1500 or hours_available_to_charge < 14
+            battery_soc > 90 or pv_total_power > 1500 or hours_available_to_charge < 14 or current_soc < 40
         )
     ):
         available_power = excess_power - excess_target  # in W
@@ -163,7 +166,7 @@ def _get_charge_action(
         adj = calculate_charger_current_adjustment(excess_power, excess_target, configured_phases, configured_current)
         phases, current, reason = (
             phases,
-            configured_current + adj,
+            configured_current + adj if phases <= configured_phases else 7,
             f"Excess power detected: {excess_power:.0f} W, Target: {excess_target:.0f} W, current power {current_power:.0f} W, "
             f"Target Power for EV: {current_power + available_power:.0f} W",
         )
@@ -171,9 +174,7 @@ def _get_charge_action(
 
     # Charge when price is low and not much time left (likely not possible to charge via excess)
     elif is_low_price and hours_available_to_charge < 14:  # Use cheap electricity
-        battery_discharging = get(Victron.inverter_mode_sensor, default="off").lower() == "on" and not get(
-            Battery.force_charge_switch, False
-        )
+        battery_discharging = inverter_mode == "on" and not battery_force_charge
         if battery_discharging:  # in case we're discharging from battery, we should limit the current accordingly
             adj = calculate_charger_current_adjustment(
                 excess_power, excess_target, configured_phases=3, configured_current=configured_current

@@ -28,12 +28,14 @@ if TYPE_CHECKING:
     from modules.energy_core import _get_ev_smart_charge_limit, _get_ev_energy_needed, _get_charge_action  # noqa: F401
 
     from modules.states import Automation, Charger, ElectricityPrices, EV, Excess, Battery, House, PVProduction
+    from modules.victron import Victron
 
 else:
     from const import EV as Const
     from utils import get, set_state, get_attr, now, with_timezone
     from states import Automation, Charger, ElectricityPrices, EV, Excess, Battery, House, PVProduction
     from energy_core import _get_ev_smart_charge_limit, _get_ev_energy_needed, _get_charge_action, HYSTERESIS_BUFFER  # noqa: F401
+    from victron import Victron
 
 
 @state_trigger(f"{EV.planned_drives}")
@@ -265,7 +267,7 @@ async def auto_ev_charging():
     """Combined EV charging control with excess power, price and temperature awareness"""
     global last_ev_charging_phase_change
 
-    log.warning(f"auto ev charging active {get(Charger.ready)}")
+    log.warning(f"Auto ev charging active. Charger state: {get(Charger.ready, False) or get(Charger.control_switch, False)}")
 
     # ensure only one instance of this task is running (phase switching can take a while)
     task.unique("control_ev_charging", kill_me=True)
@@ -309,6 +311,9 @@ async def auto_ev_charging():
     ev_charge_limit = get(EV.smart_charge_limit, 80)
 
     energy_needed = get(EV.energy_needed, 0)  # in kWh
+    battery_force_charge = get(Battery.force_charge_switch, False)
+
+    inverter_mode = get(Victron.inverter_mode_sensor, default="off").lower()
 
     next_drive = None
     # next drive is the point in time where the user needs to have the car charged to the required soc
@@ -379,6 +384,8 @@ async def auto_ev_charging():
         hysteresis=HYSTERESIS_BUFFER,
         is_charging=is_charging,
         t_now=t_now,
+        inverter_mode=inverter_mode,
+        battery_force_charge=battery_force_charge,
     )
 
     hours_available_to_charge = ((next_drive - t_now).total_seconds() / 3600) if next_drive else 999

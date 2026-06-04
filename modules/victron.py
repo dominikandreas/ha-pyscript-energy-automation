@@ -83,9 +83,9 @@ def get_auto_inverter_mode(
             new_mode = InverterMode.off if pv_power < 10 else InverterMode.charger_only
     else:
         #
-        if electricity_price < min_discharge_price and (battery_soc < max(5, target_soc, -5) or surplus_energy <= 0):
+        if electricity_price < min_discharge_price and (surplus_energy < -1):
             if pv_power == 0:
-                reason = f"no PV, battery {battery_soc}% < target {target_soc}% and price is low"
+                reason = f"no PV, battery {surplus_energy}% < -1 and price is low"
                 new_mode = InverterMode.off
             else:
                 reason = f"battery {battery_soc}% < target {target_soc}% and price is low"
