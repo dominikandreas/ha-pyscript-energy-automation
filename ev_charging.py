@@ -81,16 +81,18 @@ def force_charge():
         return
     log.warning(f"state is {state}")
     if (val := get(Charger.control_switch, default=None, mapper=bool)) is False:
-        log.warning("Force charge enabled, turning on EV charger")
-        set_state(Charger.control_switch, True)
+        changed = True
         if get(Charger.phases, 3) != 3 or get(Charger.current_setting, -1) != 16:
-            set_phases_and_current(3, 16, "Force charge enabled, setting max power")
+            changed = set_phases_and_current(3, 16, "Force charge enabled, setting max power")
+        if changed:
+            turn_on_charger("Force charge enabled")
+        else:
+            log.warning("Force charge enabled, but phase/current change was blocked; not turning on EV charger")
     else:
         log.warning(f"Force charge enabled, EV charger already on: {val}")
 
 
 def turn_on_charger(reason: str = ""):
-    global last_ev_charging_phase_change
     charger_enabled = get(Charger.control_switch, False)
     if not charger_enabled:
         log.warning(f"Turning on ev charger {reason}")
@@ -123,8 +125,6 @@ def turn_off_charger(reason: str = "", check_phase_change_cooldown=True, force=F
         service.call("switch", "turn_off", entity_id=Charger.control_switch)
         task.sleep(5)
         new_state = get(Charger.control_switch, False)
-        if new_state is False:
-            last_ev_charging_phase_change = now()  # Update phase change timestamp
 
         return new_state
 
@@ -415,29 +415,7 @@ async def auto_ev_charging():
 
     hours_available_to_charge = ((next_drive - t_now).total_seconds() / 3600) if next_drive else 999
 
-    # excess_power > target_excess
-    # and (surplus_energy > 10 or excess_power > 2 and battery_soc > 90)
-    # and (  # prevent charging by discharging from battery when we can excess charge the next day
-    #     battery_soc > 90
-    #     or pv_total_power > 1500
-    #     # and 10 <= t_now.hour <= 17
-    #     or hours_available_to_charge < 24
-    #     # and current_soc <= required_soc
-    # )
-    log.warning(f"""
-    Got charge action: {action} phases {phases} current {current}: {reason}
-
-        excess_power > excess_target and (surplus_energy > 3)
-        and (battery_soc > 90 or pv_total_power > 1500 or hours_available_to_charge < 14)
-        --------------------------------------------------------
-        {excess_power:.0f} > {excess_target:.0f} and ({surplus_energy} > 3)
-        and ({battery_soc} > 90 or {pv_total_power} > 1500 or {hours_available_to_charge} < 14)
-        --------------------------------------------------------
-        {excess_power > excess_target:.0f} and ({surplus_energy > 3})
-        and {battery_soc > 90} or {pv_total_power > 1500} or {hours_available_to_charge < 14}
-        --------------------------------------------------------
-        {excess_power > excess_target and surplus_energy > 3} and {battery_soc > 90 or pv_total_power > 1500 or hours_available_to_charge < 14}
-        """)
+    log.warning(f"Got charge action: {action} phases {phases} current {current}: {reason}")
 
     if action == "on":
         changed = set_phases_and_current(phases, current, reason)

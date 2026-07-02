@@ -233,12 +233,6 @@ def _get_charge_action(
             )
 
     elif high_price and surplus_energy <= 0 and excess_power < excess_target:
-        # Only charge if time-constrained with explicit unit conversion
-        charge_rate_kw = (3 * Const.voltage * Const.max_current) / 1000  # Convert W to kW
-        min_required_time = energy_needed / charge_rate_kw  # Hours
-        if not (hours_available_to_charge < min_required_time - 0.5):
-            return (ChargeAction.off, 1, 6, "high electricity price and still time available")
-        else:
-            return (ChargeAction.off, 1, 6, "high electricity price and still time available")
+        return (ChargeAction.off, 1, 6, "high electricity price and still time available")
 
     return (ChargeAction.off, 1, 6, "None of the conditions for auto charging matched")
