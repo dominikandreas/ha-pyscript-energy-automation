@@ -105,7 +105,8 @@ def find_time_and_energy_to_reach_target(target_production, forecast_days):
                     current_period_estimate,
                     next_period_estimate,
                 )
-                total_energy += interpolated_pv * period_hours
+                remaining_hours = (next_period_start - t_now).total_seconds() / 3600
+                total_energy += interpolated_pv * remaining_hours
                 log_msg += f"iterpolated total energy to now: {total_energy} from td {next_period_start - current_period_start}: pv {interpolated_pv} kWh  total {total_energy}\n"
 
             elif (
@@ -121,7 +122,7 @@ def find_time_and_energy_to_reach_target(target_production, forecast_days):
                     current_period_start.timestamp(),
                     next_period_start.timestamp(),
                 )
-                time_to_reach_target = datetime.fromtimestamp(interpolated_time)
+                time_to_reach_target = datetime.fromtimestamp(interpolated_time, tz=current_period_start.tzinfo)
 
                 interpolated_pv = interpolate_value(
                     interpolated_time,
@@ -130,7 +131,8 @@ def find_time_and_energy_to_reach_target(target_production, forecast_days):
                     current_period_estimate,
                     next_period_estimate,
                 )
-                total_energy += interpolated_pv * period_hours
+                elapsed_until_target_hours = (time_to_reach_target - current_period_start).total_seconds() / 3600
+                total_energy += interpolated_pv * elapsed_until_target_hours
                 log_msg += f"trtt {time_to_reach_target}: current {current_period_start} - next {next_period_start}: pv {interpolated_pv} kWh  total {total_energy}\n"
                 break
             else:

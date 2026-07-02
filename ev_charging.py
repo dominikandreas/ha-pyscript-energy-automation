@@ -105,11 +105,12 @@ def turn_off_charger(reason: str = "", check_phase_change_cooldown=True):
     global last_ev_charging_phase_change
 
     is_charging = get(Charger.control_switch, False)
+    configured_phases = get(Charger.phases, 3)
 
     if get(Charger.force_charge, False):
         log.warning(f"Not turning off charging, force charge in on. Reason for request {reason}")
     elif is_charging:
-        if check_phase_change_cooldown and last_ev_charging_phase_change > now() - timedelta(minutes=15):
+        if check_phase_change_cooldown and configured_phases == 3 and last_ev_charging_phase_change > now() - timedelta(minutes=15):
             log.warning(f"Phase change too frequent - cooldown active. Reason: {reason or 'no reason provided'}")
             return
 
@@ -251,8 +252,8 @@ def parse_full_schedule(
 
 
 def get_ev_schedule():
-    ev_schedule = (schedule.get_schedule(entity_id="schedule.tesla_planned_drives") or {}).get(
-        "schedule.tesla_planned_drives", {}
+    ev_schedule = (schedule.get_schedule(entity_id=EV.planned_drives) or {}).get(
+        EV.planned_drives, {}
     )
     ev_required_soc = get(EV.required_soc, 80)
     return parse_full_schedule(ev_schedule, default_required_soc=ev_required_soc)
@@ -267,7 +268,7 @@ async def auto_ev_charging():
     """Combined EV charging control with excess power, price and temperature awareness"""
     global last_ev_charging_phase_change
 
-    log.warning(f"Auto ev charging active. Charger state: {get(Charger.ready, False) or get(Charger.control_switch, False)}")
+    # log.warning(f"Auto ev charging active. Charger state: {get(Charger.ready, False) or get(Charger.control_switch, False)}")
 
     # ensure only one instance of this task is running (phase switching can take a while)
     task.unique("control_ev_charging", kill_me=True)
@@ -316,6 +317,7 @@ async def auto_ev_charging():
     inverter_mode = get(Victron.inverter_mode_sensor, default="off").lower()
 
     next_drive = None
+    msg = ""
     # next drive is the point in time where the user needs to have the car charged to the required soc
     ongoing = get(EV.planned_drives, False)
     if ev_schedule is not None:
@@ -326,15 +328,16 @@ async def auto_ev_charging():
                 next_drive = next_drive_event.start
                 if next_drive_event.required_soc:
                     required_soc = next_drive_event.required_soc
-                    log.warning(f"required soc defined via next drive event {required_soc}")
+                    msg += (f"required soc defined via next drive event {required_soc}")
                 elif next_drive_event.distance:
                     energy_needed = min(Const.ev_capacity, next_drive_event.distance / 100 * Const.kwh_per_100km)
                     required_soc = min(100, (energy_needed) / Const.ev_capacity * 100 + 10)
-                    log.warning(f"setting requred soc to {required_soc}")
+                    msg += (f"setting required soc to {required_soc}")
                 energy_needed = max(0, required_soc - current_soc) / 100 * Const.ev_capacity
 
     else:
         next_drive = get_attr(EV.planned_drives, "next_event")
+
     is_charging = get(Charger.control_switch, False)
 
     if ongoing:

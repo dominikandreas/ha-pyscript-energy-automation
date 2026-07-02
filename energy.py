@@ -354,8 +354,8 @@ def battery_use_until_pv_meets_demand():
 
     energy_until_pv_meets_demand = get(PVProduction.energy_until_production_meets_demand, 0)
     discharge_price = get(Automation.min_discharge_price, 100)
-    daily_avg_power = get(House.nightly_average_power, 0)
-    night_avg_power = get(House.daily_average_power, 0)
+    daily_avg_power = get(House.daily_average_power, 0)
+    night_avg_power = get(House.nightly_average_power, 0)
     t_now = now()
 
     price_attr = get_attr(ElectricityPrices.current_price)
@@ -412,6 +412,15 @@ def get_reserve_soc():
     return max(min_reserve, round(summer_deviation * 30, 0))  # ranging from 5 to 30 (max 30% reserve during winter)
 
 
+@pyscript_compile
+def get_low_pv_reserve_soc(house_power: float, pv_power: float, battery_cells_balanced: bool) -> float:
+    if battery_cells_balanced:
+        return 0
+    if house_power <= 0:
+        return 0
+    return 15 if pv_power < house_power * 0.75 else 0
+
+
 def get_ev_requested_energy_today():
     t_now = now()
 
@@ -459,16 +468,28 @@ def auto_battery_target_soc():
     if not get(Automation.auto_battery_target_soc, False):
         return
     battery_soc = get(Battery.soc, default=50)
-    reserve_soc = get_reserve_soc()
+    base_reserve_soc = get_reserve_soc()
 
     house_demand = get(House.energy_demand, default=10)
     pv_upcoming = get(PVProduction.energy_until_production_meets_demand, default=0)
     excess_next_days = get(Excess.excess_next_three_days, default=0)
+    house_power = get(House.daily_average_power, default=0)
     battery_capacity = get(Battery.capacity, default=8)
     battery_cells_balanced = get(Battery.cells_balanced, False)
     battery_energy = get(Battery.energy, default=0)
     surplus = get(House.energy_surplus, 0)
     surplus_detail = get_attr(House.energy_forecast, "detail")
+    pv_power = get(PVProduction.total_power, default=0)
+
+    if pv_power == 0:
+        pv_power = get(PVForecast.power_now, default=0)
+
+    reserve_soc_floor = max(
+        base_reserve_soc,
+        get_low_pv_reserve_soc(
+            house_power=house_power, pv_power=pv_power, battery_cells_balanced=battery_cells_balanced
+        ),
+    )
 
     if not surplus_detail:
         return
@@ -486,7 +507,7 @@ def auto_battery_target_soc():
 
     msg = (
         f"\nAuto battery target soc calculation: \n"
-        f"\n\thouse_demand: {house_demand:.2f}kWh, pv_upcoming: {pv_upcoming:.2f}kWh, reserve_soc: {reserve_soc:.2f}%, "
+        f"\n\thouse_demand: {house_demand:.2f}kWh, pv_upcoming: {pv_upcoming:.2f}kWh, reserve_soc: {reserve_soc_floor:.2f}%, "
         f"\n\texcess_next_days: {excess_next_days:.2f}kWh, battery_capacity: {battery_capacity:.2f}kWh, battery_energy: {battery_energy:.2f}kWh, surplus: {surplus:.2f}kWh => req_energy: {req_energy:.2f}kWh"
     )
 
@@ -494,7 +515,7 @@ def auto_battery_target_soc():
 
     max_soc = 80 if battery_cells_balanced else 100
 
-    reserve_soc = max(2, reserve_soc - (house_demand - pv_upcoming))
+    reserve_soc = max(reserve_soc_floor, base_reserve_soc - (house_demand - pv_upcoming))
 
     minimal_soc = min(max_soc, (max(0, req_energy) / battery_capacity * 100) + reserve_soc)
     set_state(Automation.minimal_soc, round(minimal_soc, 2), unit_of_measurement="%")  # different attributes
@@ -959,6 +980,7 @@ def forecast(
     min_discharge_price: float | None = None,
     charger_ready: bool | None = None,
     eff_dis: bool | None = None,
+    battery_cells_balanced: bool | None = None,
     t_now: datetime | None = None,
 ):
     t_now = t_now or now()
@@ -977,6 +999,9 @@ def forecast(
     min_discharge_price = min_discharge_price or float(get(Automation.min_discharge_price, default=0))
     charger_ready = charger_ready or get(Charger.ready, False)
     eff_dis = eff_dis or get(Automation.efficient_discharge, False)
+    battery_cells_balanced = (
+        battery_cells_balanced if battery_cells_balanced is not None else get(Battery.cells_balanced, False)
+    )
     return _forecast(
         forecast=forecast,
         setpoint=setpoint,
@@ -1007,6 +1032,7 @@ def forecast(
         min_discharge_price=min_discharge_price,
         charger_ready=charger_ready,
         eff_dis=eff_dis,
+        battery_cells_balanced=battery_cells_balanced,
         t_now=t_now,
     )
 
@@ -1042,6 +1068,7 @@ def _forecast(
     min_discharge_price: float | None = None,
     charger_ready: bool | None = None,
     eff_dis: bool | None = None,
+    battery_cells_balanced: bool | None = None,
     t_now: datetime | None = None,
 ):
     if not len(forecast) > 1:
@@ -1140,6 +1167,14 @@ def _forecast(
 
         power_production: float = entry.pv_estimate * forecast_dampening * 1000
         house_power = daily_power if 7 < start.hour < 19 else nightly_power
+        period_battery_min_energy = battery_min_energy
+        low_pv_reserve_soc = get_low_pv_reserve_soc(
+            house_power=house_power,
+            pv_power=power_production,
+            battery_cells_balanced=bool(battery_cells_balanced),
+        )
+        if low_pv_reserve_soc > 0:
+            period_battery_min_energy = max(period_battery_min_energy, battery_capacity * low_pv_reserve_soc / 100 + 1)
 
         smart_charge_limit = 101
         if next_drive_event:
@@ -1222,7 +1257,7 @@ def _forecast(
             prices_mean,
             prices_std,
             battery_energy=tentative_batt_energy,
-            battery_min_limit=battery_min_energy,
+            battery_min_limit=period_battery_min_energy,
             pv_power=power_production,
             house_power=house_power,
             setpoint_spread=setpoint_spread,
@@ -1234,13 +1269,15 @@ def _forecast(
         if is_charging_ev and ev_charge_power > 1:
             added_ev_energy = ev_charge_power * period_hours / 1000
             # Cap at smart limit
-            if ev_energy + added_ev_energy > smart_charge_limit:
-                added_ev_energy = max(0, smart_charge_limit - ev_energy)
+            if ev_energy + added_ev_energy > smart_charge_limit * EVConst.ev_capacity / 100:
+                added_ev_energy = max(0, smart_charge_limit * EVConst.ev_capacity / 100 - ev_energy)
                 # Recalculate power to match the energy cap
                 ev_charge_power = (added_ev_energy * 1000) / period_hours if period_hours > 0 else 0
 
             ev_energy += added_ev_energy
-            free_capacity = smart_charge_limit - ev_energy + battery_capacity - battery_energy
+            free_capacity = (
+                smart_charge_limit * EVConst.ev_capacity / 100 - ev_energy + battery_capacity - battery_energy
+            )
 
             this_setpoint = -20
 
@@ -1295,9 +1332,6 @@ def _forecast(
             # Grid must supply: House + EV + Battery - PV
             power_from_grid = max(0, power_balance_w + battery_power)
 
-            # The energy added to the EV reduces the import risk -> increases the surplus (less negative)
-            surplus += power_from_grid * period_hours / 1000
-
             # No feedin during force charge usually
             feedin = 0
             pv_feedin = 0
@@ -1319,13 +1353,13 @@ def _forecast(
                 # Check Mode/SOC constraints
                 if (
                     inverter_mode in (InverterMode.off, InverterMode.charger_only)
-                    or current_bat_kwh <= battery_min_energy
+                    or current_bat_kwh <= period_battery_min_energy
                 ):
                     actual_discharge_watts = 0
                 else:
                     # Physical Constraints: Limit and Available Energy
                     max_discharge_rate = min(battery_charge_limit, max_battery_power_target)
-                    available_energy_kwh = current_bat_kwh - battery_min_energy
+                    available_energy_kwh = current_bat_kwh - period_battery_min_energy
                     max_discharge_by_energy = (available_energy_kwh * 1000) / period_hours if period_hours > 0 else 0
 
                     actual_discharge_watts = min(
@@ -1370,6 +1404,10 @@ def _forecast(
         # Calculate final battery state for this step
         new_battery_energy = max(0, min(battery_capacity, battery_energy + accumulated_energy))
 
+        # Track only energy that actually remains available after meeting load and imports.
+        surplus_delta = (battery_power - power_from_grid) * period_hours / 1000
+        surplus += surplus_delta
+
         # Update setpoint for next loop context
         setpoint = this_setpoint
         if logging:
@@ -1399,14 +1437,10 @@ def _forecast(
             max_pv_feedin_target = max_feedin
             t_max_feedin = start
 
-        surplus += power_production * period_hours / 1000
-
-        surplus = min(
-            surplus, battery_energy + accumulated_energy - 0.5
-        )  # can't have more surplus than total battery energy
+        surplus = min(surplus, new_battery_energy - 0.5)  # can't have more surplus than total battery energy
 
         if logging:
-            msg += f"\n{surplus:.1f}(battery_power - power_from_grid) * period_hours / 1000: ({battery_power} - {power_from_grid}) * {period_hours} / 1000 = {(battery_power - power_from_grid) * period_hours / 1000}"
+            msg += f"\n{surplus:.1f} surplus += (battery_power - power_from_grid) * period_hours / 1000: ({battery_power} - {power_from_grid}) * {period_hours} / 1000 = {surplus_delta}"
 
         detail.append(
             ForecastEntry(
@@ -1551,7 +1585,7 @@ def auto_setpoint_target():
         current_setpoint = get(Grid.power_setpoint_target, -20)
 
     max_setpoint = min(current_setpoint + 500, get(Grid.max_setpoint, -20))
-    min_setpoint = max(current_setpoint - 500, min(max_setpoint, -max_feedin_limit))
+    min_setpoint = min(max_setpoint, -max_feedin_limit)
     battery_reserve = get_reserve_soc() * get(Battery.capacity, 0) / 100
     battery_min_energy = battery_reserve + 1
 
@@ -1621,6 +1655,45 @@ def auto_setpoint_target():
         )
         task.sleep(0.01)  # sleep to allow other tasks to run
         return result
+
+    def get_discounted_pv_feedin_peak(forecast_result):
+        if not forecast_result or not forecast_result.detail:
+            return 0, t_now, 0
+
+        discount_points = ((0.0, 1.0), (6.0, 1.0), (9.0, 0.75), (12.0, 0.5), (16.0, 0.25), (20.0, 0.0))
+
+        def get_discount(hours_ahead):
+            if hours_ahead <= discount_points[0][0]:
+                return discount_points[0][1]
+
+            for (left_hours, left_discount), (right_hours, right_discount) in zip(discount_points, discount_points[1:]):
+                if hours_ahead <= right_hours:
+                    span = right_hours - left_hours
+                    if span <= 0:
+                        return right_discount
+                    ratio = (hours_ahead - left_hours) / span
+                    return left_discount + ratio * (right_discount - left_discount)
+
+            return 0.0
+
+        best_weighted_peak = 0.0
+        best_peak_time = t_now
+        best_raw_peak = 0.0
+
+        for entry in forecast_result.detail:
+            if entry.period_start <= t_now or entry.pv_feedin <= 0:
+                continue
+
+            hours_ahead = max(0, (entry.period_start - t_now).total_seconds() / 3600)
+            discount = get_discount(hours_ahead)
+
+            weighted_peak = entry.pv_feedin * discount
+            if weighted_peak > best_weighted_peak:
+                best_weighted_peak = weighted_peak
+                best_peak_time = entry.period_start
+                best_raw_peak = entry.pv_feedin
+
+        return best_weighted_peak, best_peak_time, best_raw_peak
 
     # Binary search for optimal setpoint
     current_battery_energy = battery_energy
@@ -1714,10 +1787,11 @@ def auto_setpoint_target():
                 max_battery_power_target=max_battery_power_target,
             )
             update_reason = ""
+            discounted_pv_feedin, discounted_peak_time, raw_pv_feedin = get_discounted_pv_feedin_peak(r)
 
             if (
-                r.max_pv_feedin > max_pv_feedin
-                and r.t_max_feedin.day != t_now.day
+                discounted_pv_feedin > max_pv_feedin
+                and discounted_peak_time.day != t_now.day
                 and (
                     r.min_bat < battery_min_energy
                     or min(
@@ -1734,7 +1808,7 @@ def auto_setpoint_target():
                 if update_spread:
                     max_spread = current_spread
 
-            elif r.max_pv_feedin > max_pv_feedin:
+            elif discounted_pv_feedin > max_pv_feedin:
                 update_reason = "max feedin too large"
                 # If feed-in limit is exceeded, we need a more negative setpoint, higher spread
                 if update_setpoint:
@@ -1752,7 +1826,11 @@ def auto_setpoint_target():
             search_results.append(r)
 
             if logging:
-                msg += f"Iteration {itr + 1}: reason  {update_reason} setpoint {r.setpoint:0f} spread {r.setpoint_spread:.1f} min_setpoint={min_setpoint:.0f} max_setpoint={max_setpoint:.0f} pv feedin {r.max_pv_feedin:.0f} min_bat {r.min_bat:.1f} max_bat {r.max_bat:.1f} t_max_bat {r.t_max_bat}\n"
+                msg += (
+                    f"Iteration {itr + 1}: reason  {update_reason} setpoint {r.setpoint:0f} spread {r.setpoint_spread:.1f} "
+                    f"min_setpoint={min_setpoint:.0f} max_setpoint={max_setpoint:.0f} pv feedin {raw_pv_feedin:.0f} "
+                    f"discounted {discounted_pv_feedin:.0f} at {discounted_peak_time.strftime('%d %H:%M')} min_bat {r.min_bat:.1f} max_bat {r.max_bat:.1f} t_max_bat {r.t_max_bat}\n"
+                )
 
             if (update_spread and abs(max_spread - min_spread) < 1e-3) or (
                 update_setpoint and abs(max_setpoint - min_setpoint) < 50
@@ -1774,12 +1852,14 @@ def auto_setpoint_target():
         def fi(k):
             return f"{k:.0f}"
 
-        lines = [
-            f"{r.setpoint:2.0f} {' ' * 4}  {r.setpoint_spread:8.6f}{r.min_bat:9.1f}{'':6s}{ft(r.t_min_bat):10s}{r.max_bat:5.1f}{'':6s}{ft(r.t_max_bat):12s}{fi(r.max_pv_feedin):12s}{ft(r.t_max_pv_feedin):10s}"
-            for r in search_results
-        ]
+        lines = []
+        for r in search_results:
+            discounted_peak, discounted_time, raw_peak = get_discounted_pv_feedin_peak(r)
+            lines.append(
+                f"{r.setpoint:2.0f} {' ' * 4}  {r.setpoint_spread:8.6f}{r.min_bat:9.1f}{'':6s}{ft(r.t_min_bat):10s}{r.max_bat:5.1f}{'':6s}{ft(r.t_max_bat):12s}{fi(raw_peak):12s}{fi(discounted_peak):18s}{ft(discounted_time):10s}"
+            )
         return (
-            f"Setpoint results {title}:\n{'setpoint':<11s}{'spread':<13s}{'min_bat':<10s}{'t_min_bat':<11s}{'max_bat':<11s}{'t_max_bat':<11s}{'max_pv_feedin':<11s}{'t_max_pv_feedin':<10s}\n"
+            f"Setpoint results {title}:\n{'setpoint':<11s}{'spread':<13s}{'min_bat':<10s}{'t_min_bat':<11s}{'max_bat':<11s}{'t_max_bat':<11s}{'max_pv_feedin':<12s}{'discounted_pv':<18s}{'t_discounted':<10s}\n"
             + "\n".join(lines)
         )
 
@@ -1826,9 +1906,10 @@ def auto_setpoint_target():
         [d.pv_feedin for d in initial_result.detail if d.period_start.day == t_now.day and d.period_start > t_now],
         default=0,
     )
+    discounted_pv_feedin, discounted_peak_time, raw_pv_feedin = get_discounted_pv_feedin_peak(initial_result)
     log.warning(
-        f" \n\ninitial_result.max_pv_feedin {initial_result.max_pv_feedin:.0f} W > max_pv_feedin {max_pv_feedin:.0f} W: {initial_result.max_pv_feedin > max_pv_feedin}\n"
-        f" max pv feedin today {max_pv_feedin_today:.0f} W > max pv feedin {max_pv_feedin:.0f} W: {max_pv_feedin_today > max_pv_feedin}\n\n"
+        f" \n\ninitial_result.max_pv_feedin {raw_pv_feedin:.0f} W, discounted {discounted_pv_feedin:.0f} W at {discounted_peak_time.strftime('%d %H:%M')} > max_pv_feedin {max_pv_feedin:.0f} W: {discounted_pv_feedin > max_pv_feedin}\n"
+        f" max pv feedin today {max_pv_feedin_today:.0f} W > max_pv_feedin {max_pv_feedin:.0f} W: {max_pv_feedin_today > max_pv_feedin}\n\n"
     )
     if max_pv_feedin_today > max_pv_feedin:
         t_start = max(t_now, t_now.replace(hour=8))
@@ -1874,7 +1955,7 @@ def auto_setpoint_target():
 
         if logging:
             log.warning(
-                f" \n\nnew_result.max_pv_feedin {new_result.max_pv_feedin:0f} > max_pv_feedin {max_pv_feedin:0f}: {new_result.max_pv_feedin > max_pv_feedin}\n\n!!"
+                f" \n\nnew_result.discounted_pv_feedin {get_discounted_pv_feedin_peak(new_result)[0]:0f} > max_pv_feedin {max_pv_feedin:0f}: {get_discounted_pv_feedin_peak(new_result)[0] > max_pv_feedin}\n\n!!"
             )
         msg = ""
         # while new_result.max_pv_feedin > max_pv_feedin and new_result.max_battery_power_target > 100:
@@ -1982,7 +2063,7 @@ prev_house_loads = None
 @time_trigger
 @time_trigger("period(now, 5sec)")
 def auto_apply_setpoint():
-    logging = True
+    logging = False
     msg = ""
     if not get(Automation.auto_setpoint, False):
         msg = "Auto setpoint disabled"
@@ -1996,8 +2077,10 @@ def auto_apply_setpoint():
     msg += f" max setpont {max_setpoint}"
     house_power_long_term_average = get(House.daily_average_power, 0)  # W
     house_loads = get(House.loads, prev_house_loads)
+    # when true PV power changes rapidly, house_loads can be negative due to the house loads are often calculated
+    house_loads = max(house_loads, house_power_long_term_average * 0.5)
 
-    #house_loads = prev_house_loads * 0.9 + 0.1 * house_loads  # prevent oscillations
+    house_loads = prev_house_loads * 0.5 + 0.5 * house_loads  # prevent oscillations, outliers
     setpoint_target = get(Grid.power_setpoint_target, 0)
     max_setpoint_target = get(Grid.max_feedin_target, 0)
 

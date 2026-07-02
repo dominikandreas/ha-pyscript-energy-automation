@@ -93,6 +93,7 @@ class EV:
     """The short term demand for the EV"""
     is_charging = "binary_sensor.is_charging"
     """Whether the battery is currently charging"""
+    #soc = "sensor.tesla_model_3_electric_vehicles_octopus_a_fe756afd_tesla_model_3_soc"
     soc = "sensor.tesla_usable_battery_level"
     """The state of charge of the EV battery (usable level)"""
     pv_opportunistic_price = "sensor.pv_opportunistic_price"
