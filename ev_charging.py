@@ -104,8 +104,6 @@ def turn_on_charger(reason: str = ""):
 
 
 def turn_off_charger(reason: str = "", check_phase_change_cooldown=True, force=False):
-    global last_ev_charging_phase_change
-
     is_charging = get(Charger.control_switch, False)
     configured_phases = get(Charger.phases, 3)
 
@@ -136,7 +134,7 @@ def set_current(current, reason: str | None = None):
     if configured_current != current:
         if not Const.min_current <= current <= Const.max_current:
             log.warning(
-                f"Current out of bounds {current} - skipping phase change. Reason: {reason or 'no reason provided'}"
+                f"Current out of bounds {current} - skipping current change. Reason: {reason or 'no reason provided'}"
             )
             return
         service.call("number", "set_value", entity_id=Charger.current_setting, value=current)
@@ -282,8 +280,6 @@ def get_ev_schedule():
 )
 async def auto_ev_charging():
     """Combined EV charging control with excess power, price and temperature awareness"""
-    global last_ev_charging_phase_change
-
     # log.warning(f"Auto ev charging active. Charger state: {get(Charger.ready, False) or get(Charger.control_switch, False)}")
 
     # ensure only one instance of this task is running (phase switching can take a while)
