@@ -13,7 +13,7 @@ else:
     from victron import Victron
 
 
-HYSTERESIS_BUFFER = 500  # Watts buffer for phase switching
+HYSTERESIS_BUFFER = 1200  # Watts buffer for phase switching
 
 
 class ChargeAction:
@@ -58,20 +58,17 @@ def calculate_charger_current_adjustment(
     current_excess: float, target_excess: float, configured_phases: int, configured_current: float
 ) -> int:
     """Calculate appropriate current adjustment based on excess power delta"""
-    diff = current_excess - target_excess
-    power_change_per_current_step = 230 * max(6, configured_phases) / 1000  # kW
-    upper_limit = min(4, 16 - configured_current)
-    lower_limit = max(-4, 6 - configured_current)
+    diff_w = current_excess - target_excess
+    if abs(diff_w) < 300:
+        return 0
 
-    # Calculate raw adjustment and apply limits
-    raw_adj = diff / power_change_per_current_step
-    adj = clip(round(raw_adj), lower_limit, upper_limit)
+    phases = max(Const.min_phases, configured_phases)
+    watts_per_amp = Const.voltage * phases
+    upper_limit = min(2, Const.max_current - configured_current)
+    lower_limit = max(-2, Const.min_current - configured_current)
 
-    # log.warning(
-    #     f"Calculating charger current adjustment: {diff:.2f} kW delta, {configured_current}A current, {configured_phases} phases, "
-    #     f"{power_change_per_current_step:.3f} kW/step, limits[{lower_limit}, {upper_limit}]. Raw: {raw_adj:.1f} → Adj: {adj}"
-    # )
-    return adj
+    raw_adj = diff_w / watts_per_amp
+    return int(clip(round(raw_adj), lower_limit, upper_limit))
 
 
 @pyscript_compile
@@ -130,11 +127,24 @@ def _get_charge_action(
 
     if smart_charge_limit == 100:
         smart_limiter_active = False
+
+    effective_charge_limit = required_soc
+    if smart_limiter_active:
+        effective_charge_limit = min(required_soc, smart_charge_limit)
+
+    if current_soc >= effective_charge_limit:
+        return (
+            ChargeAction.off,
+            1,
+            6,
+            f"EV charge limit reached: {current_soc:.0f}% >= {effective_charge_limit:.0f}%",
+        )
+
     # if no more charging needed, turn off the charger
-    if energy_needed <= 0 and surplus_energy <= 1:
-        reason = f"required SoC was reached, stopping charge with surplus of {surplus_energy:.0f}kWh"
+    if energy_needed <= 0:
+        reason = f"Required SoC reached, energy_needed={energy_needed:.2f}kWh"
         return (ChargeAction.off, 1, 6, reason)
-    elif smart_limiter_active and current_soc > smart_charge_limit:
+    elif smart_limiter_active and current_soc >= smart_charge_limit:
         return (ChargeAction.off, 1, 6, f"Smart charge limit of {smart_charge_limit} reached.")
     # Emergency charge, independently of price or excess power
     elif (hours_available_to_charge < 2 or hours_available_to_charge < min_hours_needed) and current_soc < (
@@ -173,7 +183,7 @@ def _get_charge_action(
         return (ChargeAction.on, phases, current, reason)  #
 
     # Charge when price is low and not much time left (likely not possible to charge via excess)
-    elif is_low_price and hours_available_to_charge < 14:  # Use cheap electricity
+    elif energy_needed > 0 and is_low_price and hours_available_to_charge < 14:  # Use cheap electricity
         battery_discharging = inverter_mode == "on" and not battery_force_charge
         if battery_discharging:  # in case we're discharging from battery, we should limit the current accordingly
             adj = calculate_charger_current_adjustment(

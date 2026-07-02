@@ -101,20 +101,25 @@ def turn_on_charger(reason: str = ""):
         return new_state
 
 
-def turn_off_charger(reason: str = "", check_phase_change_cooldown=True):
+def turn_off_charger(reason: str = "", check_phase_change_cooldown=True, force=False):
     global last_ev_charging_phase_change
 
     is_charging = get(Charger.control_switch, False)
     configured_phases = get(Charger.phases, 3)
 
-    if get(Charger.force_charge, False):
-        log.warning(f"Not turning off charging, force charge in on. Reason for request {reason}")
+    if get(Charger.force_charge, False) and not force:
+        log.warning(f"Not turning off charging, force charge is on. Reason for request {reason}")
     elif is_charging:
-        if check_phase_change_cooldown and configured_phases == 3 and last_ev_charging_phase_change > now() - timedelta(minutes=15):
+        if (
+            not force
+            and check_phase_change_cooldown
+            and configured_phases == 3
+            and last_ev_charging_phase_change > now() - timedelta(minutes=15)
+        ):
             log.warning(f"Phase change too frequent - cooldown active. Reason: {reason or 'no reason provided'}")
             return
 
-        log.warning(f"Turning off ev charger. Reason for request: {reason}")
+        log.warning(f"Turning off EV charger. Reason for request: {reason}")
         service.call("switch", "turn_off", entity_id=Charger.control_switch)
         task.sleep(5)
         new_state = get(Charger.control_switch, False)
@@ -289,7 +294,7 @@ async def auto_ev_charging():
     required_soc = get(EV.required_soc, 80)
 
     # the current excess power available, this is defined as power going into the battery or into the grid (or the opposite, depending on the sign)
-    excess_power = get(Excess.power, 1337)  # in W
+    excess_power = get(Excess.power_1m_average, 1337)  # in W
     if excess_power == 1337:
         log.warning("Excess power is not set, cannot proceed with charging control.")
         return
@@ -333,6 +338,12 @@ async def auto_ev_charging():
                     energy_needed = min(Const.ev_capacity, next_drive_event.distance / 100 * Const.kwh_per_100km)
                     required_soc = min(100, (energy_needed) / Const.ev_capacity * 100 + 10)
                     msg += (f"setting required soc to {required_soc}")
+                effective_required_soc = required_soc
+                if smart_limiter_active:
+                    effective_required_soc = min(required_soc, ev_charge_limit)
+                if effective_required_soc != required_soc:
+                    msg += f", limited by smart charge limit to {effective_required_soc}"
+                required_soc = effective_required_soc
                 energy_needed = max(0, required_soc - current_soc) / 100 * Const.ev_capacity
 
     else:
@@ -421,6 +432,12 @@ async def auto_ev_charging():
         set_phases_and_current(phases, current, reason)
         turn_on_charger(reason)
     elif action == "off":
-        turn_off_charger(reason, check_phase_change_cooldown=surplus_energy > 2)
+        reason_lower = reason.lower()
+        force_off = (
+            "charge limit" in reason_lower
+            or "required soc" in reason_lower
+            or "energy_needed" in reason_lower
+        )
+        turn_off_charger(reason, check_phase_change_cooldown=surplus_energy > 2 and not force_off, force=force_off)
     else:
         log.warning(f"Skipping unknown action: {action}")
