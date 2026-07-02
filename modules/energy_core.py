@@ -189,7 +189,8 @@ def _get_charge_action(
             adj = calculate_charger_current_adjustment(
                 excess_power, excess_target, configured_phases=3, configured_current=configured_current
             )  # Calculate current adjustment
-            phases, current, reason = (3, configured_current + adj, "Charging at low price, with battery discharging")
+            current = clip(configured_current + adj, Const.min_current, Const.max_current)
+            phases, current, reason = (3, current, "Charging at low price, with battery discharging")
         else:
             phases, current, reason = (3, Const.max_current, "Charging at low price, no battery discharging")
         return (ChargeAction.on, phases, current, reason)

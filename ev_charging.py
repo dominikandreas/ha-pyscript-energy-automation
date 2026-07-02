@@ -153,34 +153,45 @@ def set_phases_and_current(phases, current, reason: str | None = None):
     global last_ev_charging_phase_change
 
     charger_enabled = get(Charger.control_switch, False)
-
-    set_current(current, reason)
-
     configured_phases = get(Charger.phases, 3)
     configured_current = get(Charger.current_setting, -1)
 
+    if not Const.min_current <= current <= Const.max_current:
+        log.warning(
+            f"Current out of bounds {current} - skipping change. Reason: {reason or 'no reason provided'}"
+        )
+        return False
+
+    phase_change_needed = configured_phases != phases
+    if not phase_change_needed:
+        set_current(current, reason)
+        return True
+
+    if last_ev_charging_phase_change > now() - timedelta(minutes=15):
+        log.warning(
+            f"Phase change too frequent - cooldown active. Keeping existing {configured_phases}P-{configured_current}A. "
+            f"Requested {phases}P-{current}A. Reason: {reason or 'no reason provided'}"
+        )
+        return False
+
     desc = f"ON->ON: {configured_phases}P-{configured_current}A -> {phases}P-{current}A"
+    log.warning(f"{desc}. Reason: {reason or 'no reason provided'}")
 
-    if configured_phases != phases:
-        if last_ev_charging_phase_change > now() - timedelta(minutes=15):
-            log.warning(f"Phase change too frequent - cooldown active. Reason: {reason or 'no reason provided'}")
-            return
+    if charger_enabled:
+        turn_off_charger(f"Phase change from {configured_phases} -> {phases}", check_phase_change_cooldown=False)
 
-        log.warning(f"{desc}. Reason: {reason or 'no reason provided'}")
+    service.call("vestel_ecv04", "set_phases_and_current", current=Const.max_current, num_phases=phases)
+    last_ev_charging_phase_change = now()  # Update phase change timestamp
+    log.warning(f"Phase change initiated - waiting {Const.ev_phase_switch_delay} seconds")
+    task.sleep(Const.ev_phase_switch_delay)
 
-        if charger_enabled:
-            turn_off_charger(f"Phase change from {configured_phases} -> {phases}", check_phase_change_cooldown=False)
+    set_current(current, reason)
+    log.warning(f"Phase change completed. Phase is now set to: {get(Charger.phases) or 'unknown'}")
 
-        service.call("vestel_ecv04", "set_phases_and_current", current=Const.max_current, num_phases=phases)
-        last_ev_charging_phase_change = now()  # Update phase change timestamp
-        log.warning(f"Phase change initiated - waiting {Const.ev_phase_switch_delay} seconds")
-        task.sleep(Const.ev_phase_switch_delay)
-        log.warning(f"Phase change completed. Phase is now set to: {get(Charger.phases) or 'unknown'}")
+    if charger_enabled:
+        turn_on_charger(reason)
 
-        if charger_enabled:
-            turn_on_charger()
-    else:
-        log.warning(f"Phases of {phases} already set - skipping phase change")
+    return True
 
 
 @time_trigger
@@ -367,7 +378,7 @@ async def auto_ev_charging():
 
     log.warning(
         f"Current SOC: {current_soc}%, Required SOC: {required_soc}%, Surplus {surplus_energy:.2f}, energy needed {energy_needed:.2f} "
-        f"Excess: {excess_power:.2f} kW, Target: {excess_target:.2f} kW "
+        f"Excess: {excess_power:.0f} W, Target: {excess_target:.0f} W "
         f"Energy needed: {energy_needed:.2f} kWh, Time needed: {min_hours_needed:.2f}h, "
         f"low price: {low_price}, high price: {high_price}, next drive: {next_drive}, "
         f"EV charge limit: {ev_charge_limit:.0f}%"
@@ -429,8 +440,9 @@ async def auto_ev_charging():
         """)
 
     if action == "on":
-        set_phases_and_current(phases, current, reason)
-        turn_on_charger(reason)
+        changed = set_phases_and_current(phases, current, reason)
+        if changed:
+            turn_on_charger(reason)
     elif action == "off":
         reason_lower = reason.lower()
         force_off = (
@@ -438,6 +450,6 @@ async def auto_ev_charging():
             or "required soc" in reason_lower
             or "energy_needed" in reason_lower
         )
-        turn_off_charger(reason, check_phase_change_cooldown=surplus_energy > 2 and not force_off, force=force_off)
+        turn_off_charger(reason, check_phase_change_cooldown=False, force=force_off)
     else:
         log.warning(f"Skipping unknown action: {action}")
