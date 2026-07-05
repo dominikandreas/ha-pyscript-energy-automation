@@ -4,7 +4,35 @@ Pyscript automations for coordinating my EV charging, home battery behavior, PV 
 
 The scripts are built around a simple idea: keep the energy decisions in readable Python, while Home Assistant provides the sensors, helpers, schedules, switches, and services that actually control the house.
 
-The entire project is tuned for my house, but there's no reason it shouldn't work for other settings in principle. 
+The most valuable and standing out features:
+ - Forcast based EV Charging with PV Surplus or low electricity prices (if necessary)
+ - Forcast based Battery discharging into grid at high prices to make room at low priecs
+ - Grid setpoint optimization using binary search over policy parameters: setpoint (how much to energy feed/draw to/from the grid) and spread (how feedin modulates with electricity price)
+
+Example from real usage:
+
+From the history (top graph) you'll note:
+- battery was discharged into the grid over night (green line)
+- battery energy (purple line) kept at sufficient level to survive
+- EV (blue line) was priority charged using PV surplus (scheduled to depart tomorrow)
+![alt text](docs/energy_history_forecast.png)
+From forecast (bottom graph):
+- the entire energy profile is included (EV, Battery, PV)
+- EV is charged to 100% only shortly before scheduled departure (battery health)
+- Forecast shows policy will charge EV in the evening on arrival (partially from battery)
+
+The forecast duration is configurable (~5 days by default), graph only shows a partial timeframe.
+
+
+> Note: The entire project is tuned for my house, but there's no reason it shouldn't work for other settings in principle. 
+
+To get the most out of it, you need:
+> - average daily / nightly house consumption
+> - PV sensors and forecast (solcast)
+> - switch for EV charge / discharge, input number for Amp selection, action for phase switch
+> - A `schedule` entity to define when EV departs 
+
+For controlling further devices, the automations will provide a value for **"surplus"**. This is the accumulated future energy "headroom" that can be spent without additional cost.
 
 ## Getting Started
 
