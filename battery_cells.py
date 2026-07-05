@@ -64,9 +64,10 @@ BALANCING_START_VOLTAGE = 3.45
 VOLTAGE_THRESHOLDS = [3.15, 3.10, 3.05]
 
 # Rearm after a meaningful recharge.
-# 3.35 V means the previous lower-knee discharge event is clearly over.
-# Use 3.40 if you want fewer events and stricter rearming.
-RESET_AVG_CELL_VOLTAGE = 3.35
+# 3.33 V is realistic for a high-SOC rested LFP pack; SOC is an additional
+# rearm signal when voltage is slightly below the flat-curve threshold.
+RESET_AVG_CELL_VOLTAGE = 3.33
+RESET_SOC = 90.0
 
 # Negative current = discharge.
 # Tune these to your actual current sensors.
@@ -146,6 +147,9 @@ def _evaluate_pack(pack_name, config):
     event_active = bool(attrs.get("event_active", False))
     crossed_thresholds = attrs.get("crossed_thresholds", [])
     threshold_stats = attrs.get("threshold_stats", {})
+    previous_avg_cell_voltage = _coerce_optional_float(
+        attrs.get("previous_avg_cell_voltage")
+    )
 
     if not isinstance(crossed_thresholds, list):
         crossed_thresholds = []
@@ -191,7 +195,7 @@ def _evaluate_pack(pack_name, config):
     # -------------------------------------------------------------------------
     # Rearm event after meaningful recharge
     # -------------------------------------------------------------------------
-    if avg_cell_voltage >= RESET_AVG_CELL_VOLTAGE:
+    if avg_cell_voltage >= RESET_AVG_CELL_VOLTAGE or soc >= RESET_SOC:
         event_active = False
         crossed_thresholds = []
 
@@ -283,11 +287,30 @@ def _evaluate_pack(pack_name, config):
     event_active = True
     did_capture = False
 
+    if previous_avg_cell_voltage is None:
+        _write_status(
+            pack_name=pack_name,
+            config=config,
+            value="Initialized threshold crossing baseline",
+            event_active=event_active,
+            crossed_thresholds=crossed_thresholds,
+            threshold_stats=threshold_stats,
+            soc=soc,
+            current=current,
+            avg_cell_voltage=avg_cell_voltage,
+            min_cell_voltage=min_cell_voltage,
+            max_cell_voltage=max_cell_voltage,
+            pack_delta_mv=pack_delta_mv,
+            balancer_attrs=balancer_attrs,
+        )
+        return
+
     # Highest threshold first: 3.15, then 3.10, then 3.05.
     for threshold in sorted(VOLTAGE_THRESHOLDS, reverse=True):
         threshold_key = _threshold_key(threshold)
+        crossed_now = previous_avg_cell_voltage > threshold >= avg_cell_voltage
 
-        if avg_cell_voltage <= threshold and threshold_key not in crossed_thresholds:
+        if crossed_now and threshold_key not in crossed_thresholds:
             threshold_stats = _record_threshold_snapshot(
                 threshold_stats=threshold_stats,
                 threshold=threshold,
@@ -346,6 +369,16 @@ def _read_cell_voltages(entity_id):
 
     try:
         return [float(v) for v in attrs["cell_voltages"]]
+    except (ValueError, TypeError):
+        return None
+
+
+def _coerce_optional_float(value):
+    if value is None:
+        return None
+
+    try:
+        return float(value)
     except (ValueError, TypeError):
         return None
 
@@ -786,6 +819,7 @@ def _write_status(
             "last_soc": round(soc, 1),
             "last_current_a": round(current, 1),
             "last_avg_cell_voltage": round(avg_cell_voltage, 4),
+            "previous_avg_cell_voltage": round(avg_cell_voltage, 4),
             "last_min_cell_voltage": round(min_cell_voltage, 4),
             "last_max_cell_voltage": round(max_cell_voltage, 4),
             "last_pack_delta_mv": round(pack_delta_mv, 1),
@@ -794,6 +828,7 @@ def _write_status(
 
             "voltage_thresholds": VOLTAGE_THRESHOLDS,
             "reset_avg_cell_voltage": RESET_AVG_CELL_VOLTAGE,
+            "reset_soc": RESET_SOC,
             "balancing_start_voltage": BALANCING_START_VOLTAGE,
             "discharge_limit_cell_voltage": DISCHARGE_LIMIT_CELL_VOLTAGE,
             "charge_limit_cell_voltage": CHARGE_LIMIT_CELL_VOLTAGE,
@@ -827,6 +862,7 @@ def reset_jkbms_capacity_rankings():
                 "event_active": False,
                 "crossed_thresholds": [],
                 "threshold_stats": {},
+                "previous_avg_cell_voltage": None,
                 "combined_ranking": [],
                 "combined_strongest_candidate_cell": None,
                 "combined_weakest_candidate_cell": None,
@@ -856,6 +892,7 @@ def reset_jkbms_capacity_rankings():
 
                 "voltage_thresholds": VOLTAGE_THRESHOLDS,
                 "reset_avg_cell_voltage": RESET_AVG_CELL_VOLTAGE,
+                "reset_soc": RESET_SOC,
                 "balancing_start_voltage": BALANCING_START_VOLTAGE,
                 "discharge_limit_cell_voltage": DISCHARGE_LIMIT_CELL_VOLTAGE,
                 "charge_limit_cell_voltage": CHARGE_LIMIT_CELL_VOLTAGE,
@@ -936,6 +973,7 @@ def arm_jkbms_capacity_rankings():
                 "event_active": False,
                 "crossed_thresholds": [],
                 "threshold_stats": threshold_stats,
+                "previous_avg_cell_voltage": None,
                 "friendly_name": f"{pack_name.replace('_', ' ').title()} Cell Capacity Ranking",
                 "icon": "mdi:battery-arrow-down",
             },
