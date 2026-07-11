@@ -53,6 +53,7 @@ class Victron:
 def get_auto_inverter_mode(
     ev_is_charging,
     surplus_energy,
+    battery_headroom_energy,
     pv_power,
     daily_avg_power,
     battery_soc,
@@ -71,10 +72,12 @@ def get_auto_inverter_mode(
     new_charge_limit = None  # in W
     new_force_charge_switch_state = None
 
-    surplus_threshold = -daily_avg_power * 10 / 1000
+    headroom_threshold = 0.5  # kWh hysteresis to avoid toggling at the battery floor
 
     # When ev is charging, disable inverter if no surplus energy or insufficient pv power
     if ev_is_charging:
+        # EV charging should use the stricter, reserve-aware surplus budget. Physical
+        # battery headroom is still reserved for house backup/normal operation here.
         if surplus_energy > 0 or pv_power > (min_charge_power + daily_avg_power) and battery_soc > target_soc:
             reason = f"EV is charging with surplus energy of {surplus_energy} or pv_power > (min_charge_power + daily_avg_power)  {pv_power} > ({min_charge_power} + {daily_avg_power})"
             new_mode = InverterMode.on
@@ -82,10 +85,12 @@ def get_auto_inverter_mode(
             reason = f"EV is charging {'without' if pv_power < 10 else 'with'} PV power"
             new_mode = InverterMode.off if pv_power < 10 else InverterMode.charger_only
     else:
-        #
-        if electricity_price < min_discharge_price and (surplus_energy < -1):
+        # For normal self-consumption, use physical battery headroom instead of the
+        # reserve-aware surplus budget. A zero optional-load surplus does not mean the
+        # battery cannot still cover house load without hitting the hard floor.
+        if electricity_price < min_discharge_price and battery_headroom_energy <= headroom_threshold:
             if pv_power == 0:
-                reason = f"no PV, battery {surplus_energy}% < -1 and price is low"
+                reason = f"no PV, battery headroom {battery_headroom_energy:.2f} kWh <= {headroom_threshold:.2f} kWh and price is low"
                 new_mode = InverterMode.off
             else:
                 reason = f"battery {battery_soc}% < target {target_soc}% and price is low"
@@ -105,10 +110,10 @@ def get_auto_inverter_mode(
             new_force_charge_switch_state = False
         elif (
             pv_power < 0.5 * daily_avg_power
-            and surplus_energy < surplus_threshold
+            and battery_headroom_energy <= headroom_threshold
             and battery_soc < min(25, target_soc)
         ):
-            reason = f"insufficient pv power for charnging, surplus_energy < {surplus_threshold}kWh, battery soc below target of {target_soc}%"
+            reason = f"insufficient pv power for charging, battery headroom {battery_headroom_energy:.2f} kWh <= {headroom_threshold:.2f} kWh, battery soc below target of {target_soc}%"
             new_mode = InverterMode.off
             new_charge_limit = -1
 

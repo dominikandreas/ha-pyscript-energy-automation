@@ -281,6 +281,7 @@ def auto_victron_set_inverter_mode():
     min_discharge_price = float(get(Automation.min_discharge_price, default=0))
     ev_is_charging = get(EV.is_charging, False)
     surplus_energy = get(House.energy_surplus, -1337)
+    battery_headroom_energy = get(House.battery_headroom_until_trough, -1337)
     battery_soc = get(Battery.soc, -1337)
     target_soc = get(Automation.battery_target_soc, -1337)
     pv_power = get(PVProduction.total_power, -1337)  # in kW
@@ -295,10 +296,11 @@ def auto_victron_set_inverter_mode():
         log.warning("Total PV power state not available, using forecast instead")
         pv_power = get(PVForecast.power_now, -1337)
 
-    for v in (surplus_energy, battery_soc, target_soc, pv_power, daily_avg_power):
+    for v in (surplus_energy, battery_headroom_energy, battery_soc, target_soc, pv_power, daily_avg_power):
         if v == -1337:
             log.error(
-                f"Not all required states are available yet: surplus_energy: {surplus_energy}, battery_soc: {battery_soc}, "
+                f"Not all required states are available yet: surplus_energy: {surplus_energy}, "
+                f"battery_headroom_energy: {battery_headroom_energy}, battery_soc: {battery_soc}, "
                 f"target_soc: {target_soc}, pv_power: {pv_power}, daily_avg_power: {daily_avg_power}, skipping auto victron inverter mode"
             )
             return
@@ -306,6 +308,7 @@ def auto_victron_set_inverter_mode():
     new_mode, new_charge_power_limit, new_force_charge_switch_state, reason = get_auto_inverter_mode(
         ev_is_charging,
         surplus_energy,
+        battery_headroom_energy,
         pv_power,
         daily_avg_power,
         battery_soc,
@@ -332,7 +335,8 @@ def auto_victron_set_inverter_mode():
     if current_mode != new_mode:
         log.warning(
             f"{current_mode} -> {new_mode}: {reason}. "
-            f"ev: {ev_is_charging}, surplus: {surplus_energy}, soc: {battery_soc}, target soc: {target_soc}, "
+            f"ev: {ev_is_charging}, surplus: {surplus_energy}, headroom: {battery_headroom_energy}, "
+            f"soc: {battery_soc}, target soc: {target_soc}, "
             f"pv_power: {pv_power}, daily_avg_power {daily_avg_power}"
         )
 
@@ -711,6 +715,7 @@ def forecast_surplus():
     current_surplus = get(House.energy_surplus, 0)
     ev_energy = get(EV.energy, 0)
     reserve_soc = get_reserve_soc()
+    hard_battery_min_energy = 2
 
     if 1337 in (battery_capacity, battery_energy):
         log.warning("Battery capacity or energy not available yet, cannot calculate surplus")
@@ -729,19 +734,34 @@ def forecast_surplus():
         setpoint=setpoint,
         forecast_dampening=1,
         with_ev_charging=False,
+        battery_min_energy=hard_battery_min_energy,
         # logging=True,
         surplus_energy=current_surplus,
     )
 
     min_battery_energy = min([el.battery_energy for el in forecast_no_ev.detail] or [0])
     reserve_energy = reserve_soc / 100 * battery_capacity
-    surplus = max(0, min_battery_energy - reserve_energy)
+
+    next_local_min_battery_energy = battery_energy
+    if forecast_no_ev.detail:
+        next_local_min_battery_energy = forecast_no_ev.detail[0].battery_energy
+        previous_battery_energy = next_local_min_battery_energy
+        for el in forecast_no_ev.detail[1:]:
+            if el.battery_energy <= next_local_min_battery_energy:
+                next_local_min_battery_energy = el.battery_energy
+            elif el.battery_energy > previous_battery_energy + 0.05:
+                break
+            previous_battery_energy = el.battery_energy
+
+    # `energy_surplus` is the reserve-aware budget for optional/flexible loads.
+    # The inverter mode needs a separate physical headroom signal: zero optional
+    # surplus should not by itself disable normal house self-consumption.
+    surplus = max(0, next_local_min_battery_energy - reserve_energy)
+    battery_headroom_until_trough = max(0, next_local_min_battery_energy - hard_battery_min_energy)
 
     forecast_today = [el for el in forecast_no_ev.detail if el.period_start.day == t_now.day]
     feedin_today = sum([max(0, el.feedin - 20) for el in forecast_today]) * period_hours / 1000
     pv_feedin_today = sum([max(0, el.pv_feedin - 20) for el in forecast_today]) * period_hours / 1000
-    if feedin_today > 0.5:
-        surplus = max(surplus, feedin_today / 1000 * period_hours)
 
     # for idx, el in enumerate(forecast_no_ev.detail):
     #     remaining_min_battery = min([e.battery_energy for e in forecast_no_ev.detail[idx:]] or [0])
@@ -758,6 +778,11 @@ def forecast_surplus():
     }
 
     set_energy_surplus(House.energy_surplus, surplus)
+    set_energy_surplus(
+        House.battery_headroom_until_trough,
+        battery_headroom_until_trough,
+        friendly_name="Battery Headroom Until Trough",
+    )
     set_state(
         House.energy_forecast,
         round(forecast_no_ev.detail[-1].battery_energy, 2),
@@ -775,6 +800,7 @@ def forecast_surplus():
             forecast_dampening=1,
             with_ev_charging=True,
             ev_schedule=ev_schedule,
+            battery_min_energy=hard_battery_min_energy,
             # logging=True,
             surplus_energy=surplus,
             ev_energy=ev_energy,
@@ -785,6 +811,8 @@ def forecast_surplus():
         log.warning(
             f"""\n#################### Forecast Surplus  #####################\n
             Reserve battery energy: {reserve_energy:.2f} kWh ({reserve_soc:.2f}% reserve SOC)
+            Next local min battery: {next_local_min_battery_energy:.2f} kWh
+            Battery headroom until trough: {battery_headroom_until_trough:.2f} kWh
             Min battery: {min_battery_energy:.2f} kWh
             Final battery energy: {forecast_no_ev.detail[-1].battery_energy:.2f} kWh
             Surplus: {surplus:.2f} kWh
@@ -1117,11 +1145,14 @@ def _forecast(
             and ev_energy < EVConst.ev_capacity * (smart_charge_limit or 101) / 100
         )
 
-    def get_inverter_mode(pv_power, target_soc, current_soc, electricity_price, surplus, _t_now):
+    def get_inverter_mode(
+        pv_power, target_soc, current_soc, electricity_price, surplus, battery_headroom_energy, _t_now
+    ):
         assert surplus is not None
         new_mode, new_charge_power_limit, new_force_charge_switch_state, reason = get_auto_inverter_mode(
             is_charging_ev,
             surplus,
+            battery_headroom_energy,
             pv_power,
             daily_power,
             current_soc,
@@ -1196,10 +1227,6 @@ def _forecast(
         electricity_price = get_price(hour=start.hour, minute=start.minute)
         low_price = is_low_price(electricity_price)
 
-        inverter_mode, charge_power_limit, is_force_charging, inverter_mode_reason = get_inverter_mode(
-            power_production, battery_target_soc, tentative_batt_soc, electricity_price, surplus, _t_now=start
-        )
-
         excess_target = _get_excess_target(
             battery_target_soc=battery_target_soc,
             battery_soc=tentative_batt_soc,
@@ -1210,6 +1237,17 @@ def _forecast(
             ev_soc=ev_soc,
             t_now=start,
             efficient_discharge=eff_dis,
+        )
+
+        battery_headroom_energy = max(0, tentative_batt_energy - period_battery_min_energy)
+        inverter_mode, charge_power_limit, is_force_charging, inverter_mode_reason = get_inverter_mode(
+            power_production,
+            battery_target_soc,
+            tentative_batt_soc,
+            electricity_price,
+            surplus,
+            battery_headroom_energy,
+            _t_now=start,
         )
 
         # --- EV Charging Action ---
@@ -1394,8 +1432,7 @@ def _forecast(
             else:
                 power_from_grid = 0
                 feedin = -grid_exchange_watts
-                if current_bat_kwh > battery_capacity * 0.95:
-                    pv_feedin = feedin
+                pv_feedin = min(feedin, max(0, -natural_deficit_watts))
 
         # --- Update Accumulator ---
         added_battery_energy = (battery_power * period_hours) / 1000

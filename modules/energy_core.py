@@ -33,13 +33,13 @@ def _get_ev_smart_charge_limit(schedule, t_now, active_schedule=False):
         if td_hours < 6 or active_schedule:
             smart_charge_limit = 100
         elif td_hours < 20:
-            smart_charge_limit = 98
-        elif td_hours < 40:
             smart_charge_limit = 95
-        elif td_hours < 60:
+        elif td_hours < 40:
             smart_charge_limit = 90
-        else:
+        elif td_hours < 60:
             smart_charge_limit = 85
+        else:
+            smart_charge_limit = 80
     return smart_charge_limit
 
 

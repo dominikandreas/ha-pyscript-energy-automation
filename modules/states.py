@@ -132,6 +132,8 @@ class House:
     """The upcoming energy extra demand to plan for (e.g. washing machine, EV charging)"""
     energy_surplus = "sensor.energy_surplus"
     """Energy surplus in kWh, energy that exceeds the expected house consumption (excluding EV charging)"""
+    battery_headroom_until_trough = "sensor.battery_headroom_until_trough"
+    """Battery energy in kWh above the hard battery floor before the next local forecast minimum"""
     energy_surplus_after_ev_charging = "sensor.energy_surplus_after_ev_charging"
     """Energy surplus in kWh after accounting for planned EV charging"""
     energy_forecast = "sensor.energy_forecast"

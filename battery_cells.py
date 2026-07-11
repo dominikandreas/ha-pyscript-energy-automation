@@ -88,11 +88,11 @@ MIN_CELL_VOLTAGE_CAPTURE_LIMIT = 2.98
 # Balancer integration.
 # Set this to your JK-BMS active balancer current setting. Common values are
 # 0.6 A, 1.0 A, or 2.0 A depending on model/config.
-BALANCE_CURRENT_A = 1.0
+BALANCE_CURRENT_A = 2.0
 
 # Use 1.0 if you only want equivalent moved Ah. Use ~0.85 if you want a rough
 # transferred-energy-equivalent estimate for an active balancer.
-BALANCE_EFFICIENCY = 0.85
+BALANCE_EFFICIENCY = 0.9
 
 # The JK integration exposes a 16-character mask like "0000000000000000".
 # This script assumes the leftmost bit is cell 1. Set True if your integration
