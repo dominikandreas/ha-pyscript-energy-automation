@@ -411,8 +411,10 @@ def battery_use_until_pv_meets_demand():
 
 def get_reserve_soc():
     t_now = now()
-    min_reserve = 5
+    meridian_deviation = exp(-((t_now.hour - 12) ** 2) / (2 * 4**2))  # ranging from 0 to 1, peak at noon
+    min_reserve = 5 * (1 - meridian_deviation)  # ranging from 0 to 5 (min 5% reserve during night)
     summer_deviation = ((6 - (t_now.month - 1 + t_now.day / 30.0)) / 6) ** 4  # ranging from 0 to 1
+    
     return max(min_reserve, round(summer_deviation * 30, 0))  # ranging from 5 to 30 (max 30% reserve during winter)
 
 
@@ -763,15 +765,6 @@ def forecast_surplus():
     feedin_today = sum([max(0, el.feedin - 20) for el in forecast_today]) * period_hours / 1000
     pv_feedin_today = sum([max(0, el.pv_feedin - 20) for el in forecast_today]) * period_hours / 1000
 
-    # for idx, el in enumerate(forecast_no_ev.detail):
-    #     remaining_min_battery = min([e.battery_energy for e in forecast_no_ev.detail[idx:]] or [0])
-    #     # TODO: technically reserve energy should be recomputed here
-    #     surplus_local = remaining_min_battery - reserve_energy
-    #     forecast_local = [e for e in forecast_no_ev.detail[idx:] if e.period_start.day == el.period_start.day]
-    #     feedin_local = sum([max(0, e.feedin - 20) for e in forecast_local])
-    #     if feedin_local > 0.5:
-    #         surplus_local = max(surplus_local, feedin_local / 1000 * period_hours)
-    #     el.surplus = surplus_local
 
     detail_without_ev_vectorized = {
         k: [getattr(el, k) for el in forecast_no_ev.detail] for k in ForecastEntry.__annotations__.keys()
@@ -942,6 +935,7 @@ def map_setpoint(
     min_setpoint=-20,
     max_setpoint=-20,
     max_battery_power_target=4000,
+    surplus_energy: float | None = None,
 ):
     price = price * 100
     prices_mean = prices_mean * 100
@@ -974,6 +968,13 @@ def map_setpoint(
 
     if surplus_pv > 0 and setpoint < max_setpoint:
         new_setpoint = min(new_setpoint, -surplus_pv)
+
+    if surplus_energy is not None and surplus_energy <= 0:
+        # When the reserve-aware surplus budget is exhausted, the setpoint may
+        # still export unavoidable PV, but it must not ask the battery to export
+        # into the grid. Normal house self-consumption is handled by inverter
+        # mode/physics; this cap protects the real Victron setpoint.
+        new_setpoint = max(new_setpoint, min(min_setpoint, -surplus_pv))
 
     return max(-(max_feedin + surplus_pv), min(min_setpoint, new_setpoint))
 
@@ -1301,6 +1302,7 @@ def _forecast(
             setpoint_spread=setpoint_spread,
             max_setpoint=max_setpoint,
             max_battery_power_target=max_battery_power_target,
+            surplus_energy=surplus,
         )
 
         # --- Apply EV Charging Physics ---
@@ -1388,6 +1390,15 @@ def _forecast(
 
             # --- SUB-BRANCH 1: Battery wants to DISCHARGE ---
             if target_battery_discharge_watts > 0:
+                # Discharging for house self-consumption is allowed as long as
+                # physical headroom exists. Additional battery-to-grid export is
+                # only allowed from the reserve-aware surplus budget.
+                self_consumption_discharge_watts = max(0, natural_deficit_watts)
+                surplus_export_discharge_watts = (
+                    max(0, surplus) * 1000 / period_hours if period_hours > 0 else 0
+                )
+                max_allowed_discharge_watts = self_consumption_discharge_watts + surplus_export_discharge_watts
+
                 # Check Mode/SOC constraints
                 if (
                     inverter_mode in (InverterMode.off, InverterMode.charger_only)
@@ -1401,7 +1412,10 @@ def _forecast(
                     max_discharge_by_energy = (available_energy_kwh * 1000) / period_hours if period_hours > 0 else 0
 
                     actual_discharge_watts = min(
-                        target_battery_discharge_watts, max_discharge_rate, max_discharge_by_energy
+                        target_battery_discharge_watts,
+                        max_discharge_rate,
+                        max_discharge_by_energy,
+                        max_allowed_discharge_watts,
                     )
 
                 battery_power = -actual_discharge_watts  # Negative = Discharging (Energy leaving battery)
@@ -2055,6 +2069,7 @@ def auto_setpoint_target():
 
     pv_power_total = get(PVProduction.total_power, 0)
     house_power = get(House.loads, 0)
+    surplus_energy = get(House.energy_surplus, 0)
 
     setpoint = map_setpoint(
         setpoint_result.setpoint,
@@ -2067,13 +2082,14 @@ def auto_setpoint_target():
         house_power=house_power,
         setpoint_spread=setpoint_result.setpoint_spread,
         max_battery_power_target=setpoint_result.max_battery_power_target,
+        surplus_energy=surplus_energy,
     )
 
     if logging:
         log.warning(
             f"\nMapped setpoint: {setpoint_result.setpoint:.0f} to {setpoint} with spread {setpoint_result.setpoint_spread:.2f} and max batt power {setpoint_result.max_battery_power_target} W\n"
             f"price now {price:.2f} mean {setpoint_result.prices_mean:.2f} price std {setpoint_result.prices_std:.2f} "
-            f"min_bat {setpoint_result.min_bat:.1f} at {setpoint_result.t_min_bat.strftime('%H:%M')} "
+            f"surplus {surplus_energy:.2f} kWh min_bat {setpoint_result.min_bat:.1f} at {setpoint_result.t_min_bat.strftime('%H:%M')} "
         )
 
     set_state(
@@ -2090,6 +2106,7 @@ def auto_setpoint_target():
         Grid.power_setpoint_target,
         setpoint,
         **power_w_attributes,
+        max_battery_power_target=setpoint_result.max_battery_power_target,
         detail=detail_with_ev_vectorized,
     )
 
@@ -2132,6 +2149,19 @@ def auto_apply_setpoint():
     if get(EV.is_charging, False):
         msg = f"setpoint adjusted to {max_setpoint} since EV is charging"
         setpoint = max_setpoint
+
+    surplus_energy = get(House.energy_surplus, 0)
+    if surplus_energy <= 0:
+        pv_power = get(PVProduction.total_power, 0)
+        max_battery_power_target = get_attr(Grid.power_setpoint_target, "max_battery_power_target", 4000)
+        surplus_pv = max(0, pv_power - house_loads - max_battery_power_target)
+        min_pv_only_setpoint = min(max_setpoint, -surplus_pv)
+        if setpoint < min_pv_only_setpoint:
+            msg += (
+                f" capped setpoint from {setpoint:.0f} to {min_pv_only_setpoint:.0f} "
+                f"because surplus is {surplus_energy:.2f} kWh"
+            )
+            setpoint = min_pv_only_setpoint
 
     if logging:
         log.warning(msg)
