@@ -128,22 +128,28 @@ def _get_charge_action(
     if smart_charge_limit == 100:
         smart_limiter_active = False
 
-    effective_charge_limit = required_soc
+    required_charge_limit = required_soc
     if smart_limiter_active:
-        effective_charge_limit = min(required_soc, smart_charge_limit)
+        required_charge_limit = min(required_soc, smart_charge_limit)
 
-    if current_soc >= effective_charge_limit:
+    # Required SoC is a hard trip target. Smart limit is the PV-opportunistic
+    # ceiling. Do not block surplus charging just because the trip target is met.
+    surplus_charge_limit = max(required_charge_limit, smart_charge_limit)
+    surplus_available = excess_power > excess_target and (surplus_energy > 0 or excess_power > 3000)
+
+    if current_soc >= surplus_charge_limit:
         return (
             ChargeAction.off,
             1,
             6,
-            f"EV charge limit reached: {current_soc:.0f}% >= {effective_charge_limit:.0f}%",
+            f"EV charge limit reached: {current_soc:.0f}% >= {surplus_charge_limit:.0f}%",
         )
 
     # if no more charging needed, turn off the charger
-    if energy_needed <= 0:
-        reason = f"Required SoC reached, energy_needed={energy_needed:.2f}kWh"
+    if energy_needed <= 0 and not (surplus_available and current_soc < surplus_charge_limit):
+        reason = f"Required SoC reached and no PV surplus charging room, energy_needed={energy_needed:.2f}kWh"
         return (ChargeAction.off, 1, 6, reason)
+
     elif smart_limiter_active and current_soc >= smart_charge_limit:
         return (ChargeAction.off, 1, 6, f"Smart charge limit of {smart_charge_limit} reached.")
     # Emergency charge, independently of price or excess power

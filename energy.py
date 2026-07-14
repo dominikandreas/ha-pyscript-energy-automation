@@ -411,11 +411,34 @@ def battery_use_until_pv_meets_demand():
 
 def get_reserve_soc():
     t_now = now()
-    meridian_deviation = exp(-((t_now.hour - 12) ** 2) / (2 * 4**2))  # ranging from 0 to 1, peak at noon
-    min_reserve = 5 * (1 - meridian_deviation)  # ranging from 0 to 5 (min 5% reserve during night)
+    min_reserve = 5
     summer_deviation = ((6 - (t_now.month - 1 + t_now.day / 30.0)) / 6) ** 4  # ranging from 0 to 1
-    
+
     return max(min_reserve, round(summer_deviation * 30, 0))  # ranging from 5 to 30 (max 30% reserve during winter)
+
+
+@pyscript_compile
+def get_battery_export_floor(
+    battery_capacity: float,
+    reserve_soc: float,
+    minimal_soc: float,
+    uncertainty_margin_kwh: float = 1,
+) -> float:
+    """Energy that must remain available for house demand and battery reserve."""
+    protected_soc = max(reserve_soc, minimal_soc)
+    return min(battery_capacity, protected_soc / 100 * battery_capacity + uncertainty_margin_kwh)
+
+
+@pyscript_compile
+def get_pv_only_setpoint(
+    pv_power: float,
+    house_power: float,
+    max_battery_charge_power: float,
+    neutral_setpoint: float = -20,
+) -> float:
+    """Most negative setpoint that does not require battery-to-grid export."""
+    unavoidable_pv_export = max(0, pv_power - house_power - max_battery_charge_power)
+    return min(neutral_setpoint, -unavoidable_pv_export)
 
 
 @pyscript_compile
@@ -501,6 +524,7 @@ def auto_battery_target_soc():
         return
 
     ev_is_charging = get(EV.is_charging, False)
+    protect_battery_from_ev = ev_is_charging and surplus <= 0
 
     req_energy = get_required_energy(
         house_demand,
@@ -526,10 +550,12 @@ def auto_battery_target_soc():
     minimal_soc = min(max_soc, (max(0, req_energy) / battery_capacity * 100) + reserve_soc)
     set_state(Automation.minimal_soc, round(minimal_soc, 2), unit_of_measurement="%")  # different attributes
 
-    # prevent discharging of the battery if the EV is charging and insufficient surplus
-    result_soc = max(battery_soc + 1, minimal_soc) if ev_is_charging else minimal_soc
+    # Prevent EV charging from pulling protected battery energy. If the EV is
+    # charging from a positive surplus budget, do not raise the battery target:
+    # that target jump fights the charger and creates on/off oscillation.
+    result_soc = max(battery_soc + 1, minimal_soc) if protect_battery_from_ev else minimal_soc
 
-    msg += f"\n\tminimal soc {minimal_soc:.1f} auto battery target soc: {result_soc:.1f}"
+    msg += f"\n\tminimal soc {minimal_soc:.1f} auto battery target soc: {result_soc:.1f}, protect_battery_from_ev: {protect_battery_from_ev}"
     set_state(
         Automation.battery_target_soc,
         round(result_soc, 2),
@@ -717,7 +743,8 @@ def forecast_surplus():
     current_surplus = get(House.energy_surplus, 0)
     ev_energy = get(EV.energy, 0)
     reserve_soc = get_reserve_soc()
-    hard_battery_min_energy = 2
+    minimal_soc = get(Automation.minimal_soc, reserve_soc)
+    battery_export_floor = get_battery_export_floor(battery_capacity, reserve_soc, minimal_soc)
 
     if 1337 in (battery_capacity, battery_energy):
         log.warning("Battery capacity or energy not available yet, cannot calculate surplus")
@@ -736,7 +763,7 @@ def forecast_surplus():
         setpoint=setpoint,
         forecast_dampening=1,
         with_ev_charging=False,
-        battery_min_energy=hard_battery_min_energy,
+        battery_min_energy=battery_export_floor,
         # logging=True,
         surplus_energy=current_surplus,
     )
@@ -745,21 +772,32 @@ def forecast_surplus():
     reserve_energy = reserve_soc / 100 * battery_capacity
 
     next_local_min_battery_energy = battery_energy
+    t_next_local_min = t_now
     if forecast_no_ev.detail:
         next_local_min_battery_energy = forecast_no_ev.detail[0].battery_energy
+        t_next_local_min = forecast_no_ev.detail[0].period_start
         previous_battery_energy = next_local_min_battery_energy
         for el in forecast_no_ev.detail[1:]:
             if el.battery_energy <= next_local_min_battery_energy:
                 next_local_min_battery_energy = el.battery_energy
+                t_next_local_min = el.period_start
             elif el.battery_energy > previous_battery_energy + 0.05:
                 break
             previous_battery_energy = el.battery_energy
 
-    # `energy_surplus` is the reserve-aware budget for optional/flexible loads.
-    # The inverter mode needs a separate physical headroom signal: zero optional
-    # surplus should not by itself disable normal house self-consumption.
-    surplus = max(0, next_local_min_battery_energy - reserve_energy)
-    battery_headroom_until_trough = max(0, next_local_min_battery_energy - hard_battery_min_energy)
+    # Use the same protected floor for optional loads and battery-export
+    # headroom so a clamped forecast cannot manufacture exportable energy.
+    surplus = max(0, next_local_min_battery_energy - battery_export_floor)
+    battery_headroom_surplus = max(0, next_local_min_battery_energy - battery_export_floor)
+
+    scheduled_grid_setpoint_energy_until_trough = sum([
+        el.setpoint
+        for el in forecast_no_ev.detail
+        if t_next_local_min is not None and el.period_start <= t_next_local_min
+    ]) * period_hours / 1000
+
+    surplus = max(0, battery_headroom_surplus - scheduled_grid_setpoint_energy_until_trough)
+    battery_headroom_until_trough = battery_headroom_surplus
 
     forecast_today = [el for el in forecast_no_ev.detail if el.period_start.day == t_now.day]
     feedin_today = sum([max(0, el.feedin - 20) for el in forecast_today]) * period_hours / 1000
@@ -793,7 +831,7 @@ def forecast_surplus():
             forecast_dampening=1,
             with_ev_charging=True,
             ev_schedule=ev_schedule,
-            battery_min_energy=hard_battery_min_energy,
+            battery_min_energy=battery_export_floor,
             # logging=True,
             surplus_energy=surplus,
             ev_energy=ev_energy,
@@ -958,23 +996,26 @@ def map_setpoint(
 
     new_setpoint = gaus_prob * setpoint
 
-    battery_min_limit += 2  # add some buffer to prevent hitting the limit too eearly
-
-    # exponential decay from 1 to 0 from battery_min_limit + 2 to battery_min_limit
-    if battery_energy < battery_min_limit and pv_power < house_power:
-        new_setpoint = setpoint * ((battery_energy - battery_min_limit) / 2) ** 4
-
     surplus_pv = max(0, pv_power - house_power - max_battery_power_target)
+    pv_only_setpoint = get_pv_only_setpoint(
+        pv_power,
+        house_power,
+        max_battery_power_target,
+        neutral_setpoint=min_setpoint,
+    )
 
     if surplus_pv > 0 and setpoint < max_setpoint:
         new_setpoint = min(new_setpoint, -surplus_pv)
 
-    if surplus_energy is not None and surplus_energy <= 0:
-        # When the reserve-aware surplus budget is exhausted, the setpoint may
-        # still export unavoidable PV, but it must not ask the battery to export
-        # into the grid. Normal house self-consumption is handled by inverter
-        # mode/physics; this cap protects the real Victron setpoint.
-        new_setpoint = max(new_setpoint, min(min_setpoint, -surplus_pv))
+    # Scale only the battery-to-grid portion of the target. At the protected
+    # floor, retain a neutral target or unavoidable PV export, but never ask the
+    # battery to export. The factor is monotonic and cannot rise below the floor.
+    battery_headroom_factor = clip((battery_energy - battery_min_limit) / 2, 0, 1) ** 4
+    if surplus_energy is not None:
+        battery_headroom_factor = min(battery_headroom_factor, clip(surplus_energy / 2, 0, 1) ** 4)
+
+    if new_setpoint < pv_only_setpoint:
+        new_setpoint = pv_only_setpoint + (new_setpoint - pv_only_setpoint) * battery_headroom_factor
 
     return max(-(max_feedin + surplus_pv), min(min_setpoint, new_setpoint))
 
@@ -1066,7 +1107,7 @@ def forecast(
     )
 
 
-# @pyscript_compile
+@pyscript_compile
 def _forecast(
     forecast: list[PVForecastWithPrices],
     setpoint: float,
@@ -1637,8 +1678,7 @@ def auto_setpoint_target():
 
     max_setpoint = min(current_setpoint + 500, get(Grid.max_setpoint, -20))
     min_setpoint = min(max_setpoint, -max_feedin_limit)
-    battery_reserve = get_reserve_soc() * get(Battery.capacity, 0) / 100
-    battery_min_energy = battery_reserve + 1
+    reserve_soc = get_reserve_soc()
 
     forecast_dampening = 1.0  # dampen the forecast to account for inaccuracies
     battery_energy = get(Battery.energy, 0)
@@ -1651,6 +1691,9 @@ def auto_setpoint_target():
     if battery_capacity == 1337:
         log.error("Battery capacity not available yet, cannot calculate setpoint")
         return
+
+    minimal_soc = get(Automation.minimal_soc, reserve_soc)
+    battery_min_energy = get_battery_export_floor(battery_capacity, reserve_soc, minimal_soc)
 
     if logging:
         log.warning(f"battery capacity: {battery_capacity} min energy: {battery_min_energy}")
@@ -1772,21 +1815,32 @@ def auto_setpoint_target():
 
     if not automation_disabled and initial_forecast.max_feedin < 200:
         skip_automation_message = "No significant feedin expected"
-    if initial_forecast.min_bat < battery_min_energy + 0.5:
+    battery_too_low = (
+        battery_energy <= battery_min_energy + 0.5
+        or initial_forecast.min_bat < battery_min_energy + 0.5
+    )
+    if battery_too_low:
         skip_automation_message = "Battery too low in forecast, skipping automation to avoid depletion"
 
     if skip_automation_message:
-        log.warning(f"{skip_automation_message}, setting setpoint to {initial_forecast.setpoint}")
+        fallback_setpoint = initial_forecast.setpoint
+        if battery_too_low:
+            fallback_setpoint = get_pv_only_setpoint(
+                pv_power_total,
+                get(House.loads, house_avg_power),
+                8000,
+            )
+        log.warning(f"{skip_automation_message}, setting setpoint to {fallback_setpoint}")
 
         set_state(
             Grid.power_setpoint_target,
-            initial_forecast.setpoint,
+            fallback_setpoint,
             **power_w_attributes,
             detail=initial_forecast.detail,
         )
         set_state(
             Grid.power_setpoint_basis,
-            initial_forecast.setpoint,
+            fallback_setpoint,
             **power_w_attributes,
         )
         return
@@ -2151,17 +2205,26 @@ def auto_apply_setpoint():
         setpoint = max_setpoint
 
     surplus_energy = get(House.energy_surplus, 0)
-    if surplus_energy <= 0:
+    battery_capacity = get(Battery.capacity, 0)
+    battery_energy = get(Battery.energy, 0)
+    reserve_soc = get_reserve_soc()
+    minimal_soc = get(Automation.minimal_soc, reserve_soc)
+    battery_export_floor = get_battery_export_floor(battery_capacity, reserve_soc, minimal_soc)
+    if surplus_energy <= 0 or battery_energy <= battery_export_floor:
         pv_power = get(PVProduction.total_power, 0)
         max_battery_power_target = get_attr(Grid.power_setpoint_target, "max_battery_power_target", 4000)
-        surplus_pv = max(0, pv_power - house_loads - max_battery_power_target)
-        min_pv_only_setpoint = min(max_setpoint, -surplus_pv)
-        if setpoint < min_pv_only_setpoint:
+        pv_only_setpoint = get_pv_only_setpoint(
+            pv_power,
+            house_loads,
+            max_battery_power_target,
+        )
+        if setpoint < pv_only_setpoint:
             msg += (
-                f" capped setpoint from {setpoint:.0f} to {min_pv_only_setpoint:.0f} "
-                f"because surplus is {surplus_energy:.2f} kWh"
+                f" capped setpoint from {setpoint:.0f} to {pv_only_setpoint:.0f}; "
+                f"surplus {surplus_energy:.2f} kWh, battery {battery_energy:.2f} kWh, "
+                f"protected floor {battery_export_floor:.2f} kWh"
             )
-            setpoint = min_pv_only_setpoint
+            setpoint = pv_only_setpoint
 
     if logging:
         log.warning(msg)
