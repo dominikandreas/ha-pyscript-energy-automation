@@ -146,7 +146,8 @@ def _get_charge_action(
         )
 
     # if no more charging needed, turn off the charger
-    if energy_needed <= 0 and not (surplus_available and current_soc < surplus_charge_limit):
+    active_surplus_charge = is_charging and surplus_energy > 0 and current_soc < surplus_charge_limit
+    if energy_needed <= 0 and not (surplus_available and current_soc < surplus_charge_limit) and not active_surplus_charge:
         reason = f"Required SoC reached and no PV surplus charging room, energy_needed={energy_needed:.2f}kWh"
         return (ChargeAction.off, 1, 6, reason)
 
