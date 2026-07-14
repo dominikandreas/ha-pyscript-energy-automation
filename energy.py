@@ -2200,7 +2200,8 @@ def auto_apply_setpoint():
         setpoint = min(max_setpoint, setpoint_target)
         msg += f" updated setpoint to {setpoint}"
 
-    if get(EV.is_charging, False):
+    ev_is_charging = get(EV.is_charging, False)
+    if ev_is_charging:
         msg = f"setpoint adjusted to {max_setpoint} since EV is charging"
         setpoint = max_setpoint
 
@@ -2210,14 +2211,27 @@ def auto_apply_setpoint():
     reserve_soc = get_reserve_soc()
     minimal_soc = get(Automation.minimal_soc, reserve_soc)
     battery_export_floor = get_battery_export_floor(battery_capacity, reserve_soc, minimal_soc)
-    if surplus_energy <= 0 or battery_energy <= battery_export_floor:
-        pv_power = get(PVProduction.total_power, 0)
-        max_battery_power_target = get_attr(Grid.power_setpoint_target, "max_battery_power_target", 4000)
-        pv_only_setpoint = get_pv_only_setpoint(
-            pv_power,
-            house_loads,
-            max_battery_power_target,
+    pv_power = get(PVProduction.total_power, 0)
+    max_battery_power_target = get_attr(Grid.power_setpoint_target, "max_battery_power_target", 4000)
+    pv_only_setpoint = get_pv_only_setpoint(
+        pv_power,
+        house_loads,
+        max_battery_power_target,
+    )
+
+    ev_energy_needed = get(EV.energy_needed, 0)
+    min_ev_charge_power = EVConst.voltage * EVConst.min_current
+    ev_has_pv_headroom = pv_power > house_loads + min_ev_charge_power
+    protect_opportunistic_ev_from_battery = ev_is_charging and ev_energy_needed <= 0 and ev_has_pv_headroom
+
+    if protect_opportunistic_ev_from_battery and setpoint < pv_only_setpoint:
+        msg += (
+            f" capped EV setpoint from {setpoint:.0f} to {pv_only_setpoint:.0f}; "
+            f"PV {pv_power:.0f} W, loads {house_loads:.0f} W, energy_needed {ev_energy_needed:.2f} kWh"
         )
+        setpoint = pv_only_setpoint
+
+    if surplus_energy <= 0 or battery_energy <= battery_export_floor:
         if setpoint < pv_only_setpoint:
             msg += (
                 f" capped setpoint from {setpoint:.0f} to {pv_only_setpoint:.0f}; "
