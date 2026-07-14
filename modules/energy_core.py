@@ -135,7 +135,18 @@ def _get_charge_action(
     # Required SoC is a hard trip target. Smart limit is the PV-opportunistic
     # ceiling. Do not block surplus charging just because the trip target is met.
     surplus_charge_limit = max(required_charge_limit, smart_charge_limit)
-    surplus_available = excess_power > excess_target and (surplus_energy > 0 or excess_power > 3000)
+    required_charge_pending = energy_needed > 0 and current_soc < required_charge_limit
+    surplus_charge_context = (
+        battery_soc > 90
+        or pv_total_power > 1500
+        or current_soc < 40
+        or (required_charge_pending and hours_available_to_charge < 14)
+    )
+    surplus_available = (
+        excess_power > excess_target
+        and (surplus_energy > 0 or excess_power > 3000)
+        and surplus_charge_context
+    )
 
     if current_soc >= surplus_charge_limit:
         return (
@@ -146,7 +157,12 @@ def _get_charge_action(
         )
 
     # if no more charging needed, turn off the charger
-    active_surplus_charge = is_charging and surplus_energy > 0 and current_soc < surplus_charge_limit
+    active_surplus_charge = (
+        is_charging
+        and surplus_energy > 0
+        and current_soc < surplus_charge_limit
+        and surplus_charge_context
+    )
     if energy_needed <= 0 and not (surplus_available and current_soc < surplus_charge_limit) and not active_surplus_charge:
         reason = f"Required SoC reached and no PV surplus charging room, energy_needed={energy_needed:.2f}kWh"
         return (ChargeAction.off, 1, 6, reason)
@@ -162,11 +178,7 @@ def _get_charge_action(
         return (ChargeAction.on, phases, current, reason)
     # PV surplus charging, when sufficient excess is available and no time constraints
     elif (
-        excess_power > excess_target
-        and (surplus_energy > 0 or excess_power > 3000)
-        and (  # prevent charging by discharging from battery when we can excess charge the next day
-            battery_soc > 90 or pv_total_power > 1500 or hours_available_to_charge < 14 or current_soc < 40
-        )
+        surplus_available
     ):
         available_power = excess_power - excess_target  # in W
         # Hysteresis logic with proper unit conversion (W->kW)
