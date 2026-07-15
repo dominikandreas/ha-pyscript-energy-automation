@@ -74,6 +74,8 @@ class Charger:
     """Force EV charging, disables current / phase / surplus charging automations"""
     turned_on_by_automation = "input_boolean.ev_charging_turned_on_by_automation"
     """Whether EV charging was turned on by automation"""
+    reset_button = "button.charger_reset"
+    """Button to reset the charger when it ignores normal off commands."""
 
 
 class EV:

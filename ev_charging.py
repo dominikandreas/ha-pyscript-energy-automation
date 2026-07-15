@@ -57,6 +57,7 @@ def smart_charge_limit():
 
 
 last_ev_charging_phase_change = now() - timedelta(minutes=15)
+last_charger_reset = now() - timedelta(minutes=15)
 ev_charging_turned_on_by_automation = get(Charger.turned_on_by_automation, False)
 
 
@@ -103,6 +104,30 @@ def turn_on_charger(reason: str = ""):
         return new_state
 
 
+def reset_charger_if_stuck(reason: str = ""):
+    global last_charger_reset
+
+    if last_charger_reset > now() - timedelta(minutes=5):
+        log.warning(f"Charger still appears stuck, but reset cooldown is active. Reason: {reason}")
+        return False
+
+    wallbox_power = get(Charger.power, 0)
+    connector_status = str(get(Charger.status_connector, "")).lower()
+    switch_on = get(Charger.control_switch, False)
+    physically_charging = wallbox_power > 300 or connector_status == "charging"
+
+    if switch_on or physically_charging:
+        log.warning(
+            f"Resetting EV charger after ignored off command. switch={switch_on}, "
+            f"wallbox_power={wallbox_power:.0f}W, connector={connector_status}. Reason: {reason}"
+        )
+        service.call("button", "press", entity_id=Charger.reset_button)
+        last_charger_reset = now()
+        return True
+
+    return False
+
+
 def turn_off_charger(reason: str = "", check_phase_change_cooldown=True, force=False):
     is_charging = get(Charger.control_switch, False)
     configured_phases = get(Charger.phases, 3)
@@ -123,6 +148,11 @@ def turn_off_charger(reason: str = "", check_phase_change_cooldown=True, force=F
         service.call("switch", "turn_off", entity_id=Charger.control_switch)
         task.sleep(5)
         new_state = get(Charger.control_switch, False)
+        if new_state:
+            reset_charger_if_stuck(reason)
+        else:
+            task.sleep(10)
+            reset_charger_if_stuck(reason)
 
         return new_state
 
