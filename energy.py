@@ -281,7 +281,7 @@ def auto_victron_set_inverter_mode():
     min_discharge_price = float(get(Automation.min_discharge_price, default=0))
     ev_is_charging = get(EV.is_charging, False)
     surplus_energy = get(House.energy_surplus, -1337)
-    battery_headroom_energy = get(House.battery_headroom_until_trough, -1337)
+    forecast_battery_headroom_energy = get(House.battery_headroom_until_trough, -1337)
     battery_soc = get(Battery.soc, -1337)
     target_soc = get(Automation.battery_target_soc, -1337)
     pv_power = get(PVProduction.total_power, -1337)  # in kW
@@ -290,7 +290,17 @@ def auto_victron_set_inverter_mode():
     max_charge_price = get(Battery.max_charge_price, 0)
     force_charge_switch = get(Battery.force_charge_switch, False)
     current_mode = get(Victron.inverter_mode_input_select)
+    battery_capacity = get(Battery.capacity, -1337)
+    battery_energy = get(Battery.energy, -1337)
+    reserve_soc = get_reserve_soc()
+    minimal_soc = get(Automation.minimal_soc, reserve_soc)
     t_now = now()
+
+    if battery_capacity != -1337 and battery_energy != -1337:
+        battery_export_floor = get_battery_export_floor(battery_capacity, reserve_soc, minimal_soc)
+        battery_headroom_energy = max(0, battery_energy - battery_export_floor)
+    else:
+        battery_headroom_energy = forecast_battery_headroom_energy
 
     if pv_power == -1337:
         log.warning("Total PV power state not available, using forecast instead")
