@@ -2199,6 +2199,7 @@ def auto_apply_setpoint():
     house_loads = max(house_loads, house_power_long_term_average * 0.5)
 
     house_loads = prev_house_loads * 0.5 + 0.5 * house_loads  # prevent oscillations, outliers
+    prev_house_loads = house_loads
     setpoint_target = get(Grid.power_setpoint_target, 0)
     max_setpoint_target = get(Grid.max_feedin_target, 0)
 
