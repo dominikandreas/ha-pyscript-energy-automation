@@ -1044,6 +1044,7 @@ def forecast(
     ev_energy: float | None = None,
     max_battery_power_target: float = 4000,
     max_pv_feedin_target: float = 1000,
+    max_feedin: float | None = None,
     max_setpoint=-20,
     logging=False,
     ev_schedule: list[EVScheduleEntry] | None = None,
@@ -1082,6 +1083,7 @@ def forecast(
     battery_cells_balanced = (
         battery_cells_balanced if battery_cells_balanced is not None else get(Battery.cells_balanced, False)
     )
+    max_feedin = max_feedin if max_feedin is not None else get(Grid.max_feedin_target, 4000)
     return _forecast(
         forecast=forecast,
         setpoint=setpoint,
@@ -1096,6 +1098,7 @@ def forecast(
         ev_energy=ev_energy,
         max_battery_power_target=max_battery_power_target,
         max_pv_feedin_target=max_pv_feedin_target,
+        max_feedin=max_feedin,
         max_setpoint=max_setpoint,
         logging=logging,
         ev_schedule=ev_schedule,
@@ -1132,6 +1135,7 @@ def _forecast(
     ev_energy: float | None = None,
     max_battery_power_target: float = 4000,
     max_pv_feedin_target: float = 1000,
+    max_feedin: float = 4000,
     max_setpoint=-20,
     logging=False,
     ev_schedule: list[EVScheduleEntry] | None = None,
@@ -1350,6 +1354,7 @@ def _forecast(
             battery_min_limit=period_battery_min_energy,
             pv_power=power_production,
             house_power=house_power,
+            max_feedin=max_feedin,
             setpoint_spread=setpoint_spread,
             max_setpoint=max_setpoint,
             max_battery_power_target=max_battery_power_target,
@@ -1753,6 +1758,7 @@ def auto_setpoint_target():
             ev_energy=ev_energy,
             max_battery_power_target=max_battery_power_target,
             max_pv_feedin_target=max_pv_feedin,
+            max_feedin=max_feedin_limit,
             max_setpoint=max_setpoint,
             logging=logging,
             ev_schedule=ev_schedule,
@@ -2144,6 +2150,7 @@ def auto_setpoint_target():
         battery_min_limit=battery_min_energy,
         pv_power=pv_power_total,
         house_power=house_power,
+        max_feedin=max_feedin_limit,
         setpoint_spread=setpoint_result.setpoint_spread,
         max_battery_power_target=setpoint_result.max_battery_power_target,
         surplus_energy=surplus_energy,
