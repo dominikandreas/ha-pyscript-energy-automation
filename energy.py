@@ -693,6 +693,77 @@ def set_energy_surplus(entity, surplus, **kwargs):
 
 
 @pyscript_compile
+def get_spendable_solar_cycle_energy(
+    detail: list["ForecastEntry"],
+    battery_export_floor: float,
+    t_now: datetime,
+    period_hours: float,
+) -> tuple[float, float, float, datetime | None]:
+    """Return a conservative energy budget for the current solar cycle.
+
+    The caller must provide a baseline forecast in which optional loads and
+    optional battery-to-grid export are disabled.  Energy is spendable when it
+    either remains above the protected battery floor at the following overnight
+    trough, or would otherwise be exported from PV before that trough.
+
+    The result is a schedulable energy budget, not an assertion that all of the
+    energy can be drawn immediately; live power controls still need to align a
+    variable load with the available PV/battery power.
+    """
+    future = [entry for entry in detail if entry.period_start >= t_now]
+    if not future:
+        return 0, 0, 0, None
+
+    today = t_now.date()
+    solar_today = [
+        entry
+        for entry in future
+        if entry.period_start.date() == today and entry.pv_estimate >= entry.house_power
+    ]
+
+    # With no useful solar window left today, retain the old conservative
+    # meaning: only expose battery headroom at the next local trough.
+    if not solar_today:
+        trough_energy = future[0].battery_energy
+        previous_energy = trough_energy
+        trough_time = future[0].period_start
+        for entry in future[1:]:
+            if entry.battery_energy <= trough_energy:
+                trough_energy = entry.battery_energy
+                trough_time = entry.period_start
+            elif entry.battery_energy > previous_energy + 0.05:
+                break
+            previous_energy = entry.battery_energy
+        battery_headroom = max(0, trough_energy - battery_export_floor)
+        return battery_headroom, battery_headroom, 0, trough_time
+
+    solar_end_time = solar_today[-1].period_start
+
+    # End the budget at the next solar cycle.  This forces today's spendable
+    # energy to cover the evening/night demand before tomorrow's PV is credited.
+    next_solar_start = next(
+        (
+            entry.period_start
+            for entry in future
+            if entry.period_start.date() > today and entry.pv_estimate >= entry.house_power
+        ),
+        None,
+    )
+    cycle = [
+        entry
+        for entry in future
+        if next_solar_start is None or entry.period_start < next_solar_start
+    ]
+    after_solar = [entry for entry in cycle if entry.period_start >= solar_end_time]
+    trough_entry = min(after_solar or cycle, key=lambda entry: entry.battery_energy)
+
+    battery_headroom = max(0, trough_entry.battery_energy - battery_export_floor)
+    pv_spill = sum(max(0, entry.pv_feedin - 20) for entry in cycle) * period_hours / 1000
+    spendable = battery_headroom + pv_spill
+    return spendable, battery_headroom, pv_spill, trough_entry.period_start
+
+
+@pyscript_compile
 def parse_full_schedule(
     schedule_data: dict[str, list[dict[str, Any]]], default_required_soc: float
 ) -> list["EVScheduleEntry"]:
@@ -778,6 +849,22 @@ def forecast_surplus():
         surplus_energy=current_surplus,
     )
 
+    # Calculate the variable-load budget from a separate conservative baseline.
+    # Starting this forecast with zero surplus prevents a feedback loop where a
+    # previously reported budget authorizes battery export which is then counted
+    # again as newly available energy.  Forecast PV is reduced by 20% and only
+    # PV that still spills after charging the battery is added to the budget.
+    spendable_forecast = forecast(
+        forecast=pv_forecast,
+        battery_capacity=battery_capacity,
+        battery_energy=battery_energy,
+        setpoint=setpoint,
+        forecast_dampening=0.8,
+        with_ev_charging=False,
+        battery_min_energy=battery_export_floor,
+        surplus_energy=0,
+    )
+
     min_battery_energy = min([el.battery_energy for el in forecast_no_ev.detail] or [0])
     reserve_energy = reserve_soc / 100 * battery_capacity
 
@@ -795,30 +882,32 @@ def forecast_surplus():
                 break
             previous_battery_energy = el.battery_energy
 
-    # Use the same protected floor for optional loads and battery-export
-    # headroom so a clamped forecast cannot manufacture exportable energy.
-    surplus = max(0, next_local_min_battery_energy - battery_export_floor)
-    battery_headroom_surplus = max(0, next_local_min_battery_energy - battery_export_floor)
-
-    scheduled_grid_setpoint_energy_until_trough = sum([
-        el.setpoint
-        for el in forecast_no_ev.detail
-        if t_next_local_min is not None and el.period_start <= t_next_local_min
-    ]) * period_hours / 1000
-
-    surplus = max(0, battery_headroom_surplus - scheduled_grid_setpoint_energy_until_trough)
-    battery_headroom_until_trough = battery_headroom_surplus
+    surplus, battery_headroom_until_trough, conservative_pv_spill, spendable_horizon = (
+        get_spendable_solar_cycle_energy(
+            spendable_forecast.detail,
+            battery_export_floor,
+            t_now,
+            period_hours,
+        )
+    )
 
     forecast_today = [el for el in forecast_no_ev.detail if el.period_start.day == t_now.day]
     feedin_today = sum([max(0, el.feedin - 20) for el in forecast_today]) * period_hours / 1000
     pv_feedin_today = sum([max(0, el.pv_feedin - 20) for el in forecast_today]) * period_hours / 1000
 
-
     detail_without_ev_vectorized = {
         k: [getattr(el, k) for el in forecast_no_ev.detail] for k in ForecastEntry.__annotations__.keys()
     }
 
-    set_energy_surplus(House.energy_surplus, surplus)
+    set_energy_surplus(
+        House.energy_surplus,
+        surplus,
+        battery_headroom=battery_headroom_until_trough,
+        conservative_pv_spill=round(conservative_pv_spill, 2),
+        protected_battery_floor=round(battery_export_floor, 2),
+        forecast_pv_factor=0.8,
+        spendable_horizon=spendable_horizon,
+    )
     set_energy_surplus(
         House.battery_headroom_until_trough,
         battery_headroom_until_trough,
@@ -852,8 +941,11 @@ def forecast_surplus():
         log.warning(
             f"""\n#################### Forecast Surplus  #####################\n
             Reserve battery energy: {reserve_energy:.2f} kWh ({reserve_soc:.2f}% reserve SOC)
+            Protected battery floor: {battery_export_floor:.2f} kWh
             Next local min battery: {next_local_min_battery_energy:.2f} kWh
             Battery headroom until trough: {battery_headroom_until_trough:.2f} kWh
+            Conservative PV spill until trough: {conservative_pv_spill:.2f} kWh
+            Spendable horizon: {spendable_horizon}
             Min battery: {min_battery_energy:.2f} kWh
             Final battery energy: {forecast_no_ev.detail[-1].battery_energy:.2f} kWh
             Surplus: {surplus:.2f} kWh
