@@ -193,18 +193,23 @@ def house_energy_until_production_meets_demand():
 
     next_pv_meet_demand = with_timezone(next_pv_meet_demand)
     t_now = now()
-    dt = next_pv_meet_demand - t_now
 
     total_energy = 0
-    # to ensure we never hit an infinity loop for whatever reason
+    cursor = t_now
+    # Integrate partial hours exactly; rounding both ends to whole hours can
+    # otherwise reserve almost one extra hour of house demand.
     iters, max_iters = (0, 240)
-    while dt > timedelta(hours=0) and iters < max_iters:
-        if 7 < (t_now + dt).hour < 19:
-            total_energy += day_avg_power / 1000
-        else:
-            total_energy += night_avg_power / 1000
+    while cursor < next_pv_meet_demand and iters < max_iters:
+        next_hour = cursor.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+        segment_end = min(next_hour, next_pv_meet_demand)
+        duration_hours = (segment_end - cursor).total_seconds() / 3600
 
-        dt = dt - timedelta(hours=1)
+        if 7 < cursor.hour < 19:
+            total_energy += day_avg_power / 1000 * duration_hours
+        else:
+            total_energy += night_avg_power / 1000 * duration_hours
+
+        cursor = segment_end
         iters += 1
 
     log.warning(
@@ -488,15 +493,11 @@ def get_required_energy(
     house_energy_demand: float,
     pv_upcoming: float,
     excess_next_days: float,
-    battery_capacity: float,
-    battery_energy: float,
-    surplus: float,
 ) -> float:
     return max(
         0,
         house_energy_demand - pv_upcoming,
         min(0, excess_next_days),
-        0 if surplus > 0 else min(battery_capacity, battery_energy - surplus),
     )
 
 
@@ -540,9 +541,6 @@ def auto_battery_target_soc():
         house_demand,
         pv_upcoming,
         excess_next_days,
-        battery_capacity,
-        battery_energy,
-        surplus,
     )
 
     msg = (
@@ -825,7 +823,27 @@ def forecast_surplus():
     ev_energy = get(EV.energy, 0)
     reserve_soc = get_reserve_soc()
     minimal_soc = get(Automation.minimal_soc, reserve_soc)
-    battery_export_floor = get_battery_export_floor(battery_capacity, reserve_soc, minimal_soc)
+    operational_battery_floor = get_battery_export_floor(battery_capacity, reserve_soc, minimal_soc)
+
+    # Forecasted house demand must not also be embedded in the forecast floor.
+    # The forecast consumes that energy explicitly, so using minimal_soc here
+    # reserves the same demand twice and understates spendable energy.
+    forecast_battery_floor = get_battery_export_floor(
+        battery_capacity,
+        reserve_soc,
+        reserve_soc,
+    )
+
+    # Keep the unbalanced-cell low-PV reserve for optional loads. The spendable
+    # horizon ends at an overnight/early-morning trough, where that reserve is
+    # active even though it is deliberately excluded from minimal_soc above.
+    battery_cells_balanced = get(Battery.cells_balanced, False)
+    surplus_reserve_soc = max(reserve_soc, 0 if battery_cells_balanced else 15)
+    surplus_battery_floor = get_battery_export_floor(
+        battery_capacity,
+        surplus_reserve_soc,
+        surplus_reserve_soc,
+    )
 
     if 1337 in (battery_capacity, battery_energy):
         log.warning("Battery capacity or energy not available yet, cannot calculate surplus")
@@ -844,7 +862,7 @@ def forecast_surplus():
         setpoint=setpoint,
         forecast_dampening=1,
         with_ev_charging=False,
-        battery_min_energy=battery_export_floor,
+        battery_min_energy=forecast_battery_floor,
         # logging=True,
         surplus_energy=current_surplus,
     )
@@ -861,7 +879,7 @@ def forecast_surplus():
         setpoint=setpoint,
         forecast_dampening=0.8,
         with_ev_charging=False,
-        battery_min_energy=battery_export_floor,
+        battery_min_energy=forecast_battery_floor,
         surplus_energy=0,
     )
 
@@ -885,7 +903,7 @@ def forecast_surplus():
     surplus, battery_headroom_until_trough, conservative_pv_spill, spendable_horizon = (
         get_spendable_solar_cycle_energy(
             spendable_forecast.detail,
-            battery_export_floor,
+            surplus_battery_floor,
             t_now,
             period_hours,
         )
@@ -904,7 +922,9 @@ def forecast_surplus():
         surplus,
         battery_headroom=battery_headroom_until_trough,
         conservative_pv_spill=round(conservative_pv_spill, 2),
-        protected_battery_floor=round(battery_export_floor, 2),
+        protected_battery_floor=round(surplus_battery_floor, 2),
+        forecast_battery_floor=round(forecast_battery_floor, 2),
+        operational_battery_floor=round(operational_battery_floor, 2),
         forecast_pv_factor=0.8,
         spendable_horizon=spendable_horizon,
     )
@@ -930,7 +950,7 @@ def forecast_surplus():
             forecast_dampening=1,
             with_ev_charging=True,
             ev_schedule=ev_schedule,
-            battery_min_energy=battery_export_floor,
+            battery_min_energy=forecast_battery_floor,
             # logging=True,
             surplus_energy=surplus,
             ev_energy=ev_energy,
@@ -941,7 +961,9 @@ def forecast_surplus():
         log.warning(
             f"""\n#################### Forecast Surplus  #####################\n
             Reserve battery energy: {reserve_energy:.2f} kWh ({reserve_soc:.2f}% reserve SOC)
-            Protected battery floor: {battery_export_floor:.2f} kWh
+            Forecast battery floor: {forecast_battery_floor:.2f} kWh
+            Protected surplus floor: {surplus_battery_floor:.2f} kWh
+            Operational battery floor: {operational_battery_floor:.2f} kWh
             Next local min battery: {next_local_min_battery_energy:.2f} kWh
             Battery headroom until trough: {battery_headroom_until_trough:.2f} kWh
             Conservative PV spill until trough: {conservative_pv_spill:.2f} kWh
