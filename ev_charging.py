@@ -9,7 +9,7 @@ if TYPE_CHECKING:
     # Therefore during type checking we pretend to import them from modules.utils, which it can resolve.
     from modules.utils import get, get_attr
     from modules.const import EV as Const
-    from modules.energy_core import HYSTERESIS_BUFFER
+    from modules.energy_core import ChargeMode, HYSTERESIS_BUFFER
 
     # These are provided by typescript and do not need to be imported in the actual script
     # They are only needed for type checking (linting), which development easier
@@ -34,7 +34,7 @@ else:
     from const import EV as Const
     from utils import get, set_state, get_attr, now, with_timezone
     from states import Automation, Charger, ElectricityPrices, EV, Excess, Battery, House, PVProduction
-    from energy_core import _get_ev_smart_charge_limit, _get_ev_energy_needed, _get_charge_action, HYSTERESIS_BUFFER  # noqa: F401
+    from energy_core import ChargeMode, _get_ev_smart_charge_limit, _get_ev_energy_needed, _get_charge_action, HYSTERESIS_BUFFER  # noqa: F401
     from victron import Victron
 
 
@@ -58,7 +58,29 @@ def smart_charge_limit():
 
 last_ev_charging_phase_change = now() - timedelta(minutes=15)
 last_charger_reset = now() - timedelta(minutes=15)
-ev_charging_turned_on_by_automation = get(Charger.turned_on_by_automation, False)
+
+PV_SURPLUS_START_CONFIRMATION = timedelta(minutes=3)
+PV_SURPLUS_STOP_CONFIRMATION = timedelta(minutes=5)
+PV_SURPLUS_MIN_RUN_TIME = timedelta(minutes=10)
+PV_SURPLUS_RESTART_LOCKOUT = timedelta(minutes=5)
+
+pv_surplus_active = get(Charger.turned_on_by_automation, False) and get(Charger.control_switch, False)
+pv_surplus_started_at = now() if pv_surplus_active else None
+pv_surplus_start_candidate_since = None
+pv_surplus_stop_candidate_since = None
+last_pv_surplus_stop = now() - PV_SURPLUS_RESTART_LOCKOUT
+
+
+def set_pv_surplus_marker(active: bool):
+    """Persist whether the automation currently owns a PV-surplus charge."""
+
+    marker_active = get(Charger.turned_on_by_automation, False)
+    if marker_active != active:
+        service.call(
+            "input_boolean",
+            "turn_on" if active else "turn_off",
+            entity_id=Charger.turned_on_by_automation,
+        )
 
 
 @time_trigger
@@ -347,8 +369,19 @@ async def auto_ev_charging():
     surplus_energy = get(House.energy_surplus, 0)  # in kWh
 
     # this is the maximum charge current that the vehicle should be charge with right now
-    configured_current = get(Charger.current_setting, 16)
-    configured_phases = get(Charger.phases, 3)
+    configured_current = get(Charger.current_setting, default=None, mapper=float)
+    configured_phases = get(Charger.phases, default=None, mapper=int)
+    if (
+        configured_current is None
+        or not Const.min_current <= configured_current <= Const.max_current
+        or configured_phases not in (1, 3)
+    ):
+        log.warning(
+            f"Invalid charger configuration state: phases={configured_phases}, current={configured_current}; "
+            "holding the current charger state"
+        )
+        return
+    wallbox_power = get(Charger.power, 0)
 
     smart_limiter_active = get(Automation.auto_charge_limit, False)
     ev_charge_limit = get(EV.smart_charge_limit, 80)
@@ -417,7 +450,7 @@ async def auto_ev_charging():
     #  - when charging already active, control the charge amps to meet target excess
     #  - when price is high and time is not constrained, turn off the charger
     #  -------------------------------------------------------------------------------------
-    action, phases, current, reason = _get_charge_action(
+    action, phases, current, reason, charge_mode = _get_charge_action(
         next_drive=next_drive,
         current_soc=current_soc,
         required_soc=required_soc,
@@ -437,23 +470,111 @@ async def auto_ev_charging():
         t_now=t_now,
         inverter_mode=inverter_mode,
         battery_force_charge=battery_force_charge,
+        wallbox_power=wallbox_power,
     )
 
     hours_available_to_charge = ((next_drive - t_now).total_seconds() / 3600) if next_drive else 999
 
-    log.warning(f"Got charge action: {action} phases {phases} current {current}: {reason}")
+    log.warning(f"Got charge action: {action} mode {charge_mode} phases {phases} current {current}: {reason}")
 
-    if action == "on":
+    global pv_surplus_active
+    global pv_surplus_started_at
+    global pv_surplus_start_candidate_since
+    global pv_surplus_stop_candidate_since
+    global last_pv_surplus_stop
+
+    is_pv_surplus_action = action == "on" and charge_mode == ChargeMode.surplus
+    hard_stop = charge_mode == ChargeMode.hard_stop
+
+    if is_pv_surplus_action:
+        pv_surplus_stop_candidate_since = None
+
+        if not is_charging:
+            lockout_remaining = PV_SURPLUS_RESTART_LOCKOUT - (t_now - last_pv_surplus_stop)
+            if lockout_remaining.total_seconds() > 0:
+                pv_surplus_start_candidate_since = None
+                log.warning(
+                    f"Holding PV surplus charge off for another {lockout_remaining.total_seconds():.0f}s "
+                    "due to restart lockout"
+                )
+                return
+
+            if pv_surplus_start_candidate_since is None:
+                pv_surplus_start_candidate_since = t_now
+                log.warning("PV surplus start candidate detected; waiting for 3 minutes of stable headroom")
+                return
+
+            stable_for = t_now - pv_surplus_start_candidate_since
+            if stable_for < PV_SURPLUS_START_CONFIRMATION:
+                log.warning(
+                    f"PV surplus start candidate stable for {stable_for.total_seconds():.0f}s; "
+                    "waiting for 180s"
+                )
+                return
+
+        changed = set_phases_and_current(phases, current, reason)
+        if not changed:
+            return
+
+        if not is_charging and not turn_on_charger(reason):
+            log.warning("PV surplus start command was not confirmed")
+            return
+
+        if not pv_surplus_active:
+            pv_surplus_active = True
+            pv_surplus_started_at = t_now
+            set_pv_surplus_marker(True)
+        pv_surplus_start_candidate_since = None
+
+    elif action == "on":
+        # Mandatory/deadline/cheap charging bypasses all PV timing guards.
+        pv_surplus_start_candidate_since = None
+        pv_surplus_stop_candidate_since = None
+        if pv_surplus_active:
+            pv_surplus_active = False
+            pv_surplus_started_at = None
+            set_pv_surplus_marker(False)
+
         changed = set_phases_and_current(phases, current, reason)
         if changed:
             turn_on_charger(reason)
+
     elif action == "off":
-        reason_lower = reason.lower()
-        force_off = (
-            "charge limit" in reason_lower
-            or "required soc" in reason_lower
-            or "energy_needed" in reason_lower
-        )
-        turn_off_charger(reason, check_phase_change_cooldown=False, force=force_off)
+        pv_surplus_start_candidate_since = None
+
+        if hard_stop:
+            pv_surplus_stop_candidate_since = None
+        elif is_charging and (pv_surplus_active or reason.startswith("ON->OFF")):
+            if not pv_surplus_active:
+                # Safe recovery after a script reload while a surplus charge is active.
+                pv_surplus_active = True
+                pv_surplus_started_at = t_now
+                set_pv_surplus_marker(True)
+
+            if pv_surplus_stop_candidate_since is None:
+                pv_surplus_stop_candidate_since = t_now
+                log.warning("PV surplus deficit detected; waiting for 5 minutes before stopping")
+                return
+
+            deficit_for = t_now - pv_surplus_stop_candidate_since
+            run_time = t_now - pv_surplus_started_at
+            if deficit_for < PV_SURPLUS_STOP_CONFIRMATION or run_time < PV_SURPLUS_MIN_RUN_TIME:
+                log.warning(
+                    f"Holding PV surplus charge on: deficit for {deficit_for.total_seconds():.0f}s/300s, "
+                    f"run time {run_time.total_seconds():.0f}s/600s"
+                )
+                return
+
+        turn_off_charger(reason, check_phase_change_cooldown=False, force=hard_stop)
+        if get(Charger.control_switch, False):
+            log.warning("EV charger stop command was not confirmed; keeping PV surplus state active")
+            return
+
+        if pv_surplus_active:
+            pv_surplus_active = False
+            pv_surplus_started_at = None
+            last_pv_surplus_stop = t_now
+            set_pv_surplus_marker(False)
+        pv_surplus_stop_candidate_since = None
     else:
         log.warning(f"Skipping unknown action: {action}")

@@ -14,11 +14,20 @@ else:
 
 
 HYSTERESIS_BUFFER = 1200  # Watts buffer for phase switching
+SURPLUS_START_MARGIN = 300  # W above the physical minimum before starting
+SURPLUS_STOP_MARGIN = 300  # W tolerated below the physical minimum while running
 
 
 class ChargeAction:
     on = "on"
     off = "off"
+
+
+class ChargeMode:
+    hard_stop = "hard_stop"
+    idle = "idle"
+    required = "required"
+    surplus = "surplus"
 
 
 @pyscript_compile
@@ -72,6 +81,21 @@ def calculate_charger_current_adjustment(
 
 
 @pyscript_compile
+def calculate_available_ev_power(
+    excess_power: float, excess_target: float, wallbox_power: float, is_charging: bool
+) -> float:
+    """Return EV power available at the configured excess target.
+
+    ``excess_power`` includes the wallbox load while charging. Adding the
+    measured wallbox power back makes this value independent of whether the
+    charger is currently on or off.
+    """
+
+    active_wallbox_power = max(0, wallbox_power) if is_charging else 0
+    return excess_power - excess_target + active_wallbox_power
+
+
+@pyscript_compile
 def _get_charge_action(
     next_drive,
     current_soc,
@@ -92,6 +116,7 @@ def _get_charge_action(
     t_now=None,
     inverter_mode: str = "off",
     battery_force_charge=False,
+    wallbox_power: float = 0,
 ):
     """Calculate the action to take for EV charging based on various conditions.
 
@@ -122,9 +147,6 @@ def _get_charge_action(
         smart_charge_limit = smart_charge_limit - 1
         # 2 kWh hysteresis for surplus energy
         surplus_energy = surplus_energy - 2
-        # 1000 W for target excess
-        excess_target = excess_target + 1000
-
     if smart_charge_limit == 100:
         smart_limiter_active = False
 
@@ -135,7 +157,21 @@ def _get_charge_action(
     # Required SoC is a hard trip target. Smart limit is the PV-opportunistic
     # ceiling. Do not block surplus charging just because the trip target is met.
     surplus_charge_limit = max(required_charge_limit, smart_charge_limit)
-    surplus_available = excess_power > excess_target and (surplus_energy > 0 or excess_power > 3000)
+    available_ev_power = calculate_available_ev_power(
+        excess_power=excess_power,
+        excess_target=excess_target,
+        wallbox_power=wallbox_power,
+        is_charging=is_charging,
+    )
+    minimum_charge_power = Const.min_phases * Const.voltage * Const.min_current
+    surplus_power_threshold = (
+        minimum_charge_power - SURPLUS_STOP_MARGIN
+        if is_charging
+        else minimum_charge_power + SURPLUS_START_MARGIN
+    )
+    surplus_available = available_ev_power >= surplus_power_threshold and (
+        surplus_energy > 0 or available_ev_power > 3000
+    )
 
     if current_soc >= surplus_charge_limit:
         return (
@@ -143,32 +179,37 @@ def _get_charge_action(
             1,
             6,
             f"EV charge limit reached: {current_soc:.0f}% >= {surplus_charge_limit:.0f}%",
+            ChargeMode.hard_stop,
         )
 
     # if no more charging needed, turn off the charger
     active_surplus_charge = is_charging and surplus_energy > 0 and current_soc < surplus_charge_limit
     if energy_needed <= 0 and not (surplus_available and current_soc < surplus_charge_limit) and not active_surplus_charge:
         reason = f"Required SoC reached and no PV surplus charging room, energy_needed={energy_needed:.2f}kWh"
-        return (ChargeAction.off, 1, 6, reason)
+        return (ChargeAction.off, 1, 6, reason, ChargeMode.idle)
 
     elif smart_limiter_active and current_soc >= smart_charge_limit:
-        return (ChargeAction.off, 1, 6, f"Smart charge limit of {smart_charge_limit} reached.")
+        return (
+            ChargeAction.off,
+            1,
+            6,
+            f"Smart charge limit of {smart_charge_limit} reached.",
+            ChargeMode.hard_stop,
+        )
     # Emergency charge, independently of price or excess power
     elif (hours_available_to_charge < 2 or hours_available_to_charge < min_hours_needed) and current_soc < (
         required_soc - 1
     ):
         reason = f"Emergency charge - SOC: hours available {hours_available_to_charge} time needed {min_hours_needed}  {current_soc}% < Target: {required_soc}%"
         phases, current = (3, Const.max_current)
-        return (ChargeAction.on, phases, current, reason)
+        return (ChargeAction.on, phases, current, reason, ChargeMode.required)
     # PV surplus charging, when sufficient excess is available and no time constraints
     elif (
-        excess_power > excess_target
-        and (surplus_energy > 0 or excess_power > 3000)
+        surplus_available
         and (  # prevent charging by discharging from battery when we can excess charge the next day
             battery_soc > 90 or pv_total_power > 1500 or hours_available_to_charge < 14 or current_soc < 40
         )
     ):
-        available_power = excess_power - excess_target  # in W
         # Hysteresis logic with proper unit conversion (W->kW)
         min_3phase_power = 3 * Const.voltage * Const.min_current  # in W
         if configured_phases == 3:
@@ -177,17 +218,25 @@ def _get_charge_action(
             phase_switch_threshold = min_3phase_power + hysteresis
 
         current_power = configured_phases * configured_current * Const.voltage  # W
-        phases = 3 if (current_power + available_power) >= phase_switch_threshold else 1
+        phases = 3 if available_ev_power >= phase_switch_threshold else 1
         # Calculate current with bounds checking and explicit type conversion
 
-        adj = calculate_charger_current_adjustment(excess_power, excess_target, configured_phases, configured_current)
+        if is_charging:
+            adj = calculate_charger_current_adjustment(
+                excess_power, excess_target, configured_phases, configured_current
+            )
+            target_current = configured_current + adj if phases <= configured_phases else 7
+        else:
+            # Start at a setpoint the measured headroom can actually support.
+            target_current = int(available_ev_power // (Const.voltage * phases))
+
         phases, current, reason = (
             phases,
-            configured_current + adj if phases <= configured_phases else 7,
+            clip(target_current, Const.min_current, Const.max_current),
             f"Excess power detected: {excess_power:.0f} W, Target: {excess_target:.0f} W, current power {current_power:.0f} W, "
-            f"Target Power for EV: {current_power + available_power:.0f} W",
+            f"Available Power for EV: {available_ev_power:.0f} W",
         )
-        return (ChargeAction.on, phases, current, reason)  #
+        return (ChargeAction.on, phases, current, reason, ChargeMode.surplus)
 
     # Charge when price is low and not much time left (likely not possible to charge via excess)
     elif energy_needed > 0 and is_low_price and hours_available_to_charge < 14:  # Use cheap electricity
@@ -200,7 +249,7 @@ def _get_charge_action(
             phases, current, reason = (3, current, "Charging at low price, with battery discharging")
         else:
             phases, current, reason = (3, Const.max_current, "Charging at low price, no battery discharging")
-        return (ChargeAction.on, phases, current, reason)
+        return (ChargeAction.on, phases, current, reason, ChargeMode.required)
 
     # When charging already active, need to control the charge amps to meet target excess
     elif is_charging and excess_power < excess_target:
@@ -218,6 +267,7 @@ def _get_charge_action(
                     1,
                     new_current,
                     f"Reducing phases to meet deficit of {deficit:.2f} W",
+                    ChargeMode.surplus,
                 )
             else:
                 return (
@@ -226,6 +276,7 @@ def _get_charge_action(
                     6,
                     f"ON->OFF: Excess {excess_power:.1f} W below target of {excess_target:.1f} W, current {configured_current}A"
                     f" already at minimum, unable to reduce further",
+                    ChargeMode.idle,
                 )
         else:
             adj = calculate_charger_current_adjustment(
@@ -237,9 +288,10 @@ def _get_charge_action(
                 max(Const.min_current, configured_current + adj),
                 f"Excess power detected: {excess_power:.2f} W, Target: {excess_target:.2f} W "
                 f"Reducing current to meet deficit of {deficit:.2f} W",
+                ChargeMode.surplus,
             )
 
     elif high_price and surplus_energy <= 0 and excess_power < excess_target:
-        return (ChargeAction.off, 1, 6, "high electricity price and still time available")
+        return (ChargeAction.off, 1, 6, "high electricity price and still time available", ChargeMode.idle)
 
-    return (ChargeAction.off, 1, 6, "None of the conditions for auto charging matched")
+    return (ChargeAction.off, 1, 6, "None of the conditions for auto charging matched", ChargeMode.idle)

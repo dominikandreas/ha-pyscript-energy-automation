@@ -1402,7 +1402,7 @@ def _forecast(
         ev_charge_power = 0.0
 
         if could_charge_ev:
-            charge_action, new_charge_phases, charge_current, reason = _get_charge_action(
+            charge_action, new_charge_phases, charge_current, reason, _charge_mode = _get_charge_action(
                 next_drive=next_drive_event.start if next_drive_event else None,
                 current_soc=ev_soc,
                 required_soc=ev_required_soc,
