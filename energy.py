@@ -16,6 +16,13 @@ if TYPE_CHECKING:
     from modules.utils import clip, get, get_attr, set_state
     from modules.const import EV as EVConst
     from modules.energy_core import _get_ev_smart_charge_limit, ChargeAction
+    from modules.setpoint_control import (
+        FeedinCandidate,
+        calculate_pv_overflow_energy,
+        choose_stable_candidate,
+        feedin_constraint_exceeded,
+        limit_target_step,
+    )
 
     # These are provided pyscript and defined for type inference only. They do not need to
     # (or rather must not) be imported in the actual script. They are only needed for type
@@ -67,6 +74,13 @@ else:
         _get_charge_action,
         ChargeAction,
     )  # noqa: F401
+    from setpoint_control import (
+        FeedinCandidate,
+        calculate_pv_overflow_energy,
+        choose_stable_candidate,
+        feedin_constraint_exceeded,
+        limit_target_step,
+    )
     from electricity_price import is_low_price, get_price
 
 
@@ -1803,7 +1817,10 @@ def auto_setpoint_target():
 
         current_setpoint = get(Grid.power_setpoint, -20)
     else:
-        current_setpoint = get(Grid.power_setpoint_target, -20)
+        # Keep this optimizer in its own (unmapped) control domain. Feeding the
+        # price-mapped target back into the search bound created a second,
+        # unintended feedback loop after every large target change.
+        current_setpoint = get(Grid.power_setpoint_basis, -20)
 
     max_setpoint = min(current_setpoint + 500, get(Grid.max_setpoint, -20))
     min_setpoint = min(max_setpoint, -max_feedin_limit)
@@ -1919,6 +1936,17 @@ def auto_setpoint_target():
 
         return best_weighted_peak, best_peak_time, best_raw_peak
 
+    def get_feedin_candidate(forecast_result, control_value, samples=None):
+        discounted_peak, _peak_time, _raw_peak = get_discounted_pv_feedin_peak(forecast_result)
+        if samples is None:
+            samples = [(entry.period_start, entry.pv_feedin) for entry in forecast_result.detail]
+        overflow_energy = calculate_pv_overflow_energy(samples, max_pv_feedin, t_now)
+        return FeedinCandidate(
+            control_value=control_value,
+            predicted_peak_w=discounted_peak,
+            overflow_energy_kwh=overflow_energy,
+        )
+
     # Binary search for optimal setpoint
     current_battery_energy = battery_energy
     epex_prices = get_attr(ElectricityPrices.epex_forecast_prices, "data", [])
@@ -2006,26 +2034,44 @@ def auto_setpoint_target():
         if not update_setpoint:
             assert current_setpoint is not None
 
+        candidate_metrics = []
+
+        def evaluate_candidate(candidate_setpoint, candidate_spread):
+            result = forecast_setpoint_local(
+                pv_forecast,
+                candidate_setpoint,
+                candidate_spread,
+                battery_energy,
+                with_ev_charging=with_ev_charging,
+                ev_energy=ev_energy,
+                max_battery_power_target=max_battery_power_target,
+            )
+            control_value = candidate_setpoint if update_setpoint else candidate_spread
+            candidate = get_feedin_candidate(result, control_value)
+            search_results.append(result)
+            candidate_metrics.append(candidate)
+            return result, candidate
+
+        # Always evaluate the least aggressive boundary. The previous search
+        # never sampled it, so an insensitive forecast could only terminate at
+        # the opposite, full-export boundary.
+        baseline_setpoint = max_setpoint if update_setpoint else current_setpoint
+        baseline_spread = current_spread if update_setpoint else min_spread
+        evaluate_candidate(baseline_setpoint, baseline_spread)
+
         for itr in range(max_iters):
             if update_setpoint:
                 current_setpoint = (min_setpoint + max_setpoint) // 2
             if update_spread:
                 current_spread = (min_spread + max_spread) / 2
 
-            r = forecast_setpoint_local(
-                pv_forecast,
-                current_setpoint,
-                current_spread,
-                battery_energy,
-                with_ev_charging=with_ev_charging,
-                ev_energy=ev_energy,
-                max_battery_power_target=max_battery_power_target,
-            )
+            r, feedin_candidate = evaluate_candidate(current_setpoint, current_spread)
             update_reason = ""
             discounted_pv_feedin, discounted_peak_time, raw_pv_feedin = get_discounted_pv_feedin_peak(r)
+            constraint_exceeded = feedin_constraint_exceeded(feedin_candidate, max_pv_feedin)
 
             if (
-                discounted_pv_feedin > max_pv_feedin
+                constraint_exceeded
                 and discounted_peak_time.day != t_now.day
                 and (
                     r.min_bat < battery_min_energy
@@ -2043,7 +2089,7 @@ def auto_setpoint_target():
                 if update_spread:
                     max_spread = current_spread
 
-            elif discounted_pv_feedin > max_pv_feedin:
+            elif constraint_exceeded:
                 update_reason = "max feedin too large"
                 # If feed-in limit is exceeded, we need a more negative setpoint, higher spread
                 if update_setpoint:
@@ -2058,19 +2104,33 @@ def auto_setpoint_target():
                 if update_spread:
                     max_spread = current_spread
 
-            search_results.append(r)
-
             if logging:
                 msg += (
                     f"Iteration {itr + 1}: reason  {update_reason} setpoint {r.setpoint:0f} spread {r.setpoint_spread:.1f} "
                     f"min_setpoint={min_setpoint:.0f} max_setpoint={max_setpoint:.0f} pv feedin {raw_pv_feedin:.0f} "
-                    f"discounted {discounted_pv_feedin:.0f} at {discounted_peak_time.strftime('%d %H:%M')} min_bat {r.min_bat:.1f} max_bat {r.max_bat:.1f} t_max_bat {r.t_max_bat}\n"
+                    f"discounted {discounted_pv_feedin:.0f} overflow {feedin_candidate.overflow_energy_kwh:.3f} kWh "
+                    f"at {discounted_peak_time.strftime('%d %H:%M')} min_bat {r.min_bat:.1f} max_bat {r.max_bat:.1f} t_max_bat {r.t_max_bat}\n"
                 )
 
             if (update_spread and abs(max_spread - min_spread) < 1e-3) or (
                 update_setpoint and abs(max_setpoint - min_setpoint) < 50
             ):
                 break
+
+        selected_candidate = choose_stable_candidate(
+            candidate_metrics,
+            max_pv_feedin,
+            prefer_larger_control=update_setpoint,
+        )
+        selected_index = candidate_metrics.index(selected_candidate)
+        selected_result = search_results[selected_index]
+        if selected_result is not search_results[-1]:
+            log.warning(
+                f"Selected stable control {selected_candidate.control_value:.2f}; "
+                f"peak {selected_candidate.predicted_peak_w:.0f} W, "
+                f"overflow {selected_candidate.overflow_energy_kwh:.3f} kWh"
+            )
+            search_results.append(selected_result)
         if logging:
             log.warning(f"Binary search completed in {itr + 1} iterations: \n" + msg)
         return search_results
@@ -2141,12 +2201,24 @@ def auto_setpoint_target():
         [d.pv_feedin for d in initial_result.detail if d.period_start.day == t_now.day and d.period_start > t_now],
         default=0,
     )
+    today_samples = [
+        (entry.period_start, entry.pv_feedin)
+        for entry in initial_result.detail
+        if entry.period_start.day == t_now.day
+    ]
+    today_candidate = FeedinCandidate(
+        control_value=initial_result.setpoint,
+        predicted_peak_w=max_pv_feedin_today,
+        overflow_energy_kwh=calculate_pv_overflow_energy(today_samples, max_pv_feedin, t_now),
+    )
+    today_constraint_exceeded = feedin_constraint_exceeded(today_candidate, max_pv_feedin)
     discounted_pv_feedin, discounted_peak_time, raw_pv_feedin = get_discounted_pv_feedin_peak(initial_result)
     log.warning(
-        f" \n\ninitial_result.max_pv_feedin {raw_pv_feedin:.0f} W, discounted {discounted_pv_feedin:.0f} W at {discounted_peak_time.strftime('%d %H:%M')} > max_pv_feedin {max_pv_feedin:.0f} W: {discounted_pv_feedin > max_pv_feedin}\n"
-        f" max pv feedin today {max_pv_feedin_today:.0f} W > max_pv_feedin {max_pv_feedin:.0f} W: {max_pv_feedin_today > max_pv_feedin}\n\n"
+        f" \n\ninitial_result.max_pv_feedin {raw_pv_feedin:.0f} W, discounted {discounted_pv_feedin:.0f} W at {discounted_peak_time.strftime('%d %H:%M')}\n"
+        f" max pv feedin today {max_pv_feedin_today:.0f} W, overflow {today_candidate.overflow_energy_kwh:.3f} kWh, "
+        f"constraint active: {today_constraint_exceeded}\n\n"
     )
-    if max_pv_feedin_today > max_pv_feedin:
+    if today_constraint_exceeded:
         t_start = max(t_now, t_now.replace(hour=8))
 
         t_end = next(
@@ -2255,7 +2327,7 @@ def auto_setpoint_target():
     house_power = get(House.loads, 0)
     surplus_energy = get(House.energy_surplus, 0)
 
-    setpoint = map_setpoint(
+    desired_setpoint = map_setpoint(
         setpoint_result.setpoint,
         price,
         setpoint_result.prices_mean,
@@ -2269,10 +2341,14 @@ def auto_setpoint_target():
         max_battery_power_target=setpoint_result.max_battery_power_target,
         surplus_energy=surplus_energy,
     )
+    previous_setpoint_target = get(Grid.power_setpoint_target, desired_setpoint)
+    setpoint = limit_target_step(desired_setpoint, previous_setpoint_target)
 
     if logging:
         log.warning(
-            f"\nMapped setpoint: {setpoint_result.setpoint:.0f} to {setpoint} with spread {setpoint_result.setpoint_spread:.2f} and max batt power {setpoint_result.max_battery_power_target} W\n"
+            f"\nMapped setpoint: {setpoint_result.setpoint:.0f} to desired {desired_setpoint:.0f}, "
+            f"slew-limited to {setpoint:.0f} from {previous_setpoint_target:.0f}, "
+            f"with spread {setpoint_result.setpoint_spread:.2f} and max batt power {setpoint_result.max_battery_power_target} W\n"
             f"price now {price:.2f} mean {setpoint_result.prices_mean:.2f} price std {setpoint_result.prices_std:.2f} "
             f"surplus {surplus_energy:.2f} kWh min_bat {setpoint_result.min_bat:.1f} at {setpoint_result.t_min_bat.strftime('%H:%M')} "
         )
@@ -2291,6 +2367,7 @@ def auto_setpoint_target():
         Grid.power_setpoint_target,
         setpoint,
         **power_w_attributes,
+        desired_setpoint=round(desired_setpoint, 1),
         max_battery_power_target=setpoint_result.max_battery_power_target,
         detail=detail_with_ev_vectorized,
     )
