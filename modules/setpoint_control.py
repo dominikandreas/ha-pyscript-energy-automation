@@ -68,6 +68,34 @@ def feedin_constraint_exceeded(candidate: FeedinCandidate, limit_w: float) -> bo
     )
 
 
+def calculate_energy_bounded_control(
+    overflow_energy_kwh: float,
+    available_energy_kwh: float,
+    hours_to_peak: float,
+    min_control_w: float,
+    max_control_w: float,
+) -> float:
+    """Convert required battery headroom into a bounded average export target.
+
+    This is a fallback for forecast models that report the same PV overflow for
+    every tested control. It exports no more energy than is both useful for the
+    predicted overflow and safely available above the battery floor.
+    """
+
+    if min_control_w > max_control_w:
+        raise ValueError("min_control_w must not exceed max_control_w")
+    if hours_to_peak <= 0:
+        return max_control_w
+
+    useful_overflow_kwh = max(0.0, overflow_energy_kwh - PV_OVERFLOW_ENERGY_TOLERANCE_KWH)
+    usable_energy_kwh = min(useful_overflow_kwh, max(0.0, available_energy_kwh))
+    if usable_energy_kwh <= 0:
+        return max_control_w
+
+    desired_control_w = -(usable_energy_kwh * 1000 / hours_to_peak)
+    return max(min_control_w, min(max_control_w, desired_control_w))
+
+
 def choose_stable_candidate(
     candidates: list[FeedinCandidate],
     limit_w: float,
@@ -85,27 +113,50 @@ def choose_stable_candidate(
     if not candidates:
         raise ValueError("at least one feed-in candidate is required")
 
-    control_key = (lambda candidate: candidate.control_value)
-    baseline = (max if prefer_larger_control else min)(candidates, key=control_key)
+    # Keep this deliberately imperative. Pyscript compiles lambdas and
+    # comprehensions into separate functions and cannot reliably close over
+    # arguments from this function (eg ``prefer_larger_control``).
+    baseline = candidates[0]
+    for candidate in candidates[1:]:
+        if prefer_larger_control and candidate.control_value > baseline.control_value:
+            baseline = candidate
+        elif not prefer_larger_control and candidate.control_value < baseline.control_value:
+            baseline = candidate
     if not feedin_constraint_exceeded(baseline, limit_w):
         return baseline
 
-    best = min(
-        candidates,
-        key=lambda candidate: (
-            candidate.overflow_energy_kwh,
-            candidate.predicted_peak_w,
-            -candidate.control_value if prefer_larger_control else candidate.control_value,
-        ),
-    )
+    best = candidates[0]
+    for candidate in candidates[1:]:
+        candidate_is_better = candidate.overflow_energy_kwh < best.overflow_energy_kwh
+        if candidate.overflow_energy_kwh == best.overflow_energy_kwh:
+            candidate_is_better = candidate.predicted_peak_w < best.predicted_peak_w
+            if candidate.predicted_peak_w == best.predicted_peak_w:
+                candidate_is_better = (
+                    candidate.control_value > best.control_value
+                    if prefer_larger_control
+                    else candidate.control_value < best.control_value
+                )
+        if candidate_is_better:
+            best = candidate
+
     peak_effect_w = baseline.predicted_peak_w - best.predicted_peak_w
     energy_effect_kwh = baseline.overflow_energy_kwh - best.overflow_energy_kwh
     if peak_effect_w < MIN_CONTROL_PEAK_EFFECT_W and energy_effect_kwh < MIN_CONTROL_ENERGY_EFFECT_KWH:
         return baseline
 
-    acceptable = [candidate for candidate in candidates if not feedin_constraint_exceeded(candidate, limit_w)]
-    if acceptable:
-        return (max if prefer_larger_control else min)(acceptable, key=control_key)
+    selected_acceptable = None
+    for candidate in candidates:
+        if feedin_constraint_exceeded(candidate, limit_w):
+            continue
+        if selected_acceptable is None:
+            selected_acceptable = candidate
+        elif prefer_larger_control and candidate.control_value > selected_acceptable.control_value:
+            selected_acceptable = candidate
+        elif not prefer_larger_control and candidate.control_value < selected_acceptable.control_value:
+            selected_acceptable = candidate
+
+    if selected_acceptable is not None:
+        return selected_acceptable
     return best
 
 

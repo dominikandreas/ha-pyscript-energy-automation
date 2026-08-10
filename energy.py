@@ -18,6 +18,7 @@ if TYPE_CHECKING:
     from modules.energy_core import _get_ev_smart_charge_limit, ChargeAction
     from modules.setpoint_control import (
         FeedinCandidate,
+        calculate_energy_bounded_control,
         calculate_pv_overflow_energy,
         choose_stable_candidate,
         feedin_constraint_exceeded,
@@ -76,6 +77,7 @@ else:
     )  # noqa: F401
     from setpoint_control import (
         FeedinCandidate,
+        calculate_energy_bounded_control,
         calculate_pv_overflow_energy,
         choose_stable_candidate,
         feedin_constraint_exceeded,
@@ -2025,6 +2027,8 @@ def auto_setpoint_target():
             return None
         search_results = []
         assert update_setpoint or update_spread
+        control_min_setpoint = min_setpoint
+        control_max_setpoint = max_setpoint
 
         log.warning(
             f"Starting binary search for setpoint with parameters: ev_energy={ev_energy} min_setpoint={min_setpoint}, max_setpoint={max_setpoint}, min_spread={min_spread}, max_spread={max_spread}, update_setpoint={update_setpoint}, update_spread={update_spread}, max_iters={max_iters}, log_setpoint={log_setpoint}"
@@ -2124,6 +2128,39 @@ def auto_setpoint_target():
         )
         selected_index = candidate_metrics.index(selected_candidate)
         selected_result = search_results[selected_index]
+
+        # Some forecast paths do not model the setpoint's effect on PV
+        # overflow. If every candidate is effectively identical, the stable
+        # selector correctly refuses to saturate at maximum export. For a real
+        # remaining violation, derive the least export needed to create useful
+        # battery headroom before the predicted peak instead.
+        baseline_candidate = candidate_metrics[0]
+        if (
+            update_setpoint
+            and selected_index == 0
+            and feedin_constraint_exceeded(baseline_candidate, max_pv_feedin)
+        ):
+            _discounted_peak, peak_time, _raw_peak = get_discounted_pv_feedin_peak(selected_result)
+            hours_to_peak = max(0.0, (peak_time - t_now).total_seconds() / 3600)
+            available_energy_kwh = max(0.0, battery_energy - battery_min_energy)
+            fallback_setpoint = calculate_energy_bounded_control(
+                overflow_energy_kwh=baseline_candidate.overflow_energy_kwh,
+                available_energy_kwh=available_energy_kwh,
+                hours_to_peak=hours_to_peak,
+                min_control_w=control_min_setpoint,
+                max_control_w=control_max_setpoint,
+            )
+            if fallback_setpoint < baseline_candidate.control_value:
+                selected_result, selected_candidate = evaluate_candidate(
+                    fallback_setpoint,
+                    current_spread,
+                )
+                log.warning(
+                    f"Using energy-bounded fallback setpoint {fallback_setpoint:.0f} W for "
+                    f"{available_energy_kwh:.2f} kWh available, "
+                    f"{baseline_candidate.overflow_energy_kwh:.2f} kWh overflow, "
+                    f"{hours_to_peak:.2f} h to peak"
+                )
         if selected_result is not search_results[-1]:
             log.warning(
                 f"Selected stable control {selected_candidate.control_value:.2f}; "

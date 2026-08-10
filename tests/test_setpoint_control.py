@@ -1,8 +1,11 @@
+import ast
+import inspect
 import unittest
 from datetime import datetime, timedelta, timezone
 
 from modules.setpoint_control import (
     FeedinCandidate,
+    calculate_energy_bounded_control,
     calculate_pv_overflow_energy,
     choose_stable_candidate,
     feedin_constraint_exceeded,
@@ -74,6 +77,47 @@ class SetpointControlTests(unittest.TestCase):
         self.assertEqual(limit_target_step(-5260.0, -31.0), -531.0)
         self.assertEqual(limit_target_step(-31.0, -5260.0), -4760.0)
         self.assertEqual(limit_target_step(-200.0, -31.0), -200.0)
+
+    def test_energy_bounded_control_uses_available_energy_until_peak(self):
+        control = calculate_energy_bounded_control(
+            overflow_energy_kwh=16.961,
+            available_energy_kwh=14.16,
+            hours_to_peak=5.67,
+            min_control_w=-5500.0,
+            max_control_w=-100.0,
+        )
+        self.assertAlmostEqual(control, -2497.35, places=2)
+
+    def test_energy_bounded_control_handles_long_overnight_horizon(self):
+        control = calculate_energy_bounded_control(
+            overflow_energy_kwh=15.933,
+            available_energy_kwh=12.0,
+            hours_to_peak=14.3,
+            min_control_w=-5500.0,
+            max_control_w=-100.0,
+        )
+        self.assertAlmostEqual(control, -839.16, places=2)
+
+    def test_energy_bounded_control_keeps_neutral_without_usable_energy(self):
+        self.assertEqual(
+            calculate_energy_bounded_control(0.019, 12.0, 6.0, -5500.0, -100.0),
+            -100.0,
+        )
+        self.assertEqual(
+            calculate_energy_bounded_control(12.0, 0.0, 6.0, -5500.0, -100.0),
+            -100.0,
+        )
+
+    def test_energy_bounded_control_clamps_to_export_limit(self):
+        self.assertEqual(
+            calculate_energy_bounded_control(20.0, 20.0, 1.0, -5500.0, -100.0),
+            -5500.0,
+        )
+
+    def test_candidate_selector_avoids_pyscript_closure_constructs(self):
+        tree = ast.parse(inspect.getsource(choose_stable_candidate))
+        closure_nodes = (ast.Lambda, ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
+        self.assertFalse(any(isinstance(node, closure_nodes) for node in ast.walk(tree)))
 
 
 if __name__ == "__main__":
