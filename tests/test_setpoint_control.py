@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 
 from modules.setpoint_control import (
     FeedinCandidate,
+    apply_hard_feedin_control,
     calculate_energy_bounded_control,
     calculate_pv_overflow_energy,
     choose_stable_candidate,
@@ -112,6 +113,56 @@ class SetpointControlTests(unittest.TestCase):
         self.assertEqual(
             calculate_energy_bounded_control(20.0, 20.0, 1.0, -5500.0, -100.0),
             -5500.0,
+        )
+
+    def test_hard_feedin_control_replays_saturation_regression(self):
+        # 2026-08-10 16:13: PV surplus was 6.43 kW, the battery was full,
+        # and the low-price mapper still requested only -20 W.
+        self.assertEqual(
+            apply_hard_feedin_control(
+                -20.0,
+                -5500.0,
+                constraint_active=True,
+                pv_surplus_w=6431.0,
+                max_pv_feedin_w=2000.0,
+            ),
+            -2000.0,
+        )
+
+    def test_hard_feedin_control_forces_headroom_before_pv_limit_is_active(self):
+        self.assertEqual(
+            apply_hard_feedin_control(
+                -20.0,
+                -2500.0,
+                constraint_active=True,
+                pv_surplus_w=100.0,
+                max_pv_feedin_w=2000.0,
+            ),
+            -2500.0,
+        )
+
+    def test_active_pv_limit_caps_optional_battery_export(self):
+        self.assertEqual(
+            apply_hard_feedin_control(
+                -3000.0,
+                -5500.0,
+                constraint_active=True,
+                pv_surplus_w=5000.0,
+                max_pv_feedin_w=2000.0,
+            ),
+            -2000.0,
+        )
+
+    def test_inactive_hard_feedin_control_preserves_price_mapping(self):
+        self.assertEqual(
+            apply_hard_feedin_control(
+                -20.0,
+                -5500.0,
+                constraint_active=False,
+                pv_surplus_w=6431.0,
+                max_pv_feedin_w=2000.0,
+            ),
+            -20.0,
         )
 
     def test_candidate_selector_avoids_pyscript_closure_constructs(self):

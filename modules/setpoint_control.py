@@ -96,6 +96,29 @@ def calculate_energy_bounded_control(
     return max(min_control_w, min(max_control_w, desired_control_w))
 
 
+def apply_hard_feedin_control(
+    price_mapped_control_w: float,
+    headroom_control_w: float,
+    constraint_active: bool,
+    pv_surplus_w: float,
+    max_pv_feedin_w: float,
+) -> float:
+    """Apply the hard feed-in constraint in its two physical phases.
+
+    Before PV production reaches the allowed feed-in, the energy-bounded
+    control discharges the battery to create forecast headroom. Once PV surplus
+    itself exceeds the limit, the grid target is held at that limit so the
+    battery absorbs the remainder instead of being filled as quickly as a
+    neutral target would allow.
+    """
+
+    if not constraint_active:
+        return price_mapped_control_w
+    if pv_surplus_w > max_pv_feedin_w + PV_FEEDIN_PEAK_TOLERANCE_W:
+        return -max_pv_feedin_w
+    return min(price_mapped_control_w, headroom_control_w)
+
+
 def choose_stable_candidate(
     candidates: list[FeedinCandidate],
     limit_w: float,

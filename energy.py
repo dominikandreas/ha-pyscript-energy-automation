@@ -18,6 +18,7 @@ if TYPE_CHECKING:
     from modules.energy_core import _get_ev_smart_charge_limit, ChargeAction
     from modules.setpoint_control import (
         FeedinCandidate,
+        apply_hard_feedin_control,
         calculate_energy_bounded_control,
         calculate_pv_overflow_energy,
         choose_stable_candidate,
@@ -77,6 +78,7 @@ else:
     )  # noqa: F401
     from setpoint_control import (
         FeedinCandidate,
+        apply_hard_feedin_control,
         calculate_energy_bounded_control,
         calculate_pv_overflow_energy,
         choose_stable_candidate,
@@ -2364,7 +2366,7 @@ def auto_setpoint_target():
     house_power = get(House.loads, 0)
     surplus_energy = get(House.energy_surplus, 0)
 
-    desired_setpoint = map_setpoint(
+    price_mapped_setpoint = map_setpoint(
         setpoint_result.setpoint,
         price,
         setpoint_result.prices_mean,
@@ -2378,6 +2380,35 @@ def auto_setpoint_target():
         max_battery_power_target=setpoint_result.max_battery_power_target,
         surplus_energy=surplus_energy,
     )
+    final_feedin_candidate = get_feedin_candidate(
+        setpoint_result,
+        setpoint_result.setpoint,
+    )
+    hard_feedin_constraint_active = feedin_constraint_exceeded(
+        final_feedin_candidate,
+        max_pv_feedin,
+    )
+    current_pv_surplus = max(0.0, pv_power_total - house_power)
+    desired_setpoint = apply_hard_feedin_control(
+        price_mapped_control_w=price_mapped_setpoint,
+        headroom_control_w=setpoint_result.setpoint,
+        constraint_active=hard_feedin_constraint_active,
+        pv_surplus_w=current_pv_surplus,
+        max_pv_feedin_w=max_pv_feedin,
+    )
+    if hard_feedin_constraint_active and desired_setpoint != price_mapped_setpoint:
+        hard_control_reason = (
+            "active PV limit"
+            if current_pv_surplus > max_pv_feedin + 50
+            else "forecast headroom"
+        )
+        log.warning(
+            f"Hard PV feed-in constraint active ({hard_control_reason}): enforcing {desired_setpoint:.0f} W "
+            f"instead of price-mapped {price_mapped_setpoint:.0f} W; "
+            f"current PV surplus {current_pv_surplus:.0f} W, "
+            f"peak {final_feedin_candidate.predicted_peak_w:.0f} W, "
+            f"overflow {final_feedin_candidate.overflow_energy_kwh:.2f} kWh"
+        )
     previous_setpoint_target = get(Grid.power_setpoint_target, desired_setpoint)
     setpoint = limit_target_step(desired_setpoint, previous_setpoint_target)
 
