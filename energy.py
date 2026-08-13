@@ -27,6 +27,11 @@ if TYPE_CHECKING:
         feedin_constraint_exceeded,
         limit_target_step,
     )
+    from modules.export_scheduler import (
+        ExportSchedulerSlot,
+        adapt_grid_target_to_live_power,
+        build_unified_export_schedule,
+    )
 
     # These are provided pyscript and defined for type inference only. They do not need to
     # (or rather must not) be imported in the actual script. They are only needed for type
@@ -88,6 +93,11 @@ else:
         choose_stable_candidate,
         feedin_constraint_exceeded,
         limit_target_step,
+    )
+    from export_scheduler import (
+        ExportSchedulerSlot,
+        adapt_grid_target_to_live_power,
+        build_unified_export_schedule,
     )
     from electricity_price import is_low_price, get_price
 
@@ -848,10 +858,16 @@ def forecast_surplus():
     minimal_soc = get(Automation.minimal_soc, reserve_soc)
     operational_battery_floor = get_battery_export_floor(battery_capacity, reserve_soc, minimal_soc)
     max_battery_power_target = get_attr(Grid.power_setpoint_target, "max_battery_power_target", 4000)
+    unified_scheduler_active = get_attr(Grid.power_setpoint_target, "unified_scheduler_active", False)
+    grid_target_schedule = (
+        get_attr(Grid.power_setpoint_target, "grid_target_schedule", {})
+        if unified_scheduler_active
+        else None
+    )
     headroom_constraint_active = get_attr(Grid.power_setpoint_target, "headroom_constraint_active", False)
     headroom_schedule = (
         get_attr(Grid.power_setpoint_target, "headroom_schedule", {})
-        if headroom_constraint_active
+        if headroom_constraint_active and not unified_scheduler_active
         else None
     )
 
@@ -895,6 +911,7 @@ def forecast_surplus():
         battery_min_energy=forecast_battery_floor,
         max_battery_power_target=max_battery_power_target,
         headroom_schedule=headroom_schedule,
+        grid_target_schedule=grid_target_schedule,
         # logging=True,
         surplus_energy=current_surplus,
     )
@@ -914,6 +931,7 @@ def forecast_surplus():
         battery_min_energy=forecast_battery_floor,
         max_battery_power_target=max_battery_power_target,
         headroom_schedule=headroom_schedule,
+        grid_target_schedule={} if unified_scheduler_active else None,
         surplus_energy=0,
     )
 
@@ -987,6 +1005,7 @@ def forecast_surplus():
             battery_min_energy=forecast_battery_floor,
             max_battery_power_target=max_battery_power_target,
             headroom_schedule=headroom_schedule,
+            grid_target_schedule=grid_target_schedule,
             # logging=True,
             surplus_energy=surplus,
             ev_energy=ev_energy,
@@ -1196,6 +1215,7 @@ def forecast(
     max_pv_feedin_target: float = 1000,
     max_feedin: float | None = None,
     headroom_schedule: dict[str, float] | None = None,
+    grid_target_schedule: dict[str, float] | None = None,
     max_setpoint=-20,
     logging=False,
     ev_schedule: list[EVScheduleEntry] | None = None,
@@ -1251,6 +1271,7 @@ def forecast(
         max_pv_feedin_target=max_pv_feedin_target,
         configured_max_feedin=max_feedin,
         headroom_schedule=headroom_schedule,
+        grid_target_schedule=grid_target_schedule,
         max_setpoint=max_setpoint,
         logging=logging,
         ev_schedule=ev_schedule,
@@ -1289,6 +1310,7 @@ def _forecast(
     max_pv_feedin_target: float = 1000,
     configured_max_feedin: float = 4000,
     headroom_schedule: dict[str, float] | None = None,
+    grid_target_schedule: dict[str, float] | None = None,
     max_setpoint=-20,
     logging=False,
     ev_schedule: list[EVScheduleEntry] | None = None,
@@ -1498,25 +1520,32 @@ def _forecast(
         else:
             is_charging_ev, charge_phases, charge_current = False, 1, 6
 
-        this_setpoint = map_setpoint(
-            setpoint,
-            epex_price,
-            prices_mean,
-            prices_std,
-            battery_energy=tentative_batt_energy,
-            battery_min_limit=period_battery_min_energy,
-            pv_power=power_production,
-            house_power=house_power,
-            max_feedin=configured_max_feedin,
-            setpoint_spread=setpoint_spread,
-            max_setpoint=max_setpoint,
-            max_battery_power_target=max_battery_power_target,
-            surplus_energy=surplus,
-        )
-        if headroom_schedule is not None:
-            scheduled_headroom_w = headroom_schedule.get(start.isoformat())
-            if scheduled_headroom_w is not None:
-                this_setpoint = min(this_setpoint, scheduled_headroom_w)
+        if grid_target_schedule is not None:
+            # Unified mode publishes the exact trajectory which this simulator
+            # and live control both consume.  A missing key is deliberately
+            # neutral; it must never fall back to the legacy price mapper.
+            this_setpoint = grid_target_schedule.get(start.isoformat(), max_setpoint)
+            this_setpoint = max(-configured_max_feedin, min(max_setpoint, this_setpoint))
+        else:
+            this_setpoint = map_setpoint(
+                setpoint,
+                epex_price,
+                prices_mean,
+                prices_std,
+                battery_energy=tentative_batt_energy,
+                battery_min_limit=period_battery_min_energy,
+                pv_power=power_production,
+                house_power=house_power,
+                max_feedin=configured_max_feedin,
+                setpoint_spread=setpoint_spread,
+                max_setpoint=max_setpoint,
+                max_battery_power_target=max_battery_power_target,
+                surplus_energy=surplus,
+            )
+            if headroom_schedule is not None:
+                scheduled_headroom_w = headroom_schedule.get(start.isoformat())
+                if scheduled_headroom_w is not None:
+                    this_setpoint = min(this_setpoint, scheduled_headroom_w)
 
         # --- Apply EV Charging Physics ---
         if is_charging_ev and ev_charge_power > 1:
@@ -1532,7 +1561,7 @@ def _forecast(
                 smart_charge_limit * EVConst.ev_capacity / 100 - ev_energy + battery_capacity - battery_energy
             )
 
-            this_setpoint = -20
+            this_setpoint = max_setpoint if grid_target_schedule is not None else -20
 
         else:
             free_capacity = battery_capacity - battery_energy
@@ -1829,7 +1858,11 @@ def get_pv_forecast_with_prices(t_start: datetime, t_end: datetime, epex_prices:
 
 
 @time_trigger("period(now, 120sec)")
-@state_trigger(f"{Grid.max_feedin_target} or {Grid.max_pv_feedin_target} or {Automation.auto_setpoint}")
+@state_trigger(
+    f"{Grid.max_feedin_target} or {Grid.max_pv_feedin_target} or {Automation.auto_setpoint} "
+    f"or {Automation.unified_export_scheduler} or {Automation.efficient_export_power} "
+    f"or {Automation.quiet_export_price_tolerance}"
+)
 def auto_setpoint_target():
     task.unique("auto setpoint target", kill_me=True)
     t_now = now()
@@ -1900,6 +1933,8 @@ def auto_setpoint_target():
         max_battery_power_target: float = 4000,
         logging=False,
         ev_schedule=ev_schedule,
+        grid_target_schedule=None,
+        surplus_energy=None,
     ):
         if t_start is not None:
             pv_forecast = [entry for entry in pv_forecast if t_start < entry.period_start]
@@ -1919,9 +1954,12 @@ def auto_setpoint_target():
             max_battery_power_target=max_battery_power_target,
             max_pv_feedin_target=max_pv_feedin,
             max_feedin=max_feedin_limit,
+            grid_target_schedule=grid_target_schedule,
             max_setpoint=max_setpoint,
             logging=logging,
             ev_schedule=ev_schedule,
+            surplus_energy=surplus_energy,
+            t_now=t_now,
         )
         task.sleep(0.01)  # sleep to allow other tasks to run
         return result
@@ -1990,6 +2028,236 @@ def auto_setpoint_target():
         t_start=t_now, t_end=t_now + timedelta(hours=forecast_hours), epex_prices=epex_prices
     )
 
+    unified_scheduler_enabled = bool(get(Automation.unified_export_scheduler, False)) and not automation_disabled
+    if unified_scheduler_enabled:
+        max_grid_export_w = min(5500.0, max_feedin_limit)
+        configured_discharge_limit_w = get(Battery.discharge_limit, -1)
+        max_battery_discharge_w = min(
+            8000.0,
+            configured_discharge_limit_w if configured_discharge_limit_w > 0 else 8000.0,
+        )
+        efficient_discharge_w = get(Automation.efficient_export_power, 3500)
+        quiet_price_tolerance = get(Automation.quiet_export_price_tolerance, 5) / 100
+        min_discharge_price = float(get(Automation.min_discharge_price, default=0))
+
+        # The neutral replay is the sole baseline for planning. It contains the
+        # same EV, house, PV, inverter-mode and battery-floor physics as the
+        # final forecast, but no optional battery-to-grid export.
+        neutral_forecast = forecast_setpoint_local(
+            pv_forecast=epex_pv_forecast,
+            setpoint=max_setpoint,
+            setpoint_spread=0.01,
+            current_battery_energy=current_battery_energy,
+            with_ev_charging=with_ev_charging,
+            ev_energy=ev_energy,
+            max_battery_power_target=max_battery_discharge_w,
+            grid_target_schedule={},
+            surplus_energy=0,
+        )
+        if neutral_forecast is None or not neutral_forecast.detail:
+            log.error("Unified export scheduler has no neutral forecast; keeping the previous target")
+            return
+
+        battery_cells_balanced = get(Battery.cells_balanced, False)
+        scheduler_safety_margin_kwh = 0.5
+        safe_export_energy_kwh = max(
+            0.0,
+            battery_energy - battery_min_energy - scheduler_safety_margin_kwh,
+        )
+        for detail_entry in neutral_forecast.detail:
+            period_floor = battery_min_energy
+            low_pv_reserve_soc = get_low_pv_reserve_soc(
+                house_power=detail_entry.house_power,
+                pv_power=detail_entry.pv_estimate,
+                battery_cells_balanced=bool(battery_cells_balanced),
+            )
+            if low_pv_reserve_soc > 0:
+                period_floor = max(period_floor, battery_capacity * low_pv_reserve_soc / 100 + 1)
+            safe_export_energy_kwh = min(
+                safe_export_energy_kwh,
+                max(
+                    0.0,
+                    detail_entry.battery_energy - period_floor - scheduler_safety_margin_kwh,
+                ),
+            )
+
+        scheduler_slots = []
+        for index, detail_entry in enumerate(neutral_forecast.detail):
+            if index + 1 < len(neutral_forecast.detail):
+                period_end = neutral_forecast.detail[index + 1].period_start
+            elif index > 0:
+                period_end = detail_entry.period_start + (
+                    detail_entry.period_start - neutral_forecast.detail[index - 1].period_start
+                )
+            else:
+                period_end = detail_entry.period_start + timedelta(minutes=15)
+            effective_start = max(t_now, detail_entry.period_start)
+            duration_hours = max(0.0, (period_end - effective_start).total_seconds() / 3600)
+            scheduler_slots.append(
+                ExportSchedulerSlot(
+                    period_start=detail_entry.period_start,
+                    duration_hours=duration_hours,
+                    price_per_kwh=detail_entry.epex_price,
+                    baseline_setpoint_w=detail_entry.setpoint,
+                    baseline_battery_power_w=detail_entry.battery_power,
+                    baseline_grid_export_w=detail_entry.feedin,
+                    ev_charge_power_w=detail_entry.ev_charge_power,
+                    intentional_grid_import_w=detail_entry.power_from_grid,
+                )
+            )
+
+        pv_feedin_samples = []
+        raw_peak_w = 0.0
+        raw_peak_time = None
+        for detail_entry in neutral_forecast.detail:
+            pv_feedin_samples.append((detail_entry.period_start, detail_entry.pv_feedin))
+            if detail_entry.pv_feedin > raw_peak_w:
+                raw_peak_w = detail_entry.pv_feedin
+                raw_peak_time = detail_entry.period_start
+        overflow_energy_kwh = calculate_pv_overflow_energy(
+            pv_feedin_samples,
+            max_pv_feedin,
+            t_now,
+        )
+        headroom_energy_kwh = calculate_headroom_energy_requirement(
+            overflow_energy_kwh,
+            overflow_energy_kwh,
+        )
+
+        schedule_plan = build_unified_export_schedule(
+            slots=scheduler_slots,
+            available_export_energy_kwh=safe_export_energy_kwh,
+            required_headroom_energy_kwh=headroom_energy_kwh,
+            headroom_deadline=raw_peak_time,
+            min_discharge_price=min_discharge_price,
+            max_grid_export_w=max_grid_export_w,
+            max_battery_discharge_w=max_battery_discharge_w,
+            efficient_discharge_w=efficient_discharge_w,
+            quiet_boost_penalty_fraction=quiet_price_tolerance,
+        )
+        grid_target_schedule = dict(schedule_plan.grid_target_schedule)
+
+        current_period_start = None
+        for detail_entry in neutral_forecast.detail:
+            if detail_entry.period_start <= t_now and (
+                current_period_start is None or detail_entry.period_start > current_period_start
+            ):
+                current_period_start = detail_entry.period_start
+        if current_period_start is None:
+            current_period_start = neutral_forecast.detail[0].period_start
+        current_period_key = current_period_start.isoformat()
+
+        # Make switching modes and bucket transitions gentle, while putting the
+        # actually applied ramped value back into the published forecast.
+        desired_current_target = grid_target_schedule.get(current_period_key, max_setpoint)
+        previous_target = get(Grid.power_setpoint_target, max_setpoint)
+        grid_target_schedule[current_period_key] = limit_target_step(
+            desired_current_target,
+            previous_target,
+            max_step_w=1500,
+        )
+
+        physical_surplus_kwh = max(0.0, battery_energy - battery_min_energy)
+        unified_forecast = forecast_setpoint_local(
+            pv_forecast=epex_pv_forecast,
+            setpoint=max_setpoint,
+            setpoint_spread=0.01,
+            current_battery_energy=current_battery_energy,
+            with_ev_charging=with_ev_charging,
+            ev_energy=ev_energy,
+            max_battery_power_target=max_battery_discharge_w,
+            grid_target_schedule=grid_target_schedule,
+            surplus_energy=physical_surplus_kwh,
+        )
+        if unified_forecast is None or not unified_forecast.detail:
+            log.error("Unified export scheduler replay failed; keeping the previous target")
+            return
+
+        baseline_by_start = {}
+        for detail_entry in neutral_forecast.detail:
+            baseline_by_start[detail_entry.period_start.isoformat()] = detail_entry
+        unsafe_import_increase_w = 0.0
+        for detail_entry in unified_forecast.detail:
+            baseline_entry = baseline_by_start.get(detail_entry.period_start.isoformat())
+            if baseline_entry is None or detail_entry.ev_charge_power > 1:
+                continue
+            unsafe_import_increase_w = max(
+                unsafe_import_increase_w,
+                detail_entry.power_from_grid - baseline_entry.power_from_grid,
+            )
+        if unsafe_import_increase_w > 50:
+            log.error(
+                f"Unified schedule would add {unsafe_import_increase_w:.0f} W grid import; "
+                "falling back to the neutral trajectory"
+            )
+            grid_target_schedule = {}
+            unified_forecast = neutral_forecast
+            battery_power_delta_schedule = {}
+            scheduled_export_energy_kwh = 0.0
+            allocated_headroom_energy_kwh = 0.0
+        else:
+            battery_power_delta_schedule = schedule_plan.battery_power_delta_schedule
+            scheduled_export_energy_kwh = schedule_plan.allocated_energy_kwh
+            allocated_headroom_energy_kwh = schedule_plan.headroom_energy_kwh
+
+        current_detail = unified_forecast.detail[0]
+        for detail_entry in unified_forecast.detail:
+            if detail_entry.period_start <= t_now and detail_entry.period_start >= current_detail.period_start:
+                current_detail = detail_entry
+
+        current_target = current_detail.setpoint
+        max_forecast_feedin_w = max([entry.feedin for entry in unified_forecast.detail] or [0])
+        if max_forecast_feedin_w > max_grid_export_w + 50:
+            log.warning(
+                f"Unified schedule forecasts unavoidable feed-in {max_forecast_feedin_w:.0f} W "
+                f"above combined target {max_grid_export_w:.0f} W"
+            )
+        log.warning(
+            f"Unified export schedule: {scheduled_export_energy_kwh:.2f} kWh allocated "
+            f"({allocated_headroom_energy_kwh:.2f}/{headroom_energy_kwh:.2f} kWh PV headroom), "
+            f"safe budget {safe_export_energy_kwh:.2f} kWh, raw PV peak {raw_peak_w:.0f} W at "
+            f"{raw_peak_time}, current target {current_target:.0f} W, "
+            f"planned battery {current_detail.battery_power:.0f} W"
+        )
+
+        detail_vectorized = {
+            key: [getattr(entry, key) for entry in unified_forecast.detail]
+            for key in ForecastEntry.__annotations__.keys()
+        }
+        set_state(Grid.power_setpoint_basis, current_target, **power_w_attributes)
+        set_state(
+            Grid.power_setpoint_target,
+            current_target,
+            **power_w_attributes,
+            desired_setpoint=round(desired_current_target, 1),
+            unified_scheduler_active=True,
+            grid_target_schedule=grid_target_schedule,
+            battery_power_delta_schedule=battery_power_delta_schedule,
+            planned_battery_power_w=round(current_detail.battery_power, 1),
+            planned_house_power_w=round(current_detail.house_power, 1),
+            planned_pv_power_w=round(current_detail.pv_estimate, 1),
+            planned_ev_charge_power_w=round(current_detail.ev_charge_power, 1),
+            max_battery_power_target=max_battery_discharge_w,
+            max_grid_export_w=max_grid_export_w,
+            safe_export_energy_kwh=round(safe_export_energy_kwh, 3),
+            scheduled_export_energy_kwh=round(scheduled_export_energy_kwh, 3),
+            headroom_constraint_active=headroom_energy_kwh > 0,
+            headroom_control_w=current_target,
+            headroom_energy_kwh=round(headroom_energy_kwh, 3),
+            headroom_allocated_kwh=round(allocated_headroom_energy_kwh, 3),
+            headroom_unallocated_kwh=round(
+                max(0.0, headroom_energy_kwh - allocated_headroom_energy_kwh),
+                3,
+            ),
+            headroom_deadline=raw_peak_time.isoformat() if raw_peak_time is not None else None,
+            headroom_schedule={},
+            raw_pv_feedin_peak_w=round(raw_peak_w, 1),
+            quiet_efficient_power_w=round(efficient_discharge_w, 1),
+            quiet_price_tolerance_percent=round(quiet_price_tolerance * 100, 1),
+            detail=detail_vectorized,
+        )
+        return
+
     initial_forecast = forecast_setpoint_local(
         pv_forecast=epex_pv_forecast,
         setpoint=current_setpoint if automation_disabled else max_setpoint,
@@ -2025,6 +2293,8 @@ def auto_setpoint_target():
             fallback_setpoint,
             **power_w_attributes,
             desired_setpoint=fallback_setpoint,
+            unified_scheduler_active=False,
+            grid_target_schedule={},
             headroom_constraint_active=False,
             headroom_control_w=fallback_setpoint,
             headroom_energy_kwh=0.0,
@@ -2505,6 +2775,8 @@ def auto_setpoint_target():
         setpoint,
         **power_w_attributes,
         desired_setpoint=round(desired_setpoint, 1),
+        unified_scheduler_active=False,
+        grid_target_schedule={},
         max_battery_power_target=setpoint_result.max_battery_power_target,
         headroom_constraint_active=hard_feedin_constraint_active,
         headroom_control_w=round(scheduled_headroom_w, 1) if scheduled_headroom_w is not None else None,
@@ -2542,8 +2814,28 @@ def auto_apply_setpoint():
     prev_house_loads = house_loads
     setpoint_target = get(Grid.power_setpoint_target, 0)
     max_setpoint_target = get(Grid.max_feedin_target, 0)
+    unified_scheduler_active = get_attr(Grid.power_setpoint_target, "unified_scheduler_active", False)
 
-    if setpoint_target < (max_setpoint - 30):
+    if unified_scheduler_active:
+        planned_battery_power_w = get_attr(
+            Grid.power_setpoint_target,
+            "planned_battery_power_w",
+            0,
+        )
+        pv_power = get(PVProduction.total_power, 0)
+        setpoint = adapt_grid_target_to_live_power(
+            planned_battery_power_w=planned_battery_power_w,
+            house_load_w=house_loads,
+            pv_power_w=pv_power,
+            max_grid_export_w=min(5500, max_setpoint_target),
+            neutral_grid_target_w=max_setpoint,
+            ev_is_charging=get(EV.is_charging, False),
+        )
+        msg += (
+            f" unified target {setpoint:.0f} W from planned battery {planned_battery_power_w:.0f} W, "
+            f"live loads {house_loads:.0f} W and PV {pv_power:.0f} W"
+        )
+    elif setpoint_target < (max_setpoint - 30):
         current_diff_from_avg = house_power_long_term_average - house_loads
         setpoint = round(max(-max_setpoint_target, min(max_setpoint, setpoint_target - current_diff_from_avg)))
         msg += f" \nupdating setpoint {setpoint_target:.0f} with house_avg {house_power_long_term_average} loads {house_loads} and diff {current_diff_from_avg:.0f} to {setpoint:.0f}"

@@ -272,6 +272,60 @@ class SetpointControlTests(unittest.TestCase):
             self.assertIsInstance(published_headroom, ast.Name)
             self.assertEqual(published_headroom.id, "headroom_schedule")
 
+            published_schedule = next(
+                (keyword.value for keyword in call.keywords if keyword.arg == "grid_target_schedule"),
+                None,
+            )
+            self.assertIsNotNone(published_schedule)
+
+    def test_unified_forecast_uses_the_published_trajectory_without_price_mapping(self):
+        source = Path(__file__).parents[1].joinpath("energy.py").read_text()
+        tree = ast.parse(source)
+        forecast_node = next(
+            node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "_forecast"
+        )
+        direct_lookup = any(
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "grid_target_schedule"
+            and node.func.attr == "get"
+            for node in ast.walk(forecast_node)
+        )
+        self.assertTrue(direct_lookup)
+
+    def test_live_unified_control_adapts_the_same_planned_battery_power(self):
+        source = Path(__file__).parents[1].joinpath("energy.py").read_text()
+        tree = ast.parse(source)
+        apply_node = next(
+            node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "auto_apply_setpoint"
+        )
+        calls = [
+            node
+            for node in ast.walk(apply_node)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "adapt_grid_target_to_live_power"
+        ]
+        self.assertEqual(len(calls), 1)
+
+    def test_legacy_controller_remains_a_separate_flagged_branch(self):
+        source = Path(__file__).parents[1].joinpath("energy.py").read_text()
+        tree = ast.parse(source)
+        target_node = next(
+            node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "auto_setpoint_target"
+        )
+        feature_flag_reads = [
+            node
+            for node in ast.walk(target_node)
+            if isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "Automation"
+            and node.attr == "unified_export_scheduler"
+        ]
+        self.assertTrue(feature_flag_reads)
+        self.assertTrue(any(isinstance(node, ast.Return) for node in ast.walk(target_node)))
+
     def test_forecast_applies_headroom_control_after_price_mapping(self):
         source = Path(__file__).parents[1].joinpath("energy.py").read_text()
         tree = ast.parse(source)

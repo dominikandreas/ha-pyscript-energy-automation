@@ -247,6 +247,12 @@ class Automation:
     """Switch to enable/disable automatic charge limit calculation"""
     efficient_discharge = "input_boolean.efficient_discharge"
     """Switch to enable/disable efficient discharge mode"""
+    unified_export_scheduler = "input_boolean.unified_export_scheduler"
+    """Switch between the legacy controller and the unified export scheduler"""
+    efficient_export_power = "input_number.efficient_export_power"
+    """Preferred quiet-hour battery discharge power"""
+    quiet_export_price_tolerance = "input_number.quiet_export_price_tolerance"
+    """Allowed price discount before quiet-hour high-power export is preferred"""
 
 
 class OctopusEnergy:
