@@ -72,6 +72,14 @@ class UnifiedExportSchedulerTests(unittest.TestCase):
         self.assertEqual(plan.grid_target_schedule[lower.period_start.isoformat()], -3600.0)
         self.assertEqual(plan.grid_target_schedule[higher.period_start.isoformat()], -3600.0)
 
+    def test_quiet_efficiency_window_includes_the_full_23_hour(self):
+        lower = self.slot(0, 0.32663, hour=23)
+        higher = self.slot(1, 0.33885, hour=23)
+        plan = self.plan([lower, higher], energy=1.75, tolerance=0.05)
+
+        self.assertEqual(plan.grid_target_schedule[lower.period_start.isoformat()], -3600.0)
+        self.assertEqual(plan.grid_target_schedule[higher.period_start.isoformat()], -3600.0)
+
     def test_zero_quiet_tolerance_uses_maximum_power_at_the_highest_price(self):
         lower = self.slot(0, 0.32663)
         higher = self.slot(1, 0.33885)

@@ -81,7 +81,7 @@ def build_unified_export_schedule(
     efficient_discharge_w: float,
     quiet_boost_penalty_fraction: float,
     quiet_start_hour: int = 17,
-    quiet_end_hour: int = 23,
+    quiet_end_hour: int = 24,
 ) -> ExportSchedulePlan:
     """Build one price-ranked schedule used by forecast and live control.
 
