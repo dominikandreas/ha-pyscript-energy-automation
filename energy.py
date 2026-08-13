@@ -864,6 +864,11 @@ def forecast_surplus():
         if unified_scheduler_active
         else None
     )
+    unified_export_budget_kwh = (
+        get_attr(Grid.power_setpoint_target, "safe_export_energy_kwh", 0)
+        if unified_scheduler_active
+        else None
+    )
     headroom_constraint_active = get_attr(Grid.power_setpoint_target, "headroom_constraint_active", False)
     headroom_schedule = (
         get_attr(Grid.power_setpoint_target, "headroom_schedule", {})
@@ -912,6 +917,7 @@ def forecast_surplus():
         max_battery_power_target=max_battery_power_target,
         headroom_schedule=headroom_schedule,
         grid_target_schedule=grid_target_schedule,
+        battery_export_budget_kwh=unified_export_budget_kwh,
         # logging=True,
         surplus_energy=current_surplus,
     )
@@ -932,6 +938,7 @@ def forecast_surplus():
         max_battery_power_target=max_battery_power_target,
         headroom_schedule=headroom_schedule,
         grid_target_schedule={} if unified_scheduler_active else None,
+        battery_export_budget_kwh=0 if unified_scheduler_active else None,
         surplus_energy=0,
     )
 
@@ -1006,6 +1013,7 @@ def forecast_surplus():
             max_battery_power_target=max_battery_power_target,
             headroom_schedule=headroom_schedule,
             grid_target_schedule=grid_target_schedule,
+            battery_export_budget_kwh=unified_export_budget_kwh,
             # logging=True,
             surplus_energy=surplus,
             ev_energy=ev_energy,
@@ -1220,6 +1228,7 @@ def forecast(
     logging=False,
     ev_schedule: list[EVScheduleEntry] | None = None,
     surplus_energy: float | None = None,
+    battery_export_budget_kwh: float | None = None,
     daily_power: float | None = None,
     nightly_power: float | None = None,
     ev_required_soc: float | None = None,
@@ -1276,6 +1285,7 @@ def forecast(
         logging=logging,
         ev_schedule=ev_schedule,
         surplus_energy=surplus_energy,
+        battery_export_budget_kwh=battery_export_budget_kwh,
         daily_power=daily_power,
         nightly_power=nightly_power,
         ev_required_soc=ev_required_soc,
@@ -1315,6 +1325,7 @@ def _forecast(
     logging=False,
     ev_schedule: list[EVScheduleEntry] | None = None,
     surplus_energy: float | None = None,
+    battery_export_budget_kwh: float | None = None,
     daily_power: float | None = None,
     nightly_power: float | None = None,
     ev_required_soc: float | None = None,
@@ -1356,6 +1367,7 @@ def _forecast(
         surplus_energy = max(0, battery_energy - required_energy)
 
     surplus = surplus_energy
+    battery_export_budget_remaining_kwh = battery_export_budget_kwh
     orig_setpoint = setpoint
 
     smart_charge_limit = 80
@@ -1636,9 +1648,16 @@ def _forecast(
                 # physical headroom exists. Additional battery-to-grid export is
                 # only allowed from the reserve-aware surplus budget.
                 self_consumption_discharge_watts = max(0, natural_deficit_watts)
-                surplus_export_discharge_watts = (
-                    max(0, surplus) * 1000 / period_hours if period_hours > 0 else 0
-                )
+                if battery_export_budget_remaining_kwh is None:
+                    surplus_export_discharge_watts = (
+                        max(0, surplus) * 1000 / period_hours if period_hours > 0 else 0
+                    )
+                else:
+                    surplus_export_discharge_watts = (
+                        max(0, battery_export_budget_remaining_kwh) * 1000 / period_hours
+                        if period_hours > 0
+                        else 0
+                    )
                 max_allowed_discharge_watts = self_consumption_discharge_watts + surplus_export_discharge_watts
 
                 # Check Mode/SOC constraints
@@ -1658,6 +1677,17 @@ def _forecast(
                         max_discharge_rate,
                         max_discharge_by_energy,
                         max_allowed_discharge_watts,
+                    )
+
+                if battery_export_budget_remaining_kwh is not None:
+                    battery_to_grid_watts = max(
+                        0.0,
+                        actual_discharge_watts - self_consumption_discharge_watts,
+                    )
+                    battery_export_budget_remaining_kwh = max(
+                        0.0,
+                        battery_export_budget_remaining_kwh
+                        - battery_to_grid_watts * period_hours / 1000,
                     )
 
                 battery_power = -actual_discharge_watts  # Negative = Discharging (Energy leaving battery)
@@ -1935,6 +1965,7 @@ def auto_setpoint_target():
         ev_schedule=ev_schedule,
         grid_target_schedule=None,
         surplus_energy=None,
+        battery_export_budget_kwh=None,
     ):
         if t_start is not None:
             pv_forecast = [entry for entry in pv_forecast if t_start < entry.period_start]
@@ -1959,6 +1990,7 @@ def auto_setpoint_target():
             logging=logging,
             ev_schedule=ev_schedule,
             surplus_energy=surplus_energy,
+            battery_export_budget_kwh=battery_export_budget_kwh,
             t_now=t_now,
         )
         task.sleep(0.01)  # sleep to allow other tasks to run
@@ -2039,6 +2071,7 @@ def auto_setpoint_target():
         efficient_discharge_w = get(Automation.efficient_export_power, 3500)
         quiet_price_tolerance = get(Automation.quiet_export_price_tolerance, 5) / 100
         min_discharge_price = float(get(Automation.min_discharge_price, default=0))
+        policy_surplus_energy_kwh = get(House.energy_surplus, 0)
 
         # The neutral replay is the sole baseline for planning. It contains the
         # same EV, house, PV, inverter-mode and battery-floor physics as the
@@ -2052,7 +2085,8 @@ def auto_setpoint_target():
             ev_energy=ev_energy,
             max_battery_power_target=max_battery_discharge_w,
             grid_target_schedule={},
-            surplus_energy=0,
+            surplus_energy=policy_surplus_energy_kwh,
+            battery_export_budget_kwh=0,
         )
         if neutral_forecast is None or not neutral_forecast.detail:
             log.error("Unified export scheduler has no neutral forecast; keeping the previous target")
@@ -2098,7 +2132,10 @@ def auto_setpoint_target():
                     period_start=detail_entry.period_start,
                     duration_hours=duration_hours,
                     price_per_kwh=detail_entry.epex_price,
-                    baseline_setpoint_w=detail_entry.setpoint,
+                    baseline_setpoint_w=min(
+                        0.0,
+                        detail_entry.power_from_grid - detail_entry.feedin,
+                    ),
                     baseline_battery_power_w=detail_entry.battery_power,
                     baseline_grid_export_w=detail_entry.feedin,
                     ev_charge_power_w=detail_entry.ev_charge_power,
@@ -2157,7 +2194,6 @@ def auto_setpoint_target():
             max_step_w=1500,
         )
 
-        physical_surplus_kwh = max(0.0, battery_energy - battery_min_energy)
         unified_forecast = forecast_setpoint_local(
             pv_forecast=epex_pv_forecast,
             setpoint=max_setpoint,
@@ -2167,7 +2203,8 @@ def auto_setpoint_target():
             ev_energy=ev_energy,
             max_battery_power_target=max_battery_discharge_w,
             grid_target_schedule=grid_target_schedule,
-            surplus_energy=physical_surplus_kwh,
+            surplus_energy=policy_surplus_energy_kwh,
+            battery_export_budget_kwh=safe_export_energy_kwh,
         )
         if unified_forecast is None or not unified_forecast.detail:
             log.error("Unified export scheduler replay failed; keeping the previous target")
