@@ -278,6 +278,22 @@ class SetpointControlTests(unittest.TestCase):
             )
             self.assertIsNotNone(published_schedule)
 
+            published_neutral_target = next(
+                (keyword.value for keyword in call.keywords if keyword.arg == "max_setpoint"),
+                None,
+            )
+            self.assertIsInstance(published_neutral_target, ast.Name)
+            self.assertEqual(published_neutral_target.id, "forecast_max_setpoint")
+
+        decorators = forecast_surplus_node.decorator_list
+        target_triggered = any(
+            isinstance(decorator, ast.Call)
+            and isinstance(decorator.func, ast.Name)
+            and decorator.func.id == "state_trigger"
+            for decorator in decorators
+        )
+        self.assertTrue(target_triggered)
+
     def test_unified_forecast_uses_the_published_trajectory_without_price_mapping(self):
         source = Path(__file__).parents[1].joinpath("energy.py").read_text()
         tree = ast.parse(source)
@@ -325,6 +341,23 @@ class SetpointControlTests(unittest.TestCase):
         ]
         self.assertTrue(feature_flag_reads)
         self.assertTrue(any(isinstance(node, ast.Return) for node in ast.walk(target_node)))
+
+    def test_unified_neutral_target_does_not_feed_back_the_previous_basis(self):
+        source = Path(__file__).parents[1].joinpath("energy.py").read_text()
+        tree = ast.parse(source)
+        target_node = next(
+            node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "auto_setpoint_target"
+        )
+        configured_assignment = next(
+            node
+            for node in target_node.body
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == "max_setpoint"
+                for target in node.targets
+            )
+        )
+        self.assertIsInstance(configured_assignment.value, ast.IfExp)
 
     def test_forecast_applies_headroom_control_after_price_mapping(self):
         source = Path(__file__).parents[1].joinpath("energy.py").read_text()

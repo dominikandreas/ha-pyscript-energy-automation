@@ -843,6 +843,7 @@ def get_ev_schedule():
 
 @time_trigger
 @time_trigger("cron(*/2 * * * *)")
+@state_trigger(Grid.power_setpoint_target)
 def forecast_surplus():
     task.unique("forecast_surplus", kill_me=True)
     epex_prices = get_attr(ElectricityPrices.epex_forecast_prices, "data", [])
@@ -859,6 +860,7 @@ def forecast_surplus():
     operational_battery_floor = get_battery_export_floor(battery_capacity, reserve_soc, minimal_soc)
     max_battery_power_target = get_attr(Grid.power_setpoint_target, "max_battery_power_target", 4000)
     unified_scheduler_active = get_attr(Grid.power_setpoint_target, "unified_scheduler_active", False)
+    forecast_max_setpoint = get(Grid.max_setpoint, -20) if unified_scheduler_active else -20
     grid_target_schedule = (
         get_attr(Grid.power_setpoint_target, "grid_target_schedule", {})
         if unified_scheduler_active
@@ -918,6 +920,7 @@ def forecast_surplus():
         headroom_schedule=headroom_schedule,
         grid_target_schedule=grid_target_schedule,
         battery_export_budget_kwh=unified_export_budget_kwh,
+        max_setpoint=forecast_max_setpoint,
         # logging=True,
         surplus_energy=current_surplus,
     )
@@ -939,6 +942,7 @@ def forecast_surplus():
         headroom_schedule=headroom_schedule,
         grid_target_schedule={} if unified_scheduler_active else None,
         battery_export_budget_kwh=0 if unified_scheduler_active else None,
+        max_setpoint=forecast_max_setpoint,
         surplus_energy=0,
     )
 
@@ -1014,6 +1018,7 @@ def forecast_surplus():
             headroom_schedule=headroom_schedule,
             grid_target_schedule=grid_target_schedule,
             battery_export_budget_kwh=unified_export_budget_kwh,
+            max_setpoint=forecast_max_setpoint,
             # logging=True,
             surplus_energy=surplus,
             ev_energy=ev_energy,
@@ -1904,6 +1909,7 @@ def auto_setpoint_target():
     max_pv_feedin = get(Grid.max_pv_feedin_target, 4000)
 
     skip_automation_message = ""
+    unified_scheduler_requested = bool(get(Automation.unified_export_scheduler, False))
     if automation_disabled := get(Automation.auto_setpoint, False) is False:
         skip_automation_message = "Auto setpoint is disabled"
 
@@ -1914,7 +1920,12 @@ def auto_setpoint_target():
         # unintended feedback loop after every large target change.
         current_setpoint = get(Grid.power_setpoint_basis, -20)
 
-    max_setpoint = min(current_setpoint + 500, get(Grid.max_setpoint, -20))
+    configured_max_setpoint = get(Grid.max_setpoint, -20)
+    max_setpoint = (
+        configured_max_setpoint
+        if unified_scheduler_requested and not automation_disabled
+        else min(current_setpoint + 500, configured_max_setpoint)
+    )
     min_setpoint = min(max_setpoint, -max_feedin_limit)
     reserve_soc = get_reserve_soc()
 
@@ -2060,7 +2071,7 @@ def auto_setpoint_target():
         t_start=t_now, t_end=t_now + timedelta(hours=forecast_hours), epex_prices=epex_prices
     )
 
-    unified_scheduler_enabled = bool(get(Automation.unified_export_scheduler, False)) and not automation_disabled
+    unified_scheduler_enabled = unified_scheduler_requested and not automation_disabled
     if unified_scheduler_enabled:
         max_grid_export_w = min(5500.0, max_feedin_limit)
         configured_discharge_limit_w = get(Battery.discharge_limit, -1)
@@ -2173,6 +2184,8 @@ def auto_setpoint_target():
             quiet_boost_penalty_fraction=quiet_price_tolerance,
         )
         grid_target_schedule = dict(schedule_plan.grid_target_schedule)
+        for schedule_key, schedule_target in grid_target_schedule.items():
+            grid_target_schedule[schedule_key] = min(max_setpoint, schedule_target)
 
         current_period_start = None
         for detail_entry in neutral_forecast.detail:
