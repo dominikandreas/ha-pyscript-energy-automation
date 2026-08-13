@@ -87,8 +87,10 @@ def calculate_energy_bounded_control(
     if hours_to_peak <= 0:
         return max_control_w
 
-    useful_overflow_kwh = max(0.0, overflow_energy_kwh - PV_OVERFLOW_ENERGY_TOLERANCE_KWH)
-    usable_energy_kwh = min(useful_overflow_kwh, max(0.0, available_energy_kwh))
+    usable_energy_kwh = calculate_headroom_energy_requirement(
+        overflow_energy_kwh,
+        available_energy_kwh,
+    )
     if usable_energy_kwh <= 0:
         return max_control_w
 
@@ -96,26 +98,89 @@ def calculate_energy_bounded_control(
     return max(min_control_w, min(max_control_w, desired_control_w))
 
 
-def apply_hard_feedin_control(
-    price_mapped_control_w: float,
-    headroom_control_w: float,
-    constraint_active: bool,
-    pv_surplus_w: float,
-    max_pv_feedin_w: float,
+def calculate_headroom_energy_requirement(
+    overflow_energy_kwh: float,
+    available_energy_kwh: float,
 ) -> float:
-    """Apply the hard feed-in constraint in its two physical phases.
+    """Return useful, safely exportable energy for forecast headroom."""
 
-    Before PV production reaches the allowed feed-in, the energy-bounded
-    control discharges the battery to create forecast headroom. Once PV surplus
-    itself exceeds the limit, the grid target is held at that limit so the
-    battery absorbs the remainder instead of being filled as quickly as a
-    neutral target would allow.
+    useful_overflow_kwh = max(0.0, overflow_energy_kwh - PV_OVERFLOW_ENERGY_TOLERANCE_KWH)
+    return min(useful_overflow_kwh, max(0.0, available_energy_kwh))
+
+
+def build_price_aware_headroom_schedule(
+    samples: list[tuple[datetime, float, float]],
+    required_energy_kwh: float,
+    deadline: datetime,
+    t_now: datetime,
+    max_export_w: float,
+) -> dict[str, float]:
+    """Allocate required export energy to the highest-priced intervals.
+
+    Each sample contains ``(period_start, price_per_kwh, baseline_control_w)``.
+    Baseline price-mapped export already planned before ``deadline`` counts
+    toward the energy requirement. The returned mapping only contains buckets
+    that need a stronger target, keyed by ISO period start for safe publication
+    as a Home Assistant state attribute.
     """
 
-    if not constraint_active:
+    if required_energy_kwh <= 0 or max_export_w <= 0 or deadline <= t_now:
+        return {}
+
+    points = sorted(samples)
+    if not points:
+        return {}
+
+    baseline_energy_kwh = 0.0
+    ranked_slots = []
+    for index, (period_start, price_per_kwh, baseline_control_w) in enumerate(points):
+        period_end = points[index + 1][0] if index + 1 < len(points) else deadline
+        period_end = min(period_end, deadline)
+        effective_start = max(period_start, t_now)
+        if period_end <= effective_start:
+            continue
+
+        duration_hours = (period_end - effective_start).total_seconds() / 3600
+        baseline_export_w = min(max_export_w, max(0.0, -baseline_control_w))
+        baseline_energy_kwh += baseline_export_w * duration_hours / 1000
+        # Natural tuple ordering gives highest price first and, for a tie,
+        # the earlier bucket. Avoid a lambda: Pyscript closure compilation is
+        # unreliable for imported helpers.
+        ranked_slots.append(
+            (-price_per_kwh, period_start, duration_hours, baseline_export_w)
+        )
+
+    remaining_kwh = max(0.0, required_energy_kwh - baseline_energy_kwh)
+    ranked_slots.sort()
+    schedule = {}
+    for _negative_price, period_start, duration_hours, baseline_export_w in ranked_slots:
+        if remaining_kwh <= 1e-9:
+            break
+        additional_capacity_kwh = max(0.0, max_export_w - baseline_export_w) * duration_hours / 1000
+        additional_energy_kwh = min(remaining_kwh, additional_capacity_kwh)
+        if additional_energy_kwh <= 0:
+            continue
+        scheduled_export_w = baseline_export_w + additional_energy_kwh * 1000 / duration_hours
+        schedule[period_start.isoformat()] = -scheduled_export_w
+        remaining_kwh -= additional_energy_kwh
+
+    return schedule
+
+
+def apply_hard_feedin_control(
+    price_mapped_control_w: float,
+    headroom_control_w: float | None,
+    constraint_active: bool,
+) -> float:
+    """Apply the scheduled headroom target for the current price bucket.
+
+    A missing current-bucket target deliberately leaves the normal price mapper
+    in control. Scheduled buckets may export battery energy before sunrise and
+    PV energy later; the protected battery floor remains enforced downstream.
+    """
+
+    if not constraint_active or headroom_control_w is None:
         return price_mapped_control_w
-    if pv_surplus_w > max_pv_feedin_w + PV_FEEDIN_PEAK_TOLERANCE_W:
-        return -max_pv_feedin_w
     return min(price_mapped_control_w, headroom_control_w)
 
 

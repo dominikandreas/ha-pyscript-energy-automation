@@ -19,7 +19,9 @@ if TYPE_CHECKING:
     from modules.setpoint_control import (
         FeedinCandidate,
         apply_hard_feedin_control,
+        build_price_aware_headroom_schedule,
         calculate_energy_bounded_control,
+        calculate_headroom_energy_requirement,
         calculate_pv_overflow_energy,
         choose_stable_candidate,
         feedin_constraint_exceeded,
@@ -79,7 +81,9 @@ else:
     from setpoint_control import (
         FeedinCandidate,
         apply_hard_feedin_control,
+        build_price_aware_headroom_schedule,
         calculate_energy_bounded_control,
+        calculate_headroom_energy_requirement,
         calculate_pv_overflow_energy,
         choose_stable_candidate,
         feedin_constraint_exceeded,
@@ -571,9 +575,10 @@ def auto_battery_target_soc():
 
     max_soc = 80 if battery_cells_balanced else 100
 
-    reserve_soc = max(reserve_soc_floor, base_reserve_soc - (house_demand - pv_upcoming))
-
-    minimal_soc = min(max_soc, (max(0, req_energy) / battery_capacity * 100) + reserve_soc)
+    # req_energy is expressed in kWh and already contains the forecast deficit.
+    # Convert it to SOC exactly once; adding a kWh delta directly to a percentage
+    # made the protected floor rise when forecast PV exceeded house demand.
+    minimal_soc = min(max_soc, (max(0, req_energy) / battery_capacity * 100) + reserve_soc_floor)
     set_state(Automation.minimal_soc, round(minimal_soc, 2), unit_of_measurement="%")  # different attributes
 
     # Prevent EV charging from pulling protected battery energy. If the EV is
@@ -842,6 +847,13 @@ def forecast_surplus():
     reserve_soc = get_reserve_soc()
     minimal_soc = get(Automation.minimal_soc, reserve_soc)
     operational_battery_floor = get_battery_export_floor(battery_capacity, reserve_soc, minimal_soc)
+    max_battery_power_target = get_attr(Grid.power_setpoint_target, "max_battery_power_target", 4000)
+    headroom_constraint_active = get_attr(Grid.power_setpoint_target, "headroom_constraint_active", False)
+    headroom_schedule = (
+        get_attr(Grid.power_setpoint_target, "headroom_schedule", {})
+        if headroom_constraint_active
+        else None
+    )
 
     # Forecasted house demand must not also be embedded in the forecast floor.
     # The forecast consumes that energy explicitly, so using minimal_soc here
@@ -881,6 +893,8 @@ def forecast_surplus():
         forecast_dampening=1,
         with_ev_charging=False,
         battery_min_energy=forecast_battery_floor,
+        max_battery_power_target=max_battery_power_target,
+        headroom_schedule=headroom_schedule,
         # logging=True,
         surplus_energy=current_surplus,
     )
@@ -898,6 +912,8 @@ def forecast_surplus():
         forecast_dampening=0.8,
         with_ev_charging=False,
         battery_min_energy=forecast_battery_floor,
+        max_battery_power_target=max_battery_power_target,
+        headroom_schedule=headroom_schedule,
         surplus_energy=0,
     )
 
@@ -969,6 +985,8 @@ def forecast_surplus():
             with_ev_charging=True,
             ev_schedule=ev_schedule,
             battery_min_energy=forecast_battery_floor,
+            max_battery_power_target=max_battery_power_target,
+            headroom_schedule=headroom_schedule,
             # logging=True,
             surplus_energy=surplus,
             ev_energy=ev_energy,
@@ -1177,6 +1195,7 @@ def forecast(
     max_battery_power_target: float = 4000,
     max_pv_feedin_target: float = 1000,
     max_feedin: float | None = None,
+    headroom_schedule: dict[str, float] | None = None,
     max_setpoint=-20,
     logging=False,
     ev_schedule: list[EVScheduleEntry] | None = None,
@@ -1230,7 +1249,8 @@ def forecast(
         ev_energy=ev_energy,
         max_battery_power_target=max_battery_power_target,
         max_pv_feedin_target=max_pv_feedin_target,
-        max_feedin=max_feedin,
+        configured_max_feedin=max_feedin,
+        headroom_schedule=headroom_schedule,
         max_setpoint=max_setpoint,
         logging=logging,
         ev_schedule=ev_schedule,
@@ -1267,7 +1287,8 @@ def _forecast(
     ev_energy: float | None = None,
     max_battery_power_target: float = 4000,
     max_pv_feedin_target: float = 1000,
-    max_feedin: float = 4000,
+    configured_max_feedin: float = 4000,
+    headroom_schedule: dict[str, float] | None = None,
     max_setpoint=-20,
     logging=False,
     ev_schedule: list[EVScheduleEntry] | None = None,
@@ -1486,12 +1507,16 @@ def _forecast(
             battery_min_limit=period_battery_min_energy,
             pv_power=power_production,
             house_power=house_power,
-            max_feedin=max_feedin,
+            max_feedin=configured_max_feedin,
             setpoint_spread=setpoint_spread,
             max_setpoint=max_setpoint,
             max_battery_power_target=max_battery_power_target,
             surplus_energy=surplus,
         )
+        if headroom_schedule is not None:
+            scheduled_headroom_w = headroom_schedule.get(start.isoformat())
+            if scheduled_headroom_w is not None:
+                this_setpoint = min(this_setpoint, scheduled_headroom_w)
 
         # --- Apply EV Charging Physics ---
         if is_charging_ev and ev_charge_power > 1:
@@ -1987,9 +2012,10 @@ def auto_setpoint_target():
     if skip_automation_message:
         fallback_setpoint = initial_forecast.setpoint
         if battery_too_low:
+            house_power = get(House.loads, house_avg_power)
             fallback_setpoint = get_pv_only_setpoint(
                 pv_power_total,
-                get(House.loads, house_avg_power),
+                house_power,
                 8000,
             )
         log.warning(f"{skip_automation_message}, setting setpoint to {fallback_setpoint}")
@@ -1998,6 +2024,12 @@ def auto_setpoint_target():
             Grid.power_setpoint_target,
             fallback_setpoint,
             **power_w_attributes,
+            desired_setpoint=fallback_setpoint,
+            headroom_constraint_active=False,
+            headroom_control_w=fallback_setpoint,
+            headroom_energy_kwh=0.0,
+            headroom_deadline=None,
+            headroom_schedule={},
             detail=initial_forecast.detail,
         )
         set_state(
@@ -2135,7 +2167,7 @@ def auto_setpoint_target():
         # overflow. If every candidate is effectively identical, the stable
         # selector correctly refuses to saturate at maximum export. For a real
         # remaining violation, derive the least export needed to create useful
-        # battery headroom before the predicted peak instead.
+        # battery headroom before the predicted peak.
         baseline_candidate = candidate_metrics[0]
         if (
             update_setpoint
@@ -2388,22 +2420,59 @@ def auto_setpoint_target():
         final_feedin_candidate,
         max_pv_feedin,
     )
+    _discounted_peak, headroom_deadline, _raw_peak = get_discounted_pv_feedin_peak(setpoint_result)
+    available_headroom_energy_kwh = max(0.0, battery_energy - battery_min_energy)
+    headroom_energy_kwh = (
+        calculate_headroom_energy_requirement(
+            final_feedin_candidate.overflow_energy_kwh,
+            available_headroom_energy_kwh,
+        )
+        if hard_feedin_constraint_active
+        else 0.0
+    )
+    # The optimized result can start at the next half-hour boundary after a
+    # merge. Recover the actual current EPEX bucket from the original forecast
+    # so the live target and dashboard use the same published schedule key.
+    current_price_period_start = None
+    for entry in epex_pv_forecast:
+        if entry.period_start <= t_now and (
+            current_price_period_start is None or entry.period_start > current_price_period_start
+        ):
+            current_price_period_start = entry.period_start
+    if current_price_period_start is None:
+        current_price_period_start = t_now
+    headroom_samples = [(current_price_period_start, price, price_mapped_setpoint)]
+    for entry in setpoint_result.detail:
+        if t_now < entry.period_start <= headroom_deadline:
+            headroom_samples.append((entry.period_start, entry.epex_price, entry.setpoint))
+    headroom_schedule = build_price_aware_headroom_schedule(
+        samples=headroom_samples,
+        required_energy_kwh=headroom_energy_kwh,
+        deadline=headroom_deadline,
+        t_now=t_now,
+        max_export_w=min(max_feedin_limit, setpoint_result.max_battery_power_target),
+    )
+    scheduled_headroom_w = headroom_schedule.get(current_price_period_start.isoformat())
     current_pv_surplus = max(0.0, pv_power_total - house_power)
     desired_setpoint = apply_hard_feedin_control(
         price_mapped_control_w=price_mapped_setpoint,
-        headroom_control_w=setpoint_result.setpoint,
+        headroom_control_w=scheduled_headroom_w,
         constraint_active=hard_feedin_constraint_active,
-        pv_surplus_w=current_pv_surplus,
-        max_pv_feedin_w=max_pv_feedin,
     )
-    if hard_feedin_constraint_active and desired_setpoint != price_mapped_setpoint:
-        hard_control_reason = (
-            "active PV limit"
-            if current_pv_surplus > max_pv_feedin + 50
-            else "forecast headroom"
+    if hard_feedin_constraint_active:
+        current_schedule_message = (
+            f"{scheduled_headroom_w:.0f} W"
+            if scheduled_headroom_w is not None
+            else "normal price mapping"
         )
         log.warning(
-            f"Hard PV feed-in constraint active ({hard_control_reason}): enforcing {desired_setpoint:.0f} W "
+            f"Price-aware headroom schedule: {headroom_energy_kwh:.2f} kWh by "
+            f"{headroom_deadline.strftime('%H:%M')}, {len(headroom_schedule)} boosted price buckets; "
+            f"current bucket {current_schedule_message}"
+        )
+    if hard_feedin_constraint_active and desired_setpoint != price_mapped_setpoint:
+        log.warning(
+            f"Scheduled forecast headroom control: enforcing {desired_setpoint:.0f} W "
             f"instead of price-mapped {price_mapped_setpoint:.0f} W; "
             f"current PV surplus {current_pv_surplus:.0f} W, "
             f"peak {final_feedin_candidate.predicted_peak_w:.0f} W, "
@@ -2437,6 +2506,11 @@ def auto_setpoint_target():
         **power_w_attributes,
         desired_setpoint=round(desired_setpoint, 1),
         max_battery_power_target=setpoint_result.max_battery_power_target,
+        headroom_constraint_active=hard_feedin_constraint_active,
+        headroom_control_w=round(scheduled_headroom_w, 1) if scheduled_headroom_w is not None else None,
+        headroom_energy_kwh=round(headroom_energy_kwh, 3),
+        headroom_deadline=headroom_deadline.isoformat() if hard_feedin_constraint_active else None,
+        headroom_schedule=headroom_schedule,
         detail=detail_with_ev_vectorized,
     )
 

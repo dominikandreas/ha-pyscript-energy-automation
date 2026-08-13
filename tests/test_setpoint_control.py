@@ -2,11 +2,14 @@ import ast
 import inspect
 import unittest
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from modules.setpoint_control import (
     FeedinCandidate,
     apply_hard_feedin_control,
+    build_price_aware_headroom_schedule,
     calculate_energy_bounded_control,
+    calculate_headroom_energy_requirement,
     calculate_pv_overflow_energy,
     choose_stable_candidate,
     feedin_constraint_exceeded,
@@ -115,18 +118,65 @@ class SetpointControlTests(unittest.TestCase):
             -5500.0,
         )
 
-    def test_hard_feedin_control_replays_saturation_regression(self):
-        # 2026-08-10 16:13: PV surplus was 6.43 kW, the battery was full,
-        # and the low-price mapper still requested only -20 W.
+    def test_headroom_energy_requirement_respects_tolerance_and_available_energy(self):
+        self.assertAlmostEqual(calculate_headroom_energy_requirement(4.25, 10.0), 4.20)
+        self.assertEqual(calculate_headroom_energy_requirement(4.25, 2.0), 2.0)
+        self.assertEqual(calculate_headroom_energy_requirement(0.01, 2.0), 0.0)
+
+    def test_price_aware_schedule_fills_highest_price_buckets_first(self):
+        samples = [
+            (self.t_now, 0.10, -500.0),
+            (self.t_now + timedelta(minutes=30), 0.30, -500.0),
+            (self.t_now + timedelta(minutes=60), 0.20, -500.0),
+        ]
+        schedule = build_price_aware_headroom_schedule(
+            samples=samples,
+            required_energy_kwh=2.0,
+            deadline=self.t_now + timedelta(minutes=90),
+            t_now=self.t_now,
+            max_export_w=2000.0,
+        )
+        self.assertNotIn(self.t_now.isoformat(), schedule)
+        self.assertEqual(schedule[(self.t_now + timedelta(minutes=30)).isoformat()], -2000.0)
+        self.assertEqual(schedule[(self.t_now + timedelta(minutes=60)).isoformat()], -1500.0)
+
+    def test_price_aware_schedule_clips_current_bucket_to_remaining_time(self):
+        samples = [
+            (self.t_now, 0.30, 0.0),
+            (self.t_now + timedelta(minutes=30), 0.20, 0.0),
+        ]
+        schedule = build_price_aware_headroom_schedule(
+            samples=samples,
+            required_energy_kwh=1.0,
+            deadline=self.t_now + timedelta(hours=1),
+            t_now=self.t_now + timedelta(minutes=15),
+            max_export_w=2000.0,
+        )
+        self.assertEqual(schedule[self.t_now.isoformat()], -2000.0)
+        self.assertEqual(schedule[(self.t_now + timedelta(minutes=30)).isoformat()], -1000.0)
+
+    def test_price_aware_schedule_needs_no_override_when_baseline_is_sufficient(self):
+        samples = [
+            (self.t_now, 0.10, -1000.0),
+            (self.t_now + timedelta(minutes=30), 0.20, -1000.0),
+        ]
+        schedule = build_price_aware_headroom_schedule(
+            samples=samples,
+            required_energy_kwh=1.0,
+            deadline=self.t_now + timedelta(hours=1),
+            t_now=self.t_now,
+            max_export_w=2000.0,
+        )
+        self.assertEqual(schedule, {})
+
+    def test_forecast_headroom_is_not_capped_to_pv_limit_during_solar_window(self):
         self.assertEqual(
             apply_hard_feedin_control(
                 -20.0,
                 -5500.0,
                 constraint_active=True,
-                pv_surplus_w=6431.0,
-                max_pv_feedin_w=2000.0,
             ),
-            -2000.0,
+            -5500.0,
         )
 
     def test_hard_feedin_control_forces_headroom_before_pv_limit_is_active(self):
@@ -135,22 +185,18 @@ class SetpointControlTests(unittest.TestCase):
                 -20.0,
                 -2500.0,
                 constraint_active=True,
-                pv_surplus_w=100.0,
-                max_pv_feedin_w=2000.0,
             ),
             -2500.0,
         )
 
-    def test_active_pv_limit_caps_optional_battery_export(self):
+    def test_headroom_control_keeps_more_aggressive_price_export(self):
         self.assertEqual(
             apply_hard_feedin_control(
                 -3000.0,
-                -5500.0,
+                -2500.0,
                 constraint_active=True,
-                pv_surplus_w=5000.0,
-                max_pv_feedin_w=2000.0,
             ),
-            -2000.0,
+            -3000.0,
         )
 
     def test_inactive_hard_feedin_control_preserves_price_mapping(self):
@@ -159,16 +205,89 @@ class SetpointControlTests(unittest.TestCase):
                 -20.0,
                 -5500.0,
                 constraint_active=False,
-                pv_surplus_w=6431.0,
-                max_pv_feedin_w=2000.0,
             ),
             -20.0,
+        )
+
+    def test_active_headroom_control_without_current_schedule_preserves_price_mapping(self):
+        self.assertEqual(
+            apply_hard_feedin_control(
+                -321.0,
+                None,
+                constraint_active=True,
+            ),
+            -321.0,
         )
 
     def test_candidate_selector_avoids_pyscript_closure_constructs(self):
         tree = ast.parse(inspect.getsource(choose_stable_candidate))
         closure_nodes = (ast.Lambda, ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
         self.assertFalse(any(isinstance(node, closure_nodes) for node in ast.walk(tree)))
+
+    def test_forecast_does_not_overwrite_configured_feedin_limit_with_observed_metric(self):
+        # Regression for 2026-08-12 07:25: live export was 5.5 kW while the
+        # forecast showed zero because _forecast reused max_feedin for both the
+        # configured clamp and the running observed maximum.
+        source = Path(__file__).parents[1].joinpath("energy.py").read_text()
+        tree = ast.parse(source)
+        forecast_node = next(
+            node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "_forecast"
+        )
+        argument_names = [argument.arg for argument in forecast_node.args.args]
+        self.assertIn("configured_max_feedin", argument_names)
+
+        configured_limit_is_forwarded = any(
+            isinstance(node, ast.keyword)
+            and node.arg == "max_feedin"
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "configured_max_feedin"
+            for node in ast.walk(forecast_node)
+        )
+        self.assertTrue(configured_limit_is_forwarded)
+
+    def test_dashboard_forecasts_use_the_published_battery_power_limit(self):
+        source = Path(__file__).parents[1].joinpath("energy.py").read_text()
+        tree = ast.parse(source)
+        forecast_surplus_node = next(
+            node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "forecast_surplus"
+        )
+        forecast_calls = [
+            node
+            for node in ast.walk(forecast_surplus_node)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "forecast"
+        ]
+        self.assertEqual(len(forecast_calls), 3)
+        for call in forecast_calls:
+            published_limit = next(
+                (keyword.value for keyword in call.keywords if keyword.arg == "max_battery_power_target"),
+                None,
+            )
+            self.assertIsInstance(published_limit, ast.Name)
+            self.assertEqual(published_limit.id, "max_battery_power_target")
+
+            published_headroom = next(
+                (keyword.value for keyword in call.keywords if keyword.arg == "headroom_schedule"),
+                None,
+            )
+            self.assertIsInstance(published_headroom, ast.Name)
+            self.assertEqual(published_headroom.id, "headroom_schedule")
+
+    def test_forecast_applies_headroom_control_after_price_mapping(self):
+        source = Path(__file__).parents[1].joinpath("energy.py").read_text()
+        tree = ast.parse(source)
+        forecast_node = next(
+            node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "_forecast"
+        )
+        found = any(
+            isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Name) and target.id == "this_setpoint" for target in node.targets)
+            and isinstance(node.value, ast.Call)
+            and isinstance(node.value.func, ast.Name)
+            and node.value.func.id == "min"
+            and any(isinstance(argument, ast.Name) and argument.id == "scheduled_headroom_w" for argument in node.value.args)
+            for node in ast.walk(forecast_node)
+        )
+        self.assertTrue(found)
 
 
 if __name__ == "__main__":
