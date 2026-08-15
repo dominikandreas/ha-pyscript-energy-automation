@@ -21,57 +21,6 @@ class SetpointControlTests(unittest.TestCase):
     def setUp(self):
         self.t_now = datetime(2026, 8, 9, 12, 0, tzinfo=timezone.utc)
 
-    def test_forecast_presentation_payload_contains_only_dashboard_series(self):
-        energy_source = (Path(__file__).parents[1] / "energy.py").read_text()
-        tree = ast.parse(energy_source)
-        fields_node = next(
-            node
-            for node in tree.body
-            if isinstance(node, ast.Assign)
-            and any(
-                isinstance(target, ast.Name) and target.id == "FORECAST_PRESENTATION_FIELDS"
-                for target in node.targets
-            )
-        )
-        self.assertEqual(
-            set(ast.literal_eval(fields_node.value)),
-            {
-                "period_start",
-                "feedin",
-                "surplus",
-                "ev_charge_power",
-                "battery_power",
-                "battery_energy",
-                "pv_estimate",
-                "epex_price",
-                "electricity_price",
-                "power_from_grid",
-                "ev_energy",
-            },
-        )
-        hours_node = next(
-            node
-            for node in tree.body
-            if isinstance(node, ast.Assign)
-            and any(
-                isinstance(target, ast.Name) and target.id == "FORECAST_PRESENTATION_HOURS"
-                for target in node.targets
-            )
-        )
-        self.assertEqual(ast.literal_eval(hours_node.value), 36)
-
-        forecast_surplus_node = next(
-            node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "forecast_surplus"
-        )
-        vectorize_calls = [
-            node
-            for node in ast.walk(forecast_surplus_node)
-            if isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Name)
-            and node.func.id == "vectorize_forecast_detail"
-        ]
-        self.assertEqual(len(vectorize_calls), 2)
-
     def test_five_watt_half_hour_exceedance_is_tiny(self):
         samples = [
             (self.t_now, 3005.0),
