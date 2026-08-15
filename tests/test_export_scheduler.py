@@ -7,6 +7,7 @@ from modules.export_scheduler import (
     adapt_grid_target_to_live_power,
     build_reserve_energy_schedule,
     build_unified_export_schedule,
+    fit_export_schedule_to_energy_budget,
     get_optional_export_grid_target,
 )
 
@@ -92,6 +93,69 @@ class UnifiedExportSchedulerTests(unittest.TestCase):
 
         self.assertEqual(plan.grid_target_schedule[lower.period_start.isoformat()], -3600.0)
         self.assertEqual(plan.grid_target_schedule[higher.period_start.isoformat()], -3600.0)
+
+    def test_quiet_efficiency_window_includes_the_midnight_hour(self):
+        midnight = self.slot(0, 0.17430, hour=0)
+        half_past = self.slot(1, 0.17430, hour=0)
+        plan = self.plan([midnight, half_past], energy=1.75, tolerance=0.15)
+
+        self.assertEqual(plan.grid_target_schedule[midnight.period_start.isoformat()], -3600.0)
+        self.assertEqual(plan.grid_target_schedule[half_past.period_start.isoformat()], -3600.0)
+
+    def test_quiet_efficiency_preference_crosses_the_midnight_boundary(self):
+        quiet = self.slot(0, 0.17398, hour=23)
+        midnight = ExportSchedulerSlot(
+            period_start=quiet.period_start + timedelta(hours=1),
+            duration_hours=0.25,
+            price_per_kwh=0.17430,
+            baseline_setpoint_w=-100.0,
+            baseline_battery_power_w=0.0,
+            baseline_grid_export_w=100.0,
+        )
+        plan = self.plan([quiet, midnight], energy=0.875, tolerance=0.15)
+
+        self.assertEqual(plan.grid_target_schedule[quiet.period_start.isoformat()], -3600.0)
+        self.assertEqual(plan.grid_target_schedule[midnight.period_start.isoformat()], -100.0)
+
+    def test_materially_better_midnight_price_still_wins(self):
+        quiet = self.slot(0, 0.17, hour=23)
+        midnight = ExportSchedulerSlot(
+            period_start=quiet.period_start + timedelta(hours=1),
+            duration_hours=0.25,
+            price_per_kwh=0.21,
+            baseline_setpoint_w=-100.0,
+            baseline_battery_power_w=0.0,
+            baseline_grid_export_w=100.0,
+        )
+        plan = self.plan([quiet, midnight], energy=0.875, tolerance=0.15)
+
+        self.assertEqual(plan.grid_target_schedule[quiet.period_start.isoformat()], -100.0)
+        self.assertEqual(plan.grid_target_schedule[midnight.period_start.isoformat()], -3600.0)
+
+    def test_slew_limited_current_export_displaces_future_energy(self):
+        current = self.slot(0, 0.20)
+        future = self.slot(1, 0.21)
+        schedule = {
+            current.period_start.isoformat(): 2000.0,
+            future.period_start.isoformat(): 4000.0,
+        }
+
+        fitted = fit_export_schedule_to_energy_budget(
+            schedule,
+            [current, future],
+            energy_budget_kwh=1.0,
+            locked_keys={current.period_start.isoformat()},
+        )
+
+        self.assertEqual(fitted[current.period_start.isoformat()], 2000.0)
+        self.assertEqual(fitted[future.period_start.isoformat()], 2000.0)
+        self.assertAlmostEqual(
+            sum(
+                fitted[slot.period_start.isoformat()] * slot.duration_hours / 1000
+                for slot in (current, future)
+            ),
+            1.0,
+        )
 
     def test_zero_quiet_tolerance_uses_maximum_power_at_the_highest_price(self):
         lower = self.slot(0, 0.32663)

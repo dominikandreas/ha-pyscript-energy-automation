@@ -143,6 +143,66 @@ def _allocate_bands(
     return max(0.0, remaining_kwh)
 
 
+def fit_export_schedule_to_energy_budget(
+    schedule: dict[str, float],
+    slots: list[ExportSchedulerSlot],
+    energy_budget_kwh: float,
+    locked_keys: set[str] | None = None,
+) -> dict[str, float]:
+    """Return a non-negative schedule that fits the available energy.
+
+    A slew-limited current request can be larger than the freshly optimized
+    request while the controller ramps down.  Keep that current request when
+    possible and proportionally reduce future allocations so the replay does
+    not spend the same energy twice.  If the locked request alone exceeds the
+    budget, safety wins and the locked request is reduced as well.
+    """
+
+    result = {key: max(0.0, float(value)) for key, value in schedule.items()}
+    duration_by_key = {
+        slot.period_start.isoformat(): max(0.0, slot.duration_hours)
+        for slot in slots
+    }
+    locked_keys = set(locked_keys or ())
+    energy_budget_kwh = max(0.0, energy_budget_kwh)
+
+    scheduled_keys = set(duration_by_key)
+    adjustable_keys = scheduled_keys - locked_keys
+    locked_energy_kwh = 0.0
+    adjustable_energy_kwh = 0.0
+    for key in scheduled_keys:
+        scheduled_energy_kwh = (
+            result.get(key, 0.0) * duration_by_key.get(key, 0.0) / 1000
+        )
+        if key in locked_keys:
+            locked_energy_kwh += scheduled_energy_kwh
+        else:
+            adjustable_energy_kwh += scheduled_energy_kwh
+    total_energy_kwh = locked_energy_kwh + adjustable_energy_kwh
+    if total_energy_kwh <= energy_budget_kwh + 1e-9:
+        return result
+
+    if locked_energy_kwh >= energy_budget_kwh - 1e-9:
+        locked_scale = (
+            energy_budget_kwh / locked_energy_kwh
+            if locked_energy_kwh > 0
+            else 0.0
+        )
+        for key in scheduled_keys:
+            result[key] = result.get(key, 0.0) * locked_scale if key in locked_keys else 0.0
+        return result
+
+    remaining_budget_kwh = energy_budget_kwh - locked_energy_kwh
+    adjustable_scale = (
+        min(1.0, remaining_budget_kwh / adjustable_energy_kwh)
+        if adjustable_energy_kwh > 0
+        else 0.0
+    )
+    for key in adjustable_keys:
+        result[key] = result.get(key, 0.0) * adjustable_scale
+    return result
+
+
 def build_unified_export_schedule(
     slots: list[ExportSchedulerSlot],
     available_export_energy_kwh: float,
@@ -160,11 +220,13 @@ def build_unified_export_schedule(
 ) -> ExportSchedulePlan:
     """Build one price-ranked schedule used by forecast and live control.
 
-    During quiet hours the discharge band above ``efficient_discharge_w`` is
-    ranked at a configurable price discount.  At other times the whole useful
-    inverter range receives the actual price.  Preferred PV headroom is a soft
-    economic objective: energy is shifted only when the scored export price is
-    above the forecast value of the PV that it would make room for.
+    During quiet hours the configured tolerance is split symmetrically around
+    the actual price: the efficient band receives a preference and the louder
+    boost band a penalty.  The first hour after the quiet window keeps the
+    efficient/boost split without the quiet-hour bonus.  This one-hour grace
+    avoids a hard power discontinuity at midnight while a materially better
+    later price can still win.  Preferred PV headroom remains a soft economic
+    objective based on the actual/penalized export value.
 
     EV-charging and intentional grid-import intervals stay at their neutral
     baseline target.  Combined forecast export is capped at
@@ -178,6 +240,10 @@ def build_unified_export_schedule(
     max_battery_discharge_w = max(0.0, max_battery_discharge_w)
     efficient_discharge_w = max(0.0, min(max_battery_discharge_w, efficient_discharge_w))
     quiet_boost_penalty_fraction = max(0.0, min(1.0, quiet_boost_penalty_fraction))
+    quiet_score_scale = max(
+        1e-9,
+        (1.0 - quiet_boost_penalty_fraction) ** 0.5,
+    )
     headroom_reference_price = max(0.0, headroom_reference_price)
     headroom_min_price_spread = max(0.0, headroom_min_price_spread)
     profitable_headroom_price = headroom_reference_price + headroom_min_price_spread
@@ -207,27 +273,44 @@ def build_unified_export_schedule(
             continue
 
         quiet = _is_quiet_hour(slot.period_start, quiet_start_hour, quiet_end_hour)
+        efficiency_grace = (
+            not quiet
+            and quiet_start_hour != quiet_end_hour
+            and slot.period_start.hour == quiet_end_hour % 24
+        )
         efficient_delta_end_w = min(
             max_delta_w,
             max(0.0, efficient_discharge_w + slot.baseline_battery_power_w),
         )
 
         bands = []
-        if not quiet:
-            bands.append((slot.price_per_kwh, 0.0, max_delta_w))
+        if not quiet and not efficiency_grace:
+            bands.append((slot.price_per_kwh, slot.price_per_kwh, 0.0, max_delta_w))
         else:
             if efficient_delta_end_w > 0:
-                bands.append((slot.price_per_kwh, 0.0, efficient_delta_end_w))
+                bands.append(
+                    (
+                        (
+                            slot.price_per_kwh / quiet_score_scale
+                            if quiet
+                            else slot.price_per_kwh
+                        ),
+                        slot.price_per_kwh,
+                        0.0,
+                        efficient_delta_end_w,
+                    )
+                )
             if max_delta_w > efficient_delta_end_w:
                 bands.append(
                     (
+                        slot.price_per_kwh * quiet_score_scale,
                         slot.price_per_kwh * (1.0 - quiet_boost_penalty_fraction),
                         efficient_delta_end_w,
                         max_delta_w,
                     )
                 )
 
-        for score, band_start_w, band_end_w in bands:
+        for score, headroom_value, band_start_w, band_end_w in bands:
             band = (
                 -score,
                 slot.period_start,
@@ -241,7 +324,7 @@ def build_unified_export_schedule(
                 and slot.period_start < headroom_deadline
                 and (
                     not soft_headroom_enabled
-                    or score >= profitable_headroom_price
+                    or headroom_value >= profitable_headroom_price
                 )
             ):
                 headroom_bands.append(band)

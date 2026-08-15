@@ -33,6 +33,7 @@ if TYPE_CHECKING:
         adapt_grid_target_to_live_power,
         build_reserve_energy_schedule,
         build_unified_export_schedule,
+        fit_export_schedule_to_energy_budget,
     )
 
     # These are provided pyscript and defined for type inference only. They do not need to
@@ -102,6 +103,7 @@ else:
         adapt_grid_target_to_live_power,
         build_reserve_energy_schedule,
         build_unified_export_schedule,
+        fit_export_schedule_to_energy_budget,
     )
     from electricity_price import is_low_price, get_price
 
@@ -2369,6 +2371,12 @@ def auto_setpoint_target():
         optional_export_power_schedule[current_period_key] = max(
             0.0,
             max_setpoint - applied_current_target,
+        )
+        optional_export_power_schedule = fit_export_schedule_to_energy_budget(
+            optional_export_power_schedule,
+            scheduler_slots,
+            schedule_plan.allocated_energy_kwh,
+            locked_keys={current_period_key},
         )
 
         scheduled_export_energy_kwh = 0.0
