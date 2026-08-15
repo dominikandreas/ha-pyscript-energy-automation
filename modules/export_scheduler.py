@@ -1,9 +1,9 @@
 """Pure helpers for the unified battery export scheduler.
 
-The scheduler plans a delta from a neutral forecast.  This is important: the
-neutral forecast already contains PV charging, house self-consumption, planned
-EV charging, inverter modes, and battery floors.  The scheduler only decides
-where safely spendable battery energy is most valuable.
+The scheduler plans optional battery export power, never an absolute future
+grid trajectory.  Forecast and live control apply that same relative request
+on top of their current neutral behavior, so changed battery state, PV, house
+load, and EV charging cannot leave stale grid targets behind.
 """
 
 from dataclasses import dataclass
@@ -25,6 +25,17 @@ class ExportSchedulerSlot:
 
 
 @dataclass(frozen=True)
+class ReserveTrajectorySlot:
+    """One interval used to derive the protected battery-energy trajectory."""
+
+    period_start: datetime
+    duration_hours: float
+    house_power_w: float
+    pv_power_w: float
+    reserve_soc: float
+
+
+@dataclass(frozen=True)
 class ExportSchedulePlan:
     """Serializable result of one scheduler run."""
 
@@ -34,6 +45,68 @@ class ExportSchedulePlan:
     headroom_energy_kwh: float
     economic_energy_kwh: float
     unallocated_headroom_kwh: float
+
+
+def build_reserve_energy_schedule(
+    slots: list[ReserveTrajectorySlot],
+    battery_capacity_kwh: float,
+    uncertainty_margin_kwh: float = 1.0,
+) -> dict[str, float]:
+    """Return the protected energy for every future interval.
+
+    Each deficit interval reserves enough energy to reach the next interval
+    where forecast PV meets house demand.  Once PV covers demand, only the
+    installation reserve and uncertainty margin remain.  Walking backwards
+    makes the result deterministic and linear in the forecast length.
+    """
+
+    battery_capacity_kwh = max(0.0, battery_capacity_kwh)
+    uncertainty_margin_kwh = max(0.0, uncertainty_margin_kwh)
+    deficit_until_solar_kwh = 0.0
+    schedule = {}
+
+    for slot in reversed(slots):
+        duration_hours = max(0.0, slot.duration_hours)
+        if slot.pv_power_w >= slot.house_power_w:
+            deficit_until_solar_kwh = 0.0
+        else:
+            deficit_until_solar_kwh += (
+                max(0.0, slot.house_power_w - slot.pv_power_w)
+                * duration_hours
+                / 1000
+            )
+
+        reserve_energy_kwh = (
+            max(0.0, slot.reserve_soc) / 100 * battery_capacity_kwh
+        )
+        schedule[slot.period_start.isoformat()] = min(
+            battery_capacity_kwh,
+            reserve_energy_kwh
+            + deficit_until_solar_kwh
+            + uncertainty_margin_kwh,
+        )
+
+    return schedule
+
+
+def get_optional_export_grid_target(
+    optional_export_power_w: float,
+    max_grid_export_w: float,
+    neutral_grid_target_w: float,
+    ev_is_charging: bool = False,
+) -> float:
+    """Apply one optional export request to the shared neutral grid target."""
+
+    if ev_is_charging:
+        return neutral_grid_target_w
+
+    optional_export_power_w = max(0.0, optional_export_power_w)
+    max_grid_export_w = max(0.0, max_grid_export_w)
+    requested_target_w = neutral_grid_target_w - optional_export_power_w
+    return max(
+        -max_grid_export_w,
+        min(neutral_grid_target_w, requested_target_w),
+    )
 
 
 def _is_quiet_hour(period_start: datetime, quiet_start_hour: int, quiet_end_hour: int) -> bool:
@@ -82,13 +155,16 @@ def build_unified_export_schedule(
     quiet_boost_penalty_fraction: float,
     quiet_start_hour: int = 17,
     quiet_end_hour: int = 24,
+    headroom_reference_price: float = 0.0,
+    headroom_min_price_spread: float = 0.0,
 ) -> ExportSchedulePlan:
     """Build one price-ranked schedule used by forecast and live control.
 
     During quiet hours the discharge band above ``efficient_discharge_w`` is
     ranked at a configurable price discount.  At other times the whole useful
-    inverter range receives the actual price.  Mandatory PV headroom is
-    allocated first, before its raw (undiscounted) forecast peak.
+    inverter range receives the actual price.  Preferred PV headroom is a soft
+    economic objective: energy is shifted only when the scored export price is
+    above the forecast value of the PV that it would make room for.
 
     EV-charging and intentional grid-import intervals stay at their neutral
     baseline target.  Combined forecast export is capped at
@@ -102,10 +178,14 @@ def build_unified_export_schedule(
     max_battery_discharge_w = max(0.0, max_battery_discharge_w)
     efficient_discharge_w = max(0.0, min(max_battery_discharge_w, efficient_discharge_w))
     quiet_boost_penalty_fraction = max(0.0, min(1.0, quiet_boost_penalty_fraction))
+    headroom_reference_price = max(0.0, headroom_reference_price)
+    headroom_min_price_spread = max(0.0, headroom_min_price_spread)
+    profitable_headroom_price = headroom_reference_price + headroom_min_price_spread
+    soft_headroom_enabled = headroom_reference_price > 0 or headroom_min_price_spread > 0
 
     grid_target_schedule = {}
     battery_power_delta_schedule = {}
-    mandatory_bands = []
+    headroom_bands = []
     economic_bands = []
 
     for slot in slots:
@@ -156,17 +236,24 @@ def build_unified_export_schedule(
                 band_start_w,
                 band_end_w,
             )
-            if headroom_deadline is not None and slot.period_start < headroom_deadline:
-                mandatory_bands.append(band)
+            if (
+                headroom_deadline is not None
+                and slot.period_start < headroom_deadline
+                and (
+                    not soft_headroom_enabled
+                    or score >= profitable_headroom_price
+                )
+            ):
+                headroom_bands.append(band)
             if slot.price_per_kwh >= min_discharge_price:
                 economic_bands.append(band)
 
-    mandatory_bands.sort()
+    headroom_bands.sort()
     economic_bands.sort()
     allocated_w_by_key = {}
 
     remaining_headroom_kwh = _allocate_bands(
-        mandatory_bands,
+        headroom_bands,
         required_headroom_kwh,
         allocated_w_by_key,
     )

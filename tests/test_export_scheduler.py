@@ -3,8 +3,11 @@ from datetime import datetime, timedelta, timezone
 
 from modules.export_scheduler import (
     ExportSchedulerSlot,
+    ReserveTrajectorySlot,
     adapt_grid_target_to_live_power,
+    build_reserve_energy_schedule,
     build_unified_export_schedule,
+    get_optional_export_grid_target,
 )
 
 
@@ -37,7 +40,15 @@ class UnifiedExportSchedulerTests(unittest.TestCase):
             intentional_grid_import_w=grid_import,
         )
 
-    def plan(self, slots, energy=2.0, headroom=0.0, deadline=None, tolerance=0.05):
+    def plan(
+        self,
+        slots,
+        energy=2.0,
+        headroom=0.0,
+        deadline=None,
+        tolerance=0.05,
+        headroom_reference_price=0.0,
+    ):
         return build_unified_export_schedule(
             slots=slots,
             available_export_energy_kwh=energy,
@@ -48,6 +59,8 @@ class UnifiedExportSchedulerTests(unittest.TestCase):
             max_battery_discharge_w=8000.0,
             efficient_discharge_w=3500.0,
             quiet_boost_penalty_fraction=tolerance,
+            headroom_reference_price=headroom_reference_price,
+            headroom_min_price_spread=0.01,
         )
 
     def test_evening_incident_replay_uses_the_highest_price_buckets(self):
@@ -139,6 +152,36 @@ class UnifiedExportSchedulerTests(unittest.TestCase):
         self.assertAlmostEqual(plan.headroom_energy_kwh, 0.25)
         self.assertAlmostEqual(plan.unallocated_headroom_kwh, 0.75)
 
+    def test_soft_headroom_skips_an_unprofitable_battery_cycle(self):
+        flat_price = self.slot(0, 0.09)
+        plan = self.plan(
+            [flat_price],
+            energy=0.875,
+            headroom=0.875,
+            deadline=flat_price.period_start + timedelta(minutes=15),
+            headroom_reference_price=0.09,
+        )
+
+        self.assertAlmostEqual(plan.headroom_energy_kwh, 0.0)
+        self.assertAlmostEqual(plan.unallocated_headroom_kwh, 0.875)
+        self.assertEqual(plan.battery_power_delta_schedule[flat_price.period_start.isoformat()], 0.0)
+
+    def test_soft_headroom_uses_a_profitable_price_spread(self):
+        valuable_export = self.slot(0, 0.20)
+        plan = self.plan(
+            [valuable_export],
+            energy=0.875,
+            headroom=0.875,
+            deadline=valuable_export.period_start + timedelta(minutes=15),
+            headroom_reference_price=0.05,
+        )
+
+        self.assertAlmostEqual(plan.headroom_energy_kwh, 0.875)
+        self.assertEqual(
+            plan.battery_power_delta_schedule[valuable_export.period_start.isoformat()],
+            3500.0,
+        )
+
     def test_existing_pv_export_reduces_room_below_the_grid_cap(self):
         slot = self.slot(0, 0.30, grid_export=5000.0)
         plan = self.plan([slot], energy=1.0)
@@ -192,6 +235,54 @@ class UnifiedExportSchedulerTests(unittest.TestCase):
             ev_is_charging=True,
         )
         self.assertEqual(target, -100.0)
+
+    def test_optional_export_target_uses_the_planning_margin(self):
+        self.assertEqual(
+            get_optional_export_grid_target(
+                optional_export_power_w=6000.0,
+                max_grid_export_w=5350.0,
+                neutral_grid_target_w=-100.0,
+            ),
+            -5350.0,
+        )
+
+    def test_optional_export_target_is_neutral_while_ev_charges(self):
+        self.assertEqual(
+            get_optional_export_grid_target(
+                optional_export_power_w=3500.0,
+                max_grid_export_w=5350.0,
+                neutral_grid_target_w=-100.0,
+                ev_is_charging=True,
+            ),
+            -100.0,
+        )
+
+    def test_reserve_trajectory_tracks_deficit_until_solar_meets_load(self):
+        slots = [
+            ReserveTrajectorySlot(self.start, 1.0, 1000.0, 0.0, 5.0),
+            ReserveTrajectorySlot(self.start + timedelta(hours=1), 1.0, 1000.0, 0.0, 5.0),
+            ReserveTrajectorySlot(self.start + timedelta(hours=2), 1.0, 1000.0, 2000.0, 5.0),
+        ]
+
+        schedule = build_reserve_energy_schedule(
+            slots,
+            battery_capacity_kwh=20.0,
+            uncertainty_margin_kwh=1.0,
+        )
+
+        self.assertEqual(schedule[slots[0].period_start.isoformat()], 4.0)
+        self.assertEqual(schedule[slots[1].period_start.isoformat()], 3.0)
+        self.assertEqual(schedule[slots[2].period_start.isoformat()], 2.0)
+
+    def test_reserve_trajectory_honors_a_higher_slot_reserve(self):
+        slot = ReserveTrajectorySlot(self.start, 0.5, 500.0, 2000.0, 15.0)
+        schedule = build_reserve_energy_schedule(
+            [slot],
+            battery_capacity_kwh=20.0,
+            uncertainty_margin_kwh=1.0,
+        )
+
+        self.assertEqual(schedule[slot.period_start.isoformat()], 4.0)
 
 
 if __name__ == "__main__":

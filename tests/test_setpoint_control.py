@@ -294,23 +294,75 @@ class SetpointControlTests(unittest.TestCase):
         )
         self.assertTrue(target_triggered)
 
-    def test_unified_forecast_uses_the_published_trajectory_without_price_mapping(self):
+    def test_unified_forecast_uses_optional_export_and_reserve_schedules(self):
         source = Path(__file__).parents[1].joinpath("energy.py").read_text()
         tree = ast.parse(source)
         forecast_node = next(
             node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "_forecast"
         )
-        direct_lookup = any(
+        argument_names = [argument.arg for argument in forecast_node.args.args]
+        self.assertIn("optional_export_power_schedule", argument_names)
+        self.assertIn("battery_floor_schedule", argument_names)
+
+        optional_export_lookup = any(
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Attribute)
             and isinstance(node.func.value, ast.Name)
-            and node.func.value.id == "grid_target_schedule"
+            and node.func.value.id == "optional_export_power_schedule"
             and node.func.attr == "get"
             for node in ast.walk(forecast_node)
         )
-        self.assertTrue(direct_lookup)
+        reserve_lookup = any(
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "battery_floor_schedule"
+            and node.func.attr == "get"
+            for node in ast.walk(forecast_node)
+        )
+        self.assertTrue(optional_export_lookup)
+        self.assertTrue(reserve_lookup)
 
-    def test_live_unified_control_adapts_the_same_planned_battery_power(self):
+    def test_unified_orchestrator_replays_relative_export_with_the_reserve_trajectory(self):
+        source = Path(__file__).parents[1].joinpath("energy.py").read_text()
+        tree = ast.parse(source)
+        target_node = next(
+            node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "auto_setpoint_target"
+        )
+        replay_calls = []
+        for node in ast.walk(target_node):
+            if not (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "forecast_setpoint_local"
+            ):
+                continue
+            keywords = {keyword.arg: keyword.value for keyword in node.keywords}
+            optional_schedule = keywords.get("optional_export_power_schedule")
+            floor_schedule = keywords.get("battery_floor_schedule")
+            if (
+                isinstance(optional_schedule, ast.Name)
+                and optional_schedule.id == "optional_export_power_schedule"
+                and isinstance(floor_schedule, ast.Name)
+                and floor_schedule.id == "battery_floor_schedule"
+            ):
+                replay_calls.append(keywords)
+
+        self.assertEqual(len(replay_calls), 1)
+        absolute_schedule = replay_calls[0].get("grid_target_schedule")
+        self.assertIsInstance(absolute_schedule, ast.Constant)
+        self.assertIsNone(absolute_schedule.value)
+
+        reserve_builds = [
+            node
+            for node in ast.walk(target_node)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "build_reserve_energy_schedule"
+        ]
+        self.assertEqual(len(reserve_builds), 1)
+
+    def test_live_unified_control_adapts_the_stateful_planned_battery_power(self):
         source = Path(__file__).parents[1].joinpath("energy.py").read_text()
         tree = ast.parse(source)
         apply_node = next(
@@ -324,6 +376,30 @@ class SetpointControlTests(unittest.TestCase):
             and node.func.id == "adapt_grid_target_to_live_power"
         ]
         self.assertEqual(len(calls), 1)
+
+        planned_battery_reads = [
+            node
+            for node in ast.walk(apply_node)
+            if isinstance(node, ast.Constant) and node.value == "planned_battery_power_w"
+        ]
+        self.assertEqual(len(planned_battery_reads), 1)
+
+    def test_dashboard_forecasts_consume_optional_export_and_reserve_schedules(self):
+        source = Path(__file__).parents[1].joinpath("energy.py").read_text()
+        tree = ast.parse(source)
+        forecast_surplus_node = next(
+            node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "forecast_surplus"
+        )
+        forecast_calls = [
+            node
+            for node in ast.walk(forecast_surplus_node)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "forecast"
+        ]
+        self.assertEqual(len(forecast_calls), 3)
+        for call in forecast_calls:
+            keyword_names = {keyword.arg for keyword in call.keywords}
+            self.assertIn("optional_export_power_schedule", keyword_names)
+            self.assertIn("battery_floor_schedule", keyword_names)
 
     def test_legacy_controller_remains_a_separate_flagged_branch(self):
         source = Path(__file__).parents[1].joinpath("energy.py").read_text()
