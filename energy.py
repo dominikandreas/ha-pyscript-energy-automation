@@ -845,6 +845,49 @@ def get_ev_schedule():
     return parse_full_schedule(ev_schedule, default_required_soc=ev_required_soc)
 
 
+# Only these series are consumed by the Lovelace forecast charts.  Publishing
+# every internal simulator field for the 80-hour calculation exceeds Home
+# Assistant's 16 KiB recorder attribute limit and makes the forecast history
+# disappear.  Keep the simulation rich, but make its presentation payload
+# explicit and compact.
+FORECAST_PRESENTATION_FIELDS = (
+    "period_start",
+    "feedin",
+    "surplus",
+    "ev_charge_power",
+    "battery_power",
+    "battery_energy",
+    "pv_estimate",
+    "epex_price",
+    "electricity_price",
+    "power_from_grid",
+    "ev_energy",
+)
+FORECAST_PRESENTATION_HOURS = 36
+
+
+@pyscript_compile
+def vectorize_forecast_detail(detail):
+    if detail:
+        presentation_end = detail[0].period_start + timedelta(hours=FORECAST_PRESENTATION_HOURS)
+        detail = [entry for entry in detail if entry.period_start <= presentation_end]
+    result = {}
+    for key in FORECAST_PRESENTATION_FIELDS:
+        if key == "period_start":
+            result[key] = [entry.period_start.isoformat() for entry in detail]
+        else:
+            digits = 1
+            if key in ("epex_price", "electricity_price"):
+                digits = 5
+            elif key in ("battery_energy", "surplus", "ev_energy"):
+                digits = 3
+            result[key] = []
+            for entry in detail:
+                value = getattr(entry, key)
+                result[key].append(None if value is None else round(value, digits))
+    return result
+
+
 @time_trigger
 @time_trigger("cron(*/2 * * * *)")
 @state_trigger(Grid.power_setpoint_target)
@@ -1029,9 +1072,7 @@ def forecast_surplus():
     feedin_today = sum([max(0, el.feedin - 20) for el in forecast_today]) * period_hours / 1000
     pv_feedin_today = sum([max(0, el.pv_feedin - 20) for el in forecast_today]) * period_hours / 1000
 
-    detail_without_ev_vectorized = {
-        k: [getattr(el, k) for el in forecast_no_ev.detail] for k in ForecastEntry.__annotations__.keys()
-    }
+    detail_without_ev_vectorized = vectorize_forecast_detail(forecast_no_ev.detail)
 
     set_energy_surplus(
         House.energy_surplus,
@@ -1101,9 +1142,7 @@ def forecast_surplus():
             \n#################### Forecast Surplus End #####################
             """
         )
-        detail_with_ev_vectorized = {
-            k: [getattr(el, k) for el in forecast_with_ev.detail] for k in ForecastEntry.__annotations__.keys()
-        }
+        detail_with_ev_vectorized = vectorize_forecast_detail(forecast_with_ev.detail)
 
         set_state(
             House.energy_forecast_with_ev,
