@@ -3,6 +3,7 @@ import inspect
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 from modules.setpoint_control import (
     FeedinCandidate,
@@ -256,7 +257,7 @@ class SetpointControlTests(unittest.TestCase):
             for node in ast.walk(forecast_surplus_node)
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "forecast"
         ]
-        self.assertEqual(len(forecast_calls), 3)
+        self.assertEqual(len(forecast_calls), 4)
         for call in forecast_calls:
             published_limit = next(
                 (keyword.value for keyword in call.keywords if keyword.arg == "max_battery_power_target"),
@@ -395,11 +396,137 @@ class SetpointControlTests(unittest.TestCase):
             for node in ast.walk(forecast_surplus_node)
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "forecast"
         ]
-        self.assertEqual(len(forecast_calls), 3)
+        self.assertEqual(len(forecast_calls), 4)
         for call in forecast_calls:
             keyword_names = {keyword.arg for keyword in call.keywords}
             self.assertIn("optional_export_power_schedule", keyword_names)
             self.assertIn("battery_floor_schedule", keyword_names)
+
+    def test_ev_surplus_curve_uses_the_solar_cycle_budget_not_raw_accumulator(self):
+        source = Path(__file__).parents[1].joinpath("energy.py").read_text()
+        tree = ast.parse(source)
+        selected = []
+        for name in ("get_spendable_solar_cycle_energy", "get_spendable_solar_cycle_curve"):
+            node = next(
+                node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == name
+            )
+            node.decorator_list = []
+            selected.append(node)
+
+        namespace = {"datetime": datetime}
+        module = ast.Module(body=selected, type_ignores=[])
+        exec(compile(ast.fix_missing_locations(module), "energy.py", "exec"), namespace)
+
+        start = datetime(2026, 8, 16, 20, 0, tzinfo=timezone.utc)
+        detail = [
+            SimpleNamespace(
+                period_start=start,
+                pv_estimate=0.0,
+                house_power=700.0,
+                battery_energy=8.0,
+                pv_feedin=0.0,
+                surplus=-4.0,
+            ),
+            SimpleNamespace(
+                period_start=start + timedelta(minutes=30),
+                pv_estimate=0.0,
+                house_power=700.0,
+                battery_energy=6.51,
+                pv_feedin=0.0,
+                surplus=-10.19,
+            ),
+            SimpleNamespace(
+                period_start=start + timedelta(hours=1),
+                pv_estimate=0.0,
+                house_power=700.0,
+                battery_energy=7.0,
+                pv_feedin=0.0,
+                surplus=-9.0,
+            ),
+        ]
+
+        curve = namespace["get_spendable_solar_cycle_curve"](
+            detail,
+            battery_export_floor=5.8,
+            period_hours=0.5,
+        )
+
+        self.assertAlmostEqual(curve[0], 0.71)
+        self.assertTrue(all(value >= 0 for value in curve))
+
+    def test_ev_surplus_publication_uses_conservative_same_horizon_curve(self):
+        source = Path(__file__).parents[1].joinpath("energy.py").read_text()
+        tree = ast.parse(source)
+        forecast_surplus_node = next(
+            node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "forecast_surplus"
+        )
+
+        conservative_ev_forecasts = []
+        for node in ast.walk(forecast_surplus_node):
+            if not (
+                isinstance(node, ast.Assign)
+                and any(
+                    isinstance(target, ast.Name) and target.id == "spendable_forecast_with_ev"
+                    for target in node.targets
+                )
+                and isinstance(node.value, ast.Call)
+            ):
+                continue
+            keywords = {keyword.arg: keyword.value for keyword in node.value.keywords}
+            conservative_ev_forecasts.append(keywords)
+
+        self.assertEqual(len(conservative_ev_forecasts), 1)
+        keywords = conservative_ev_forecasts[0]
+        self.assertEqual(keywords["forecast_dampening"].value, 0.8)
+        self.assertTrue(keywords["with_ev_charging"].value)
+        self.assertEqual(keywords["surplus_energy"].id, "surplus")
+
+        raw_minimum_publications = [
+            node
+            for node in ast.walk(forecast_surplus_node)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "min"
+            and any(
+                isinstance(child, ast.Attribute) and child.attr == "surplus"
+                for child in ast.walk(node)
+            )
+        ]
+        self.assertEqual(raw_minimum_publications, [])
+
+        published_curve_assignments = [
+            node
+            for node in ast.walk(forecast_surplus_node)
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Subscript)
+                and isinstance(target.value, ast.Name)
+                and target.value.id == "detail_with_ev_vectorized"
+                and isinstance(target.slice, ast.Constant)
+                and target.slice.value == "surplus"
+                for target in node.targets
+            )
+        ]
+        self.assertEqual(len(published_curve_assignments), 1)
+
+        base_curve_assignments = [
+            node
+            for node in ast.walk(forecast_surplus_node)
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Subscript)
+                and isinstance(target.value, ast.Name)
+                and target.value.id == "detail_without_ev_vectorized"
+                and isinstance(target.slice, ast.Constant)
+                and target.slice.value == "surplus"
+                for target in node.targets
+            )
+        ]
+        self.assertEqual(len(base_curve_assignments), 1)
+
+        self.assertIsInstance(keywords["optional_export_power_schedule"], ast.Dict)
+        self.assertEqual(keywords["optional_export_power_schedule"].keys, [])
+        self.assertEqual(keywords["battery_export_budget_kwh"].value, 0)
 
     def test_legacy_controller_remains_a_separate_flagged_branch(self):
         source = Path(__file__).parents[1].joinpath("energy.py").read_text()

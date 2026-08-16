@@ -801,6 +801,30 @@ def get_spendable_solar_cycle_energy(
 
 
 @pyscript_compile
+def get_spendable_solar_cycle_curve(
+    detail: list["ForecastEntry"],
+    battery_export_floor: float,
+    period_hours: float,
+) -> list[float]:
+    """Return the non-negative spendable budget at every forecast bucket.
+
+    Each point is evaluated against its own solar-cycle horizon.  This keeps
+    the published curve aligned with ``get_spendable_solar_cycle_energy``
+    instead of exposing the simulator's longer-running internal accumulator.
+    """
+    curve = []
+    for entry in detail:
+        spendable, _, _, _ = get_spendable_solar_cycle_energy(
+            detail,
+            battery_export_floor,
+            entry.period_start,
+            period_hours,
+        )
+        curve.append(spendable)
+    return curve
+
+
+@pyscript_compile
 def parse_full_schedule(
     schedule_data: dict[str, list[dict[str, Any]]], default_required_soc: float
 ) -> list["EVScheduleEntry"]:
@@ -994,9 +1018,9 @@ def forecast_surplus():
         max_battery_power_target=max_battery_power_target,
         headroom_schedule=headroom_schedule,
         grid_target_schedule=None,
-        optional_export_power_schedule={} if unified_scheduler_active else None,
+        optional_export_power_schedule={},
         battery_floor_schedule=battery_floor_schedule,
-        battery_export_budget_kwh=0 if unified_scheduler_active else None,
+        battery_export_budget_kwh=0,
         max_setpoint=forecast_max_setpoint,
         surplus_energy=0,
     )
@@ -1026,6 +1050,11 @@ def forecast_surplus():
             period_hours,
         )
     )
+    spendable_surplus_curve = get_spendable_solar_cycle_curve(
+        spendable_forecast.detail,
+        surplus_battery_floor,
+        period_hours,
+    )
 
     forecast_today = [el for el in forecast_no_ev.detail if el.period_start.day == t_now.day]
     feedin_today = sum([max(0, el.feedin - 20) for el in forecast_today]) * period_hours / 1000
@@ -1034,6 +1063,7 @@ def forecast_surplus():
     detail_without_ev_vectorized = {
         k: [getattr(el, k) for el in forecast_no_ev.detail] for k in ForecastEntry.__annotations__.keys()
     }
+    detail_without_ev_vectorized["surplus"] = spendable_surplus_curve
 
     set_energy_surplus(
         House.energy_surplus,
@@ -1060,6 +1090,29 @@ def forecast_surplus():
 
     ev_schedule = get_ev_schedule()
     if ev_schedule:
+        # Re-run the conservative, optional-export-free baseline with EV loads
+        # included.  Its spendable curve is directly comparable with the base
+        # surplus budget because both use the same 80% PV factor, protected
+        # floor, and per-solar-cycle horizon.
+        spendable_forecast_with_ev = forecast(
+            forecast=pv_forecast,
+            battery_capacity=battery_capacity,
+            battery_energy=battery_energy,
+            setpoint=setpoint,
+            forecast_dampening=0.8,
+            with_ev_charging=True,
+            ev_schedule=ev_schedule,
+            battery_min_energy=forecast_battery_floor,
+            max_battery_power_target=max_battery_power_target,
+            headroom_schedule=headroom_schedule,
+            grid_target_schedule=None,
+            optional_export_power_schedule={},
+            battery_floor_schedule=battery_floor_schedule,
+            battery_export_budget_kwh=0,
+            max_setpoint=forecast_max_setpoint,
+            surplus_energy=surplus,
+            ev_energy=ev_energy,
+        )
         forecast_with_ev = forecast(
             forecast=pv_forecast,
             battery_capacity=battery_capacity,
@@ -1082,7 +1135,12 @@ def forecast_surplus():
         )
 
         min_battery_energy = min([el.battery_energy for el in forecast_with_ev.detail] or [0])
-        surplus_after_ev_charging = min([el.surplus for el in forecast_with_ev.detail] or [0])
+        spendable_surplus_curve_with_ev = get_spendable_solar_cycle_curve(
+            spendable_forecast_with_ev.detail,
+            surplus_battery_floor,
+            period_hours,
+        )
+        surplus_after_ev_charging = spendable_surplus_curve_with_ev[0] if spendable_surplus_curve_with_ev else 0
         log.warning(
             f"""\n#################### Forecast Surplus  #####################\n
             Reserve battery energy: {reserve_energy:.2f} kWh ({reserve_soc:.2f}% reserve SOC)
@@ -1106,6 +1164,11 @@ def forecast_surplus():
         detail_with_ev_vectorized = {
             k: [getattr(el, k) for el in forecast_with_ev.detail] for k in ForecastEntry.__annotations__.keys()
         }
+        # ``ForecastEntry.surplus`` remains an internal simulator accumulator
+        # used for policy decisions.  Publish the same-horizon spendable curve
+        # instead; the raw accumulator includes ordinary house demand over the
+        # full 80-hour simulation and is not an energy-surplus contract.
+        detail_with_ev_vectorized["surplus"] = spendable_surplus_curve_with_ev
 
         set_state(
             House.energy_forecast_with_ev,
@@ -1122,6 +1185,7 @@ def forecast_surplus():
             **energy_kwh_attributes,
             detail=detail_without_ev_vectorized,
         )
+        set_energy_surplus(House.energy_surplus_after_ev_charging, surplus)
 
 
 @pyscript_compile
