@@ -369,26 +369,3 @@ def build_unified_export_schedule(
             requested_headroom_kwh - allocated_headroom_kwh,
         ),
     )
-
-
-def adapt_grid_target_to_live_power(
-    planned_battery_power_w: float,
-    house_load_w: float,
-    pv_power_w: float,
-    max_grid_export_w: float,
-    neutral_grid_target_w: float,
-    ev_is_charging: bool = False,
-) -> float:
-    """Preserve planned battery power using live load/PV without grid draw.
-
-    Battery power follows the forecast convention: positive charges, negative
-    discharges.  Clamping at the neutral export target means a PV shortfall can
-    reduce planned charging/export but cannot request avoidable grid import.
-    """
-
-    if ev_is_charging:
-        return neutral_grid_target_w
-
-    natural_grid_power_w = house_load_w - pv_power_w
-    desired_grid_target_w = natural_grid_power_w + planned_battery_power_w
-    return max(-max_grid_export_w, min(neutral_grid_target_w, desired_grid_target_w))

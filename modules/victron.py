@@ -64,6 +64,7 @@ def get_auto_inverter_mode(
     charge_limit_percent,
     force_charge_switch,
     t_now,
+    enforce_battery_floor=False,
 ):
     min_charge_power = 6 * 230  # 6A amps minimum
 
@@ -95,6 +96,20 @@ def get_auto_inverter_mode(
             else:
                 reason = f"battery {battery_soc}% < target {target_soc}% and price is low"
                 new_mode = InverterMode.charger_only
+
+    if enforce_battery_floor and battery_headroom_energy <= headroom_threshold:
+        if pv_power < 0.5 * daily_avg_power:
+            reason = (
+                f"planned battery floor reached with {battery_headroom_energy:.2f} kWh headroom "
+                "and insufficient PV"
+            )
+            new_mode = InverterMode.off
+        else:
+            reason = (
+                f"planned battery floor reached with {battery_headroom_energy:.2f} kWh headroom "
+                "while PV is available"
+            )
+            new_mode = InverterMode.charger_only
 
     if electricity_price < max_charge_price and battery_soc < target_soc and battery_soc < charge_limit_percent:
         reason = "Setting Victron inverter mode to 'On' due to low price"

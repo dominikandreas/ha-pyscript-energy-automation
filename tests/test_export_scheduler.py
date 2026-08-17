@@ -4,7 +4,6 @@ from datetime import datetime, timedelta, timezone
 from modules.export_scheduler import (
     ExportSchedulerSlot,
     ReserveTrajectorySlot,
-    adapt_grid_target_to_live_power,
     build_reserve_energy_schedule,
     build_unified_export_schedule,
     fit_export_schedule_to_energy_budget,
@@ -259,44 +258,11 @@ class UnifiedExportSchedulerTests(unittest.TestCase):
 
         self.assertEqual(plan.battery_power_delta_schedule[slot.period_start.isoformat()], 1500.0)
 
-    def test_live_house_load_reduces_export_while_preserving_battery_power(self):
-        target = adapt_grid_target_to_live_power(
-            planned_battery_power_w=-3500.0,
-            house_load_w=2000.0,
-            pv_power_w=0.0,
+    def test_zero_export_budget_keeps_live_target_neutral(self):
+        target = get_optional_export_grid_target(
+            optional_export_power_w=0.0,
             max_grid_export_w=5500.0,
             neutral_grid_target_w=-100.0,
-        )
-        self.assertEqual(target, -1500.0)
-
-    def test_live_pv_increases_export_only_up_to_combined_grid_cap(self):
-        target = adapt_grid_target_to_live_power(
-            planned_battery_power_w=-3500.0,
-            house_load_w=500.0,
-            pv_power_w=4000.0,
-            max_grid_export_w=5500.0,
-            neutral_grid_target_w=-100.0,
-        )
-        self.assertEqual(target, -5500.0)
-
-    def test_live_forecast_charging_never_requests_grid_import(self):
-        target = adapt_grid_target_to_live_power(
-            planned_battery_power_w=2500.0,
-            house_load_w=1500.0,
-            pv_power_w=0.0,
-            max_grid_export_w=5500.0,
-            neutral_grid_target_w=-100.0,
-        )
-        self.assertEqual(target, -100.0)
-
-    def test_live_ev_charging_forces_neutral_target(self):
-        target = adapt_grid_target_to_live_power(
-            planned_battery_power_w=-3500.0,
-            house_load_w=6000.0,
-            pv_power_w=0.0,
-            max_grid_export_w=5500.0,
-            neutral_grid_target_w=-100.0,
-            ev_is_charging=True,
         )
         self.assertEqual(target, -100.0)
 

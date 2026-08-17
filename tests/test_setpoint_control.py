@@ -363,7 +363,7 @@ class SetpointControlTests(unittest.TestCase):
         ]
         self.assertEqual(len(reserve_builds), 1)
 
-    def test_live_unified_control_adapts_the_stateful_planned_battery_power(self):
+    def test_live_unified_control_uses_only_budgeted_optional_export(self):
         source = Path(__file__).parents[1].joinpath("energy.py").read_text()
         tree = ast.parse(source)
         apply_node = next(
@@ -374,16 +374,84 @@ class SetpointControlTests(unittest.TestCase):
             for node in ast.walk(apply_node)
             if isinstance(node, ast.Call)
             and isinstance(node.func, ast.Name)
-            and node.func.id == "adapt_grid_target_to_live_power"
+            and node.func.id == "get_optional_export_grid_target"
         ]
         self.assertEqual(len(calls), 1)
 
+        planned_optional_reads = [
+            node
+            for node in ast.walk(apply_node)
+            if isinstance(node, ast.Constant) and node.value == "planned_optional_export_power_w"
+        ]
+        self.assertEqual(len(planned_optional_reads), 1)
         planned_battery_reads = [
             node
             for node in ast.walk(apply_node)
             if isinstance(node, ast.Constant) and node.value == "planned_battery_power_w"
         ]
-        self.assertEqual(len(planned_battery_reads), 1)
+        self.assertEqual(planned_battery_reads, [])
+
+    def test_unified_live_mode_enforces_the_planned_battery_floor(self):
+        source = Path(__file__).parents[1].joinpath("modules/victron.py").read_text()
+        tree = ast.parse(source)
+        selected = [
+            node
+            for node in tree.body
+            if (isinstance(node, ast.ClassDef) and node.name == "InverterMode")
+            or (isinstance(node, ast.FunctionDef) and node.name == "get_auto_inverter_mode")
+        ]
+        for node in selected:
+            if isinstance(node, ast.FunctionDef):
+                node.decorator_list = []
+        namespace = {}
+        exec(compile(ast.fix_missing_locations(ast.Module(body=selected, type_ignores=[])), "victron.py", "exec"), namespace)
+
+        common = dict(
+            ev_is_charging=False,
+            surplus_energy=0.0,
+            battery_headroom_energy=0.0,
+            pv_power=0.0,
+            daily_avg_power=900.0,
+            battery_soc=30.0,
+            target_soc=40.0,
+            electricity_price=0.30,
+            min_discharge_price=0.10,
+            max_charge_price=0.0,
+            charge_limit_percent=0.0,
+            force_charge_switch=False,
+            t_now=self.t_now,
+        )
+        enforced_mode, _, _, _ = namespace["get_auto_inverter_mode"](
+            **common,
+            enforce_battery_floor=True,
+        )
+        normal_mode, _, _, _ = namespace["get_auto_inverter_mode"](
+            **common,
+            enforce_battery_floor=False,
+        )
+
+        self.assertEqual(enforced_mode, namespace["InverterMode"].off)
+        self.assertEqual(normal_mode, namespace["InverterMode"].on)
+
+        energy_tree = ast.parse(Path(__file__).parents[1].joinpath("energy.py").read_text())
+        live_node = next(
+            node for node in energy_tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "auto_victron_set_inverter_mode"
+        )
+        live_call = next(
+            node for node in ast.walk(live_node)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "get_auto_inverter_mode"
+        )
+        keywords = {keyword.arg: keyword.value for keyword in live_call.keywords}
+        self.assertIn("enforce_battery_floor", keywords)
+        self.assertTrue(
+            any(
+                isinstance(node, ast.Constant) and node.value == "planned_battery_floor_kwh"
+                for node in ast.walk(live_node)
+            )
+        )
 
     def test_dashboard_forecasts_consume_optional_export_and_reserve_schedules(self):
         source = Path(__file__).parents[1].joinpath("energy.py").read_text()

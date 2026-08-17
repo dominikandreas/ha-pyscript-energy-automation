@@ -30,10 +30,10 @@ if TYPE_CHECKING:
     from modules.export_scheduler import (
         ExportSchedulerSlot,
         ReserveTrajectorySlot,
-        adapt_grid_target_to_live_power,
         build_reserve_energy_schedule,
         build_unified_export_schedule,
         fit_export_schedule_to_energy_budget,
+        get_optional_export_grid_target,
     )
 
     # These are provided pyscript and defined for type inference only. They do not need to
@@ -100,10 +100,10 @@ else:
     from export_scheduler import (
         ExportSchedulerSlot,
         ReserveTrajectorySlot,
-        adapt_grid_target_to_live_power,
         build_reserve_energy_schedule,
         build_unified_export_schedule,
         fit_export_schedule_to_energy_budget,
+        get_optional_export_grid_target,
     )
     from electricity_price import is_low_price, get_price
 
@@ -339,8 +339,18 @@ def auto_victron_set_inverter_mode():
     minimal_soc = get(Automation.minimal_soc, reserve_soc)
     t_now = now()
 
+    unified_scheduler_active = get_attr(Grid.power_setpoint_target, "unified_scheduler_active", False)
     if battery_capacity != -1337 and battery_energy != -1337:
         battery_export_floor = get_battery_export_floor(battery_capacity, reserve_soc, minimal_soc)
+        if unified_scheduler_active:
+            battery_export_floor = max(
+                battery_export_floor,
+                get_attr(
+                    Grid.power_setpoint_target,
+                    "planned_battery_floor_kwh",
+                    battery_export_floor,
+                ),
+            )
         battery_headroom_energy = max(0, battery_energy - battery_export_floor)
     else:
         battery_headroom_energy = forecast_battery_headroom_energy
@@ -372,6 +382,7 @@ def auto_victron_set_inverter_mode():
         charge_limit_percent,
         force_charge_switch,
         t_now=t_now,
+        enforce_battery_floor=unified_scheduler_active,
     )
 
     # log.warning(
@@ -1538,6 +1549,7 @@ def _forecast(
             charge_limit,
             force_charge_switch,
             t_now=_t_now,
+            enforce_battery_floor=battery_floor_schedule is not None,
         )
         return new_mode, new_charge_power_limit, new_force_charge_switch_state, reason
 
@@ -3138,28 +3150,25 @@ def auto_apply_setpoint():
     unified_scheduler_active = get_attr(Grid.power_setpoint_target, "unified_scheduler_active", False)
 
     if unified_scheduler_active:
-        planned_battery_power_w = get_attr(
+        planned_optional_export_power_w = get_attr(
             Grid.power_setpoint_target,
-            "planned_battery_power_w",
+            "planned_optional_export_power_w",
             0,
         )
-        pv_power = get(PVProduction.total_power, 0)
         planned_max_grid_export_w = get_attr(
             Grid.power_setpoint_target,
             "planned_max_grid_export_w",
             min(5500, max_setpoint_target),
         )
-        setpoint = adapt_grid_target_to_live_power(
-            planned_battery_power_w=planned_battery_power_w,
-            house_load_w=house_loads,
-            pv_power_w=pv_power,
+        setpoint = get_optional_export_grid_target(
+            optional_export_power_w=planned_optional_export_power_w,
             max_grid_export_w=min(planned_max_grid_export_w, max_setpoint_target),
             neutral_grid_target_w=max_setpoint,
             ev_is_charging=get(EV.is_charging, False),
         )
         msg += (
-            f" unified target {setpoint:.0f} W from stateful planned battery {planned_battery_power_w:.0f} W, "
-            f"live loads {house_loads:.0f} W and PV {pv_power:.0f} W"
+            f" unified target {setpoint:.0f} W from budgeted optional export "
+            f"{planned_optional_export_power_w:.0f} W"
         )
     elif setpoint_target < (max_setpoint - 30):
         current_diff_from_avg = house_power_long_term_average - house_loads
