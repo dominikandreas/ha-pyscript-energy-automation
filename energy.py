@@ -15,7 +15,13 @@ if TYPE_CHECKING:
     # Therefore during type checking we pretend to import them from modules.utils, which it can resolve.
     from modules.utils import clip, get, get_attr, set_state
     from modules.const import EV as EVConst
-    from modules.energy_core import _get_ev_smart_charge_limit, ChargeAction
+    from modules.energy_core import (
+        _get_ev_smart_charge_limit,
+        ChargeAction,
+        get_drive_required_soc,
+        get_forecast_drive_context,
+        get_ongoing_and_next_drive,
+    )
     from modules.setpoint_control import (
         FeedinCandidate,
         apply_hard_feedin_control,
@@ -85,6 +91,9 @@ else:
         _get_ev_energy_needed,
         _get_charge_action,
         ChargeAction,
+        get_drive_required_soc,
+        get_forecast_drive_context,
+        get_ongoing_and_next_drive,
     )  # noqa: F401
     from setpoint_control import (
         FeedinCandidate,
@@ -857,10 +866,7 @@ def parse_full_schedule(
         for event in events:
             soc = event.get("data", {}).get("required")
             distance = event.get("data", {}).get("distance")  # km
-            if not soc and distance:
-                soc = distance / 100 * EVConst.kwh_per_100km / EVConst.ev_capacity * 100 * 1.2  # add 20% margin
-            elif not soc:
-                soc = default_required_soc
+            soc = get_drive_required_soc(soc, distance, default_required_soc)
 
             entries.append(
                 EVScheduleEntry(
@@ -1146,6 +1152,32 @@ def forecast_surplus():
         )
 
         min_battery_energy = min([el.battery_energy for el in forecast_with_ev.detail] or [0])
+        _, next_departure = get_ongoing_and_next_drive(ev_schedule, t_now)
+        departure_forecast_summary = "No future EV departure in the forecast horizon"
+        if next_departure:
+            departure_entries = [
+                entry for entry in forecast_with_ev.detail if entry.period_start < next_departure.start
+            ]
+            required_departure_soc = next_departure.required_soc or get(EV.required_soc, 80)
+            required_departure_energy = required_departure_soc / 100 * EVConst.ev_capacity
+            if departure_entries:
+                departure_ev_energy = departure_entries[-1].ev_energy
+                departure_ev_soc = departure_ev_energy / EVConst.ev_capacity * 100
+                departure_shortfall = max(0, required_departure_energy - departure_ev_energy)
+                planned_charge_energy = sum(
+                    [entry.ev_charge_power * period_hours / 1000 for entry in departure_entries]
+                )
+                first_charge_entry = next(
+                    iter([entry for entry in departure_entries if entry.ev_charge_power > 100]),
+                    None,
+                )
+                departure_forecast_summary = (
+                    f"EV departure {next_departure.start}: required {required_departure_soc:.2f}% "
+                    f"({required_departure_energy:.2f} kWh), forecast {departure_ev_soc:.2f}% "
+                    f"({departure_ev_energy:.2f} kWh), shortfall {departure_shortfall:.2f} kWh, "
+                    f"planned charge {planned_charge_energy:.2f} kWh, "
+                    f"first charge {first_charge_entry.period_start if first_charge_entry else 'none'}"
+                )
         spendable_surplus_curve_with_ev = get_spendable_solar_cycle_curve(
             spendable_forecast_with_ev.detail,
             surplus_battery_floor,
@@ -1166,6 +1198,7 @@ def forecast_surplus():
             Final battery energy: {forecast_no_ev.detail[-1].battery_energy:.2f} kWh
             Surplus: {surplus:.2f} kWh
             Surplus after EV charging: {surplus_after_ev_charging:.2f} kWh
+            {departure_forecast_summary}
             last entry date: {forecast_no_ev.detail[-1].period_start if len(forecast_no_ev.detail) > 0 else "n/a"}
             total feedin: {feedin_today:.2f} kWh
             total pv feedin: {pv_feedin_today:.2f} kWh
@@ -1515,8 +1548,10 @@ def _forecast(
 
     smart_charge_limit = 80
 
-    ongoing_drive = None
-    next_drive = next(iter([s for s in ev_schedule if s.start > t_now]), None) if ev_schedule else None
+    live_ongoing_drive, next_drive = get_ongoing_and_next_drive(ev_schedule, t_now)
+    returned_during_current_drive = bool(
+        live_ongoing_drive is not None and (charger_ready or is_charging_ev)
+    )
 
     if with_ev_charging:
         assert ev_energy is not None, "ev_energy must be provided if with_ev_charging is True"
@@ -1524,7 +1559,12 @@ def _forecast(
     def is_charging_possible(dt, ev_energy, smart_charge_limit):
         if not with_ev_charging:
             return False
-        ongoing_drive = next(iter([s for s in ev_schedule if s.start <= dt < s.end]), None)
+        ongoing_drive, _ = get_forecast_drive_context(
+            ev_schedule,
+            dt,
+            live_ongoing_drive,
+            returned_during_current_drive,
+        )
         return (
             with_ev_charging
             and ((charger_ready or is_charging_ev or not next_drive or dt > next_drive.end) and ongoing_drive is None)
@@ -1568,12 +1608,16 @@ def _forecast(
 
     for entry, epex_price in zip(forecast, prices):
         start: datetime = entry.period_start
+        ongoing_drive = None
         if ev_schedule:
-            ongoing_drive = next(iter([s for s in ev_schedule if s.start <= start < s.end]), None)
-            if ongoing_drive is None:
-                next_drive_event = next(iter([s for s in ev_schedule if s.start > start]), None)
-                if next_drive_event and next_drive_event.required_soc:
-                    ev_required_soc = next_drive_event.required_soc
+            ongoing_drive, next_drive_event = get_forecast_drive_context(
+                ev_schedule,
+                start,
+                live_ongoing_drive,
+                returned_during_current_drive,
+            )
+            if next_drive_event and next_drive_event.required_soc:
+                ev_required_soc = next_drive_event.required_soc
         elapsed = max(t_now - start, timedelta(minutes=0))
         if t_now > start:
             period_minutes = max(0, full_period_minutes - elapsed.total_seconds() / 60)

@@ -31,6 +31,45 @@ class ChargeMode:
 
 
 @pyscript_compile
+def get_ongoing_and_next_drive(ev_schedule, t_now):
+    """Return the active drive window and the following departure independently.
+
+    A car can return before the configured drive window ends.  In that case the
+    active window still matters to the simulator, but it must not hide the next
+    departure from the live charging deadline logic.
+    """
+
+    if not ev_schedule:
+        return None, None
+
+    ongoing = next(iter([event for event in ev_schedule if event.start <= t_now < event.end]), None)
+    next_drive = next(iter([event for event in ev_schedule if event.start > t_now]), None)
+    return ongoing, next_drive
+
+
+@pyscript_compile
+def get_forecast_drive_context(ev_schedule, t_now, live_ongoing_drive, vehicle_present):
+    """Treat only the current returned-early drive window as physically complete."""
+
+    ongoing, next_drive = get_ongoing_and_next_drive(ev_schedule, t_now)
+    if vehicle_present and live_ongoing_drive is not None and ongoing == live_ongoing_drive:
+        ongoing = None
+    return ongoing, next_drive
+
+
+@pyscript_compile
+def get_drive_required_soc(required_soc, distance, default_required_soc):
+    """Resolve one canonical departure SOC, including the distance margin."""
+
+    if required_soc:
+        return float(required_soc)
+    if distance:
+        drive_energy = min(Const.ev_capacity, float(distance) / 100 * Const.kwh_per_100km)
+        return min(100, round(drive_energy / Const.ev_capacity * 100 * 1.2, 2))
+    return float(default_required_soc)
+
+
+@pyscript_compile
 def _get_ev_smart_charge_limit(schedule, t_now, active_schedule=False):
     if not schedule:
         smart_charge_limit = 85
@@ -169,9 +208,10 @@ def _get_charge_action(
         if is_charging
         else minimum_charge_power + SURPLUS_START_MARGIN
     )
-    surplus_available = available_ev_power >= surplus_power_threshold and (
-        surplus_energy > 0 or available_ev_power > 3000
-    )
+    # ``excess_target`` already reserves the power needed by the home battery.
+    # Once the remaining physical headroom can sustain the charger's minimum,
+    # a separate global-energy/3 kW gate must not force that PV into the grid.
+    surplus_available = available_ev_power >= surplus_power_threshold
 
     if current_soc >= surplus_charge_limit:
         return (

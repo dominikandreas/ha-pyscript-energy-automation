@@ -9,7 +9,12 @@ if TYPE_CHECKING:
     # Therefore during type checking we pretend to import them from modules.utils, which it can resolve.
     from modules.utils import get, get_attr
     from modules.const import EV as Const
-    from modules.energy_core import ChargeMode, HYSTERESIS_BUFFER
+    from modules.energy_core import (
+        ChargeMode,
+        HYSTERESIS_BUFFER,
+        get_drive_required_soc,
+        get_ongoing_and_next_drive,
+    )
 
     # These are provided by typescript and do not need to be imported in the actual script
     # They are only needed for type checking (linting), which development easier
@@ -34,7 +39,15 @@ else:
     from const import EV as Const
     from utils import get, set_state, get_attr, now, with_timezone
     from states import Automation, Charger, ElectricityPrices, EV, Excess, Battery, House, PVProduction
-    from energy_core import ChargeMode, _get_ev_smart_charge_limit, _get_ev_energy_needed, _get_charge_action, HYSTERESIS_BUFFER  # noqa: F401
+    from energy_core import (
+        ChargeMode,
+        HYSTERESIS_BUFFER,
+        _get_charge_action,
+        _get_ev_energy_needed,
+        _get_ev_smart_charge_limit,
+        get_drive_required_soc,
+        get_ongoing_and_next_drive,
+    )  # noqa: F401
     from victron import Victron
 
 
@@ -299,11 +312,7 @@ def parse_full_schedule(
         for event in events:
             soc = event.get("data", {}).get("required")
             distance = event.get("data", {}).get("distance")  # km
-            if not soc and distance:
-                energy_needed = min(Const.ev_capacity, distance / 100 * Const.kwh_per_100km)
-                soc = min(100, energy_needed / Const.ev_capacity * 100 + 10)
-            elif not soc:
-                soc = default_required_soc
+            soc = get_drive_required_soc(soc, distance, default_required_soc)
 
             entries.append(
                 EVScheduleEntry(
@@ -396,35 +405,30 @@ async def auto_ev_charging():
     # next drive is the point in time where the user needs to have the car charged to the required soc
     ongoing = get(EV.planned_drives, False)
     if ev_schedule is not None:
-        ongoing = next(iter([s for s in ev_schedule if s.start <= t_now < s.end]), None)
-        if ongoing is None:
-            next_drive_event = next(iter([s for s in ev_schedule if s.start > t_now]), None)
-            if next_drive_event:
-                next_drive = next_drive_event.start
-                if next_drive_event.required_soc:
-                    required_soc = next_drive_event.required_soc
-                    msg += (f"required soc defined via next drive event {required_soc}")
-                elif next_drive_event.distance:
-                    energy_needed = min(Const.ev_capacity, next_drive_event.distance / 100 * Const.kwh_per_100km)
-                    required_soc = min(100, (energy_needed) / Const.ev_capacity * 100 + 10)
-                    msg += (f"setting required soc to {required_soc}")
-                effective_required_soc = required_soc
-                if smart_limiter_active:
-                    effective_required_soc = min(required_soc, ev_charge_limit)
-                if effective_required_soc != required_soc:
-                    msg += f", limited by smart charge limit to {effective_required_soc}"
-                required_soc = effective_required_soc
-                energy_needed = max(0, required_soc - current_soc) / 100 * Const.ev_capacity
+        ongoing, next_drive_event = get_ongoing_and_next_drive(ev_schedule, t_now)
+        if next_drive_event:
+            next_drive = next_drive_event.start
+            if next_drive_event.required_soc:
+                required_soc = next_drive_event.required_soc
+                msg += (f"required soc defined via next drive event {required_soc}")
+            elif next_drive_event.distance:
+                energy_needed = min(Const.ev_capacity, next_drive_event.distance / 100 * Const.kwh_per_100km)
+                required_soc = min(100, (energy_needed) / Const.ev_capacity * 100 + 10)
+                msg += (f"setting required soc to {required_soc}")
+            effective_required_soc = required_soc
+            if smart_limiter_active:
+                effective_required_soc = min(required_soc, ev_charge_limit)
+            if effective_required_soc != required_soc:
+                msg += f", limited by smart charge limit to {effective_required_soc}"
+            required_soc = effective_required_soc
+            energy_needed = max(0, required_soc - current_soc) / 100 * Const.ev_capacity
 
     else:
         next_drive = get_attr(EV.planned_drives, "next_event")
 
     is_charging = get(Charger.control_switch, False)
 
-    if ongoing:
-        next_drive = None  # if ongoing, next_drive is actually next_return, so we ignore it
-
-    elif next_drive:
+    if next_drive:
         next_drive = with_timezone(next_drive)
 
     # Calculate minimum time needed to charge the vehicle, we subtract 1 to account for charging inefficiencies
