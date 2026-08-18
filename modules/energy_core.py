@@ -183,6 +183,29 @@ def calculate_available_ev_power(
 
 
 @pyscript_compile
+def get_simulated_ev_power_inputs(
+    pv_power: float,
+    house_power: float,
+    configured_phases: int,
+    configured_current: float,
+    is_charging: bool,
+):
+    """Adapt forecast power flow to the live EV controller contract.
+
+    Live ``excess_power`` already includes the active wallbox load.  Forecast
+    PV and house load do not, so subtract the simulated wallbox here and pass
+    that same load separately for availability normalization.
+    """
+
+    wallbox_power = (
+        configured_phases * configured_current * Const.voltage
+        if is_charging
+        else 0
+    )
+    return pv_power - house_power - wallbox_power, wallbox_power
+
+
+@pyscript_compile
 def _get_charge_action(
     next_drive,
     current_soc,

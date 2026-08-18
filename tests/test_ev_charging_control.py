@@ -35,6 +35,7 @@ def _load_energy_core_symbols():
         "calculate_charger_current_adjustment",
         "get_drive_energy_drain",
         "get_ev_charge_energy_limit",
+        "get_simulated_ev_power_inputs",
         "get_drive_required_soc",
         "get_forecast_drive_context",
         "get_ongoing_and_next_drive",
@@ -222,6 +223,74 @@ class EVChargingControlTests(unittest.TestCase):
         self.assertAlmostEqual(bucket_drains[0], 8.5)
         self.assertAlmostEqual(sum(bucket_drains), 42.5)
 
+    def test_falling_pv_surplus_charge_does_not_create_forecast_grid_import(self):
+        # Captured from the 2026-08-19 forecast.  The old simulator fed
+        # pre-wallbox excess into the live controller contract, ramped to 16 A,
+        # and invented 2.69 kWh of grid import between 13:00 and 16:00.
+        buckets = [
+            (10, 0, 3324.3, 388.783),
+            (10, 30, 3753.0, 1251.0),
+            (11, 0, 4096.9, 1365.633),
+            (11, 30, 4412.9, 1470.967),
+            (12, 0, 4508.7, 1502.9),
+            (12, 30, 4447.6, 1482.533),
+            (13, 0, 4253.3, 1417.767),
+            (13, 30, 3947.7, 1315.9),
+            (14, 0, 3670.9, 1223.633),
+            (14, 30, 3410.8, 1136.933),
+            (15, 0, 3273.2, 1091.067),
+            (15, 30, 3217.8, 1103.197),
+            (16, 0, 2936.6, 1381.039),
+        ]
+        house_power = 844.0
+        phases = 1
+        current = 7
+        is_charging = False
+        cumulative_grid_import_kwh = 0.0
+        applied_currents = []
+
+        for hour, minute, pv_power, excess_target in buckets:
+            excess_power, wallbox_power = self.core["get_simulated_ev_power_inputs"](
+                pv_power,
+                house_power,
+                phases,
+                current,
+                is_charging,
+            )
+            action, phases, current, _reason, mode = self.core["_get_charge_action"](
+                next_drive=None,
+                current_soc=32,
+                required_soc=65,
+                energy_needed=20,
+                excess_power=excess_power,
+                excess_target=excess_target,
+                surplus_energy=5.48,
+                smart_charge_limit=101,
+                smart_limiter_active=False,
+                configured_phases=phases,
+                configured_current=current,
+                is_low_price=False,
+                pv_total_power=pv_power,
+                battery_soc=40,
+                is_charging=is_charging,
+                t_now=datetime(2026, 8, 19, hour, minute, tzinfo=timezone.utc),
+                inverter_mode="off",
+                battery_force_charge=False,
+                wallbox_power=wallbox_power,
+            )
+            is_charging = action == self.core["ChargeAction"].on
+            applied_current = current if is_charging else 0
+            applied_currents.append(applied_current)
+            ev_power = phases * applied_current * self.core["Const"].voltage
+            grid_import_w = max(0, house_power + ev_power - pv_power)
+            cumulative_grid_import_kwh += grid_import_w * 0.5 / 1000
+            if is_charging:
+                self.assertEqual(mode, self.core["ChargeMode"].surplus)
+
+        self.assertEqual(applied_currents[6:12], [9, 9, 7, 7, 7, 6])
+        self.assertEqual(applied_currents[-1], 0)
+        self.assertAlmostEqual(cumulative_grid_import_kwh, 0.0)
+
     def test_live_and_forecast_use_the_shared_schedule_context(self):
         project_root = Path(__file__).parents[1]
         ev_tree = ast.parse((project_root / "ev_charging.py").read_text())
@@ -268,6 +337,14 @@ class EVChargingControlTests(unittest.TestCase):
             and call.func.id == "_forecast"
         )
         self.assertIn("charger_ready_since", [keyword.arg for keyword in forecast_delegate.keywords])
+        forecast_charge_call = next(
+            call
+            for call in ast.walk(forecast_node)
+            if isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Name)
+            and call.func.id == "_get_charge_action"
+        )
+        self.assertIn("wallbox_power", [keyword.arg for keyword in forecast_charge_call.keywords])
         self.assertFalse(
             any(isinstance(node, ast.GeneratorExp) for node in ast.walk(forecast_surplus_node)),
             "forecast_surplus must avoid generator expressions unsupported by Pyscript",
