@@ -406,3 +406,79 @@ def _get_charge_action(
         return (ChargeAction.off, 1, 6, "high electricity price and still time available", ChargeMode.idle)
 
     return (ChargeAction.off, 1, 6, "None of the conditions for auto charging matched", ChargeMode.idle)
+
+
+@pyscript_compile
+def get_settled_simulated_ev_charge_action(
+    next_drive,
+    current_soc,
+    required_soc,
+    energy_needed,
+    excess_target,
+    surplus_energy,
+    smart_charge_limit,
+    smart_limiter_active,
+    configured_phases,
+    configured_current,
+    is_low_price,
+    pv_total_power,
+    house_power,
+    battery_soc,
+    is_charging,
+    t_now,
+    inverter_mode,
+    battery_force_charge,
+    max_control_steps=10,
+):
+    """Settle minute-rate EV control inside one forecast interval.
+
+    Live control runs once per minute, while forecast intervals are normally
+    30 minutes.  Replaying several controller decisions prevents a 2 A live
+    slew limit from being stretched across whole forecast buckets.
+    """
+
+    action = ChargeAction.on if is_charging else ChargeAction.off
+    phases = configured_phases
+    current = configured_current
+    reason = ""
+    charge_mode = ChargeMode.idle
+
+    for _ in range(max_control_steps):
+        previous_state = (is_charging, phases, current)
+        excess_power, wallbox_power = get_simulated_ev_power_inputs(
+            pv_total_power,
+            house_power,
+            phases,
+            current,
+            is_charging,
+        )
+        action, new_phases, new_current, reason, charge_mode = _get_charge_action(
+            next_drive=next_drive,
+            current_soc=current_soc,
+            required_soc=required_soc,
+            energy_needed=energy_needed,
+            excess_power=excess_power,
+            excess_target=excess_target,
+            surplus_energy=surplus_energy,
+            smart_charge_limit=smart_charge_limit,
+            smart_limiter_active=smart_limiter_active,
+            configured_phases=phases,
+            configured_current=current,
+            is_low_price=is_low_price,
+            pv_total_power=pv_total_power,
+            battery_soc=battery_soc,
+            is_charging=is_charging,
+            t_now=t_now,
+            inverter_mode=inverter_mode,
+            battery_force_charge=battery_force_charge,
+            wallbox_power=wallbox_power,
+        )
+        next_is_charging = action == ChargeAction.on
+        if new_phases != phases:
+            new_current = 8 if new_phases == 1 else 6
+        next_state = (next_is_charging, new_phases, new_current)
+        is_charging, phases, current = next_state
+        if not is_charging or next_state == previous_state:
+            break
+
+    return action, phases, current, reason, charge_mode

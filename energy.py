@@ -24,7 +24,7 @@ if TYPE_CHECKING:
         get_ev_charge_energy_limit,
         get_forecast_drive_context,
         get_ongoing_and_next_drive,
-        get_simulated_ev_power_inputs,
+        get_settled_simulated_ev_charge_action,
         is_vehicle_present_during_active_drive,
     )
     from modules.setpoint_control import (
@@ -102,7 +102,7 @@ else:
         get_ev_charge_energy_limit,
         get_forecast_drive_context,
         get_ongoing_and_next_drive,
-        get_simulated_ev_power_inputs,
+        get_settled_simulated_ev_charge_action,
         is_vehicle_present_during_active_drive,
     )  # noqa: F401
     from setpoint_control import (
@@ -1734,37 +1734,28 @@ def _forecast(
         charge_mode = ChargeMode.idle
 
         if could_charge_ev:
-            simulated_excess_power, simulated_wallbox_power = get_simulated_ev_power_inputs(
-                power_production,
-                house_power,
-                charge_phases,
-                charge_current,
-                is_charging_ev,
+            charge_action, new_charge_phases, charge_current, reason, charge_mode = (
+                get_settled_simulated_ev_charge_action(
+                    next_drive=next_drive_event.start if next_drive_event else None,
+                    current_soc=ev_soc,
+                    required_soc=ev_required_soc,
+                    energy_needed=ev_energy_needed,
+                    excess_target=excess_target,
+                    surplus_energy=surplus,
+                    smart_charge_limit=smart_charge_limit,
+                    smart_limiter_active=smart_limiter_active,
+                    configured_phases=charge_phases,
+                    configured_current=charge_current,
+                    is_low_price=low_price,
+                    pv_total_power=power_production,
+                    house_power=house_power,
+                    battery_soc=tentative_batt_soc,
+                    is_charging=is_charging_ev,
+                    t_now=start,
+                    inverter_mode=inverter_mode,
+                    battery_force_charge=is_force_charging,
+                )
             )
-            charge_action, new_charge_phases, charge_current, reason, charge_mode = _get_charge_action(
-                next_drive=next_drive_event.start if next_drive_event else None,
-                current_soc=ev_soc,
-                required_soc=ev_required_soc,
-                energy_needed=ev_energy_needed,
-                excess_power=simulated_excess_power,
-                excess_target=excess_target,
-                surplus_energy=surplus,
-                smart_charge_limit=smart_charge_limit,
-                smart_limiter_active=smart_limiter_active,
-                configured_phases=charge_phases,
-                configured_current=charge_current,
-                is_low_price=low_price,
-                pv_total_power=power_production,
-                battery_soc=tentative_batt_soc,
-                is_charging=is_charging_ev,
-                t_now=start,
-                inverter_mode=inverter_mode,
-                battery_force_charge=is_force_charging,
-                wallbox_power=simulated_wallbox_power,
-            )
-
-            if new_charge_phases != charge_phases:
-                charge_current = 8 if new_charge_phases == 1 else 6
 
             charge_phases = new_charge_phases
             is_charging_ev = charge_action == ChargeAction.on

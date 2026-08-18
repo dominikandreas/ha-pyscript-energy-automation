@@ -35,6 +35,7 @@ def _load_energy_core_symbols():
         "calculate_charger_current_adjustment",
         "get_drive_energy_drain",
         "get_ev_charge_energy_limit",
+        "get_settled_simulated_ev_charge_action",
         "get_simulated_ev_power_inputs",
         "get_drive_required_soc",
         "get_forecast_drive_context",
@@ -250,19 +251,13 @@ class EVChargingControlTests(unittest.TestCase):
         applied_currents = []
 
         for hour, minute, pv_power, excess_target in buckets:
-            excess_power, wallbox_power = self.core["get_simulated_ev_power_inputs"](
-                pv_power,
-                house_power,
-                phases,
-                current,
-                is_charging,
-            )
-            action, phases, current, _reason, mode = self.core["_get_charge_action"](
+            action, phases, current, _reason, mode = self.core[
+                "get_settled_simulated_ev_charge_action"
+            ](
                 next_drive=None,
                 current_soc=32,
                 required_soc=65,
                 energy_needed=20,
-                excess_power=excess_power,
                 excess_target=excess_target,
                 surplus_energy=5.48,
                 smart_charge_limit=101,
@@ -271,12 +266,12 @@ class EVChargingControlTests(unittest.TestCase):
                 configured_current=current,
                 is_low_price=False,
                 pv_total_power=pv_power,
+                house_power=house_power,
                 battery_soc=40,
                 is_charging=is_charging,
                 t_now=datetime(2026, 8, 19, hour, minute, tzinfo=timezone.utc),
                 inverter_mode="off",
                 battery_force_charge=False,
-                wallbox_power=wallbox_power,
             )
             is_charging = action == self.core["ChargeAction"].on
             applied_current = current if is_charging else 0
@@ -289,6 +284,62 @@ class EVChargingControlTests(unittest.TestCase):
 
         self.assertEqual(applied_currents[6:12], [9, 9, 7, 7, 7, 6])
         self.assertEqual(applied_currents[-1], 0)
+        self.assertAlmostEqual(cumulative_grid_import_kwh, 0.0)
+
+    def test_evening_surplus_charge_settles_before_battery_floor_import(self):
+        buckets = [
+            (17, 0, 2049.4, 844.0, -2443.829),
+            (17, 30, 1711.2, 844.0, -2269.544),
+            (18, 0, 1246.3, 844.0, -1969.247),
+            (18, 30, 730.8, 844.0, -1563.411),
+            (19, 0, 274.7, 682.0, -1061.869),
+            (19, 30, 104.7, 682.0, -540.827),
+            (20, 0, 32.2, 682.0, -64.736),
+        ]
+        phases = 1
+        current = 6
+        is_charging = False
+        battery_energy = 19.299
+        battery_floor = 14.053
+        cumulative_grid_import_kwh = 0.0
+        applied_currents = []
+
+        for hour, minute, pv_power, house_power, excess_target in buckets:
+            action, phases, current, _reason, _mode = self.core[
+                "get_settled_simulated_ev_charge_action"
+            ](
+                next_drive=None,
+                current_soc=52,
+                required_soc=65,
+                energy_needed=8,
+                excess_target=excess_target,
+                surplus_energy=5.48,
+                smart_charge_limit=101,
+                smart_limiter_active=False,
+                configured_phases=phases,
+                configured_current=current,
+                is_low_price=False,
+                pv_total_power=pv_power,
+                house_power=house_power,
+                battery_soc=battery_energy / 32 * 100,
+                is_charging=is_charging,
+                t_now=datetime(2026, 8, 19, hour, minute, tzinfo=timezone.utc),
+                inverter_mode="off",
+                battery_force_charge=False,
+            )
+            is_charging = action == self.core["ChargeAction"].on
+            applied_current = current if is_charging else 0
+            applied_currents.append(applied_current)
+            ev_power = phases * applied_current * self.core["Const"].voltage
+            natural_deficit_w = max(0, house_power + ev_power - pv_power)
+            available_discharge_w = max(0, battery_energy - battery_floor) * 1000 / 0.5
+            battery_discharge_w = min(natural_deficit_w, available_discharge_w)
+            grid_import_w = natural_deficit_w - battery_discharge_w
+            battery_energy -= battery_discharge_w * 0.5 / 1000
+            cumulative_grid_import_kwh += grid_import_w * 0.5 / 1000
+
+        self.assertEqual(applied_currents, [15, 14, 0, 0, 0, 0, 0])
+        self.assertGreater(battery_energy, battery_floor)
         self.assertAlmostEqual(cumulative_grid_import_kwh, 0.0)
 
     def test_live_and_forecast_use_the_shared_schedule_context(self):
@@ -342,9 +393,9 @@ class EVChargingControlTests(unittest.TestCase):
             for call in ast.walk(forecast_node)
             if isinstance(call, ast.Call)
             and isinstance(call.func, ast.Name)
-            and call.func.id == "_get_charge_action"
+            and call.func.id == "get_settled_simulated_ev_charge_action"
         )
-        self.assertIn("wallbox_power", [keyword.arg for keyword in forecast_charge_call.keywords])
+        self.assertIn("house_power", [keyword.arg for keyword in forecast_charge_call.keywords])
         self.assertFalse(
             any(isinstance(node, ast.GeneratorExp) for node in ast.walk(forecast_surplus_node)),
             "forecast_surplus must avoid generator expressions unsupported by Pyscript",
