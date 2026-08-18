@@ -18,9 +18,13 @@ if TYPE_CHECKING:
     from modules.energy_core import (
         _get_ev_smart_charge_limit,
         ChargeAction,
+        ChargeMode,
+        get_drive_energy_drain,
         get_drive_required_soc,
+        get_ev_charge_energy_limit,
         get_forecast_drive_context,
         get_ongoing_and_next_drive,
+        is_vehicle_present_during_active_drive,
     )
     from modules.setpoint_control import (
         FeedinCandidate,
@@ -91,9 +95,13 @@ else:
         _get_ev_energy_needed,
         _get_charge_action,
         ChargeAction,
+        ChargeMode,
+        get_drive_energy_drain,
         get_drive_required_soc,
+        get_ev_charge_energy_limit,
         get_forecast_drive_context,
         get_ongoing_and_next_drive,
+        is_vehicle_present_during_active_drive,
     )  # noqa: F401
     from setpoint_control import (
         FeedinCandidate,
@@ -1152,6 +1160,31 @@ def forecast_surplus():
         )
 
         min_battery_energy = min([el.battery_energy for el in forecast_with_ev.detail] or [0])
+        active_drive, _ = get_ongoing_and_next_drive(ev_schedule, t_now)
+        active_drive_forecast_summary = ""
+        if active_drive:
+            charger_ready = get(Charger.ready, False)
+            charger_ready_since = get_attr(Charger.ready, "last_changed")
+            is_charging_ev = get(EV.is_charging, False)
+            returned_early = is_vehicle_present_during_active_drive(
+                active_drive,
+                charger_ready,
+                charger_ready_since,
+                is_charging_ev,
+            )
+            active_drive_entries = [
+                entry
+                for entry in forecast_with_ev.detail
+                if active_drive.start <= entry.period_start < active_drive.end
+            ]
+            if active_drive_entries:
+                active_drive_end_energy = active_drive_entries[-1].ev_energy
+                active_drive_forecast_summary = (
+                    f"Active EV drive {active_drive.start} -> {active_drive.end}: "
+                    f"forecast {ev_energy:.2f} -> {active_drive_end_energy:.2f} kWh "
+                    f"(use {max(0, ev_energy - active_drive_end_energy):.2f} kWh), "
+                    f"returned early: {returned_early}"
+                )
         _, next_departure = get_ongoing_and_next_drive(ev_schedule, t_now)
         departure_forecast_summary = "No future EV departure in the forecast horizon"
         if next_departure:
@@ -1198,6 +1231,7 @@ def forecast_surplus():
             Final battery energy: {forecast_no_ev.detail[-1].battery_energy:.2f} kWh
             Surplus: {surplus:.2f} kWh
             Surplus after EV charging: {surplus_after_ev_charging:.2f} kWh
+            {active_drive_forecast_summary}
             {departure_forecast_summary}
             last entry date: {forecast_no_ev.detail[-1].period_start if len(forecast_no_ev.detail) > 0 else "n/a"}
             total feedin: {feedin_today:.2f} kWh
@@ -1412,6 +1446,7 @@ def forecast(
     force_charge_switch: bool | None = None,
     min_discharge_price: float | None = None,
     charger_ready: bool | None = None,
+    charger_ready_since: datetime | None = None,
     eff_dis: bool | None = None,
     battery_cells_balanced: bool | None = None,
     t_now: datetime | None = None,
@@ -1431,6 +1466,7 @@ def forecast(
     force_charge_switch = force_charge_switch or get(Battery.force_charge_switch, False)
     min_discharge_price = min_discharge_price or float(get(Automation.min_discharge_price, default=0))
     charger_ready = charger_ready or get(Charger.ready, False)
+    charger_ready_since = charger_ready_since or get_attr(Charger.ready, "last_changed")
     eff_dis = eff_dis or get(Automation.efficient_discharge, False)
     battery_cells_balanced = (
         battery_cells_balanced if battery_cells_balanced is not None else get(Battery.cells_balanced, False)
@@ -1471,6 +1507,7 @@ def forecast(
         force_charge_switch=force_charge_switch,
         min_discharge_price=min_discharge_price,
         charger_ready=charger_ready,
+        charger_ready_since=charger_ready_since,
         eff_dis=eff_dis,
         battery_cells_balanced=battery_cells_balanced,
         t_now=t_now,
@@ -1513,6 +1550,7 @@ def _forecast(
     force_charge_switch: bool | None = None,
     min_discharge_price: float | None = None,
     charger_ready: bool | None = None,
+    charger_ready_since: datetime | None = None,
     eff_dis: bool | None = None,
     battery_cells_balanced: bool | None = None,
     t_now: datetime | None = None,
@@ -1549,8 +1587,11 @@ def _forecast(
     smart_charge_limit = 80
 
     live_ongoing_drive, next_drive = get_ongoing_and_next_drive(ev_schedule, t_now)
-    returned_during_current_drive = bool(
-        live_ongoing_drive is not None and (charger_ready or is_charging_ev)
+    returned_during_current_drive = is_vehicle_present_during_active_drive(
+        live_ongoing_drive,
+        charger_ready,
+        charger_ready_since,
+        is_charging_ev,
     )
 
     if with_ev_charging:
@@ -1688,9 +1729,10 @@ def _forecast(
 
         # --- EV Charging Action ---
         ev_charge_power = 0.0
+        charge_mode = ChargeMode.idle
 
         if could_charge_ev:
-            charge_action, new_charge_phases, charge_current, reason, _charge_mode = _get_charge_action(
+            charge_action, new_charge_phases, charge_current, reason, charge_mode = _get_charge_action(
                 next_drive=next_drive_event.start if next_drive_event else None,
                 current_soc=ev_soc,
                 required_soc=ev_required_soc,
@@ -1762,15 +1804,19 @@ def _forecast(
         # --- Apply EV Charging Physics ---
         if is_charging_ev and ev_charge_power > 1:
             added_ev_energy = ev_charge_power * period_hours / 1000
-            # Cap at smart limit
-            if ev_energy + added_ev_energy > smart_charge_limit * EVConst.ev_capacity / 100:
-                added_ev_energy = max(0, smart_charge_limit * EVConst.ev_capacity / 100 - ev_energy)
+            ev_charge_energy_limit = get_ev_charge_energy_limit(
+                charge_mode,
+                ev_required_soc,
+                smart_charge_limit,
+            )
+            if ev_energy + added_ev_energy > ev_charge_energy_limit:
+                added_ev_energy = max(0, ev_charge_energy_limit - ev_energy)
                 # Recalculate power to match the energy cap
                 ev_charge_power = (added_ev_energy * 1000) / period_hours if period_hours > 0 else 0
 
             ev_energy += added_ev_energy
             free_capacity = (
-                smart_charge_limit * EVConst.ev_capacity / 100 - ev_energy + battery_capacity - battery_energy
+                ev_charge_energy_limit - ev_energy + battery_capacity - battery_energy
             )
 
             if optional_export_power_schedule is not None or grid_target_schedule is not None:
@@ -1785,11 +1831,8 @@ def _forecast(
 
         # --- Driving Physics ---
         if ongoing_drive and ev_energy is not None:
-            total_required_kwh = (ongoing_drive.distance or 200) / 100 * EVConst.kwh_per_100km
-            drive_duration_s = (ongoing_drive.end - ongoing_drive.start).total_seconds()
-            # ev_energy -= total_required_kwh / max(drive_duration_s / 3600, 1) * period_hours
-            if drive_duration_s > 0:
-                energy_drained = total_required_kwh * (period_hours * 3600 / drive_duration_s)
+            energy_drained = get_drive_energy_drain(ongoing_drive, period_hours)
+            if energy_drained > 0:
                 ev_energy -= energy_drained
 
                 if ev_energy < 0:

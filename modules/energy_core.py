@@ -58,6 +58,54 @@ def get_forecast_drive_context(ev_schedule, t_now, live_ongoing_drive, vehicle_p
 
 
 @pyscript_compile
+def is_vehicle_present_during_active_drive(
+    active_drive,
+    charger_ready,
+    charger_ready_since,
+    is_charging,
+):
+    """Return whether telemetry proves the car returned during this drive.
+
+    ``charger_ready`` can remain on after charging and across a later departure.
+    Only a ready transition inside the active drive window (or actual charging)
+    is evidence that the car is physically back early.
+    """
+
+    if active_drive is None:
+        return False
+    if is_charging:
+        return True
+    return bool(
+        charger_ready
+        and charger_ready_since is not None
+        and active_drive.start <= charger_ready_since < active_drive.end
+    )
+
+
+@pyscript_compile
+def get_ev_charge_energy_limit(charge_mode, required_soc, smart_charge_limit):
+    """Return the EV energy ceiling for one simulated charging action."""
+
+    charge_limit_soc = smart_charge_limit
+    if charge_mode == ChargeMode.required:
+        charge_limit_soc = min(charge_limit_soc, required_soc)
+    return charge_limit_soc * Const.ev_capacity / 100
+
+
+@pyscript_compile
+def get_drive_energy_drain(active_drive, period_hours):
+    """Return the EV energy consumed during one forecast interval."""
+
+    if active_drive is None:
+        return 0
+    drive_duration_hours = (active_drive.end - active_drive.start).total_seconds() / 3600
+    if drive_duration_hours <= 0:
+        return 0
+    total_drive_energy = (active_drive.distance or 200) / 100 * Const.kwh_per_100km
+    return total_drive_energy * period_hours / drive_duration_hours
+
+
+@pyscript_compile
 def get_drive_required_soc(required_soc, distance, default_required_soc):
     """Resolve one canonical departure SOC, including the distance margin."""
 

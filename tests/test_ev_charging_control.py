@@ -33,9 +33,12 @@ def _load_energy_core_symbols():
         "SURPLUS_STOP_MARGIN",
         "calculate_available_ev_power",
         "calculate_charger_current_adjustment",
+        "get_drive_energy_drain",
+        "get_ev_charge_energy_limit",
         "get_drive_required_soc",
         "get_forecast_drive_context",
         "get_ongoing_and_next_drive",
+        "is_vehicle_present_during_active_drive",
         "_get_charge_action",
     }
     selected = []
@@ -150,6 +153,75 @@ class EVChargingControlTests(unittest.TestCase):
         self.assertIsNone(ongoing)
         self.assertIs(next_drive, following)
 
+    def test_stale_ready_state_from_before_departure_does_not_cancel_drive(self):
+        drive = SimpleNamespace(
+            start=datetime(2026, 8, 18, 6, 30, tzinfo=timezone.utc),
+            end=datetime(2026, 8, 18, 9, 0, tzinfo=timezone.utc),
+        )
+        stale_ready_since = datetime(2026, 8, 18, 2, 57, tzinfo=timezone.utc)
+
+        vehicle_present = self.core["is_vehicle_present_during_active_drive"](
+            drive,
+            charger_ready=True,
+            charger_ready_since=stale_ready_since,
+            is_charging=False,
+        )
+        ongoing, _ = self.core["get_forecast_drive_context"](
+            [drive],
+            drive.start + timedelta(minutes=30),
+            drive,
+            vehicle_present,
+        )
+
+        self.assertFalse(vehicle_present)
+        self.assertIs(ongoing, drive)
+
+    def test_ready_transition_after_departure_marks_returned_car_present(self):
+        drive = SimpleNamespace(
+            start=datetime(2026, 8, 17, 14, 30, tzinfo=timezone.utc),
+            end=datetime(2026, 8, 17, 18, 30, tzinfo=timezone.utc),
+        )
+        returned_at = datetime(2026, 8, 17, 18, 10, tzinfo=timezone.utc)
+
+        vehicle_present = self.core["is_vehicle_present_during_active_drive"](
+            drive,
+            charger_ready=True,
+            charger_ready_since=returned_at,
+            is_charging=False,
+        )
+
+        self.assertTrue(vehicle_present)
+
+    def test_required_charge_bucket_caps_at_required_soc(self):
+        required_limit = self.core["get_ev_charge_energy_limit"](
+            self.core["ChargeMode"].required,
+            required_soc=85,
+            smart_charge_limit=100,
+        )
+        surplus_limit = self.core["get_ev_charge_energy_limit"](
+            self.core["ChargeMode"].surplus,
+            required_soc=85,
+            smart_charge_limit=100,
+        )
+
+        self.assertEqual(required_limit, 51.0)
+        self.assertEqual(surplus_limit, 60.0)
+
+    def test_active_drive_consumes_its_full_energy_across_all_buckets(self):
+        drive = SimpleNamespace(
+            start=datetime(2026, 8, 18, 6, 30, tzinfo=timezone.utc),
+            end=datetime(2026, 8, 18, 9, 0, tzinfo=timezone.utc),
+            distance=265.625,
+        )
+
+        bucket_drains = [
+            self.core["get_drive_energy_drain"](drive, period_hours=0.5)
+            for _ in range(5)
+        ]
+
+        self.assertAlmostEqual(bucket_drains[0], 8.5)
+        self.assertAlmostEqual(sum(bucket_drains), 42.5)
+
     def test_live_and_forecast_use_the_shared_schedule_context(self):
         project_root = Path(__file__).parents[1]
         ev_tree = ast.parse((project_root / "ev_charging.py").read_text())
@@ -163,6 +235,9 @@ class EVChargingControlTests(unittest.TestCase):
         )
         forecast_surplus_node = next(
             node for node in energy_tree.body if isinstance(node, ast.FunctionDef) and node.name == "forecast_surplus"
+        )
+        forecast_wrapper_node = next(
+            node for node in energy_tree.body if isinstance(node, ast.FunctionDef) and node.name == "forecast"
         )
 
         def helper_calls(node):
@@ -183,6 +258,16 @@ class EVChargingControlTests(unittest.TestCase):
             and call.func.id == "get_forecast_drive_context"
         ]
         self.assertGreaterEqual(len(forecast_context_calls), 2)
+        for node in (forecast_wrapper_node, forecast_node):
+            self.assertIn("charger_ready_since", [argument.arg for argument in node.args.args])
+        forecast_delegate = next(
+            call
+            for call in ast.walk(forecast_wrapper_node)
+            if isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Name)
+            and call.func.id == "_forecast"
+        )
+        self.assertIn("charger_ready_since", [keyword.arg for keyword in forecast_delegate.keywords])
         self.assertFalse(
             any(isinstance(node, ast.GeneratorExp) for node in ast.walk(forecast_surplus_node)),
             "forecast_surplus must avoid generator expressions unsupported by Pyscript",
