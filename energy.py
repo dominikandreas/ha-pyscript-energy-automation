@@ -25,6 +25,7 @@ if TYPE_CHECKING:
         get_forecast_drive_context,
         get_ongoing_and_next_drive,
         get_settled_simulated_ev_charge_action,
+        is_forecast_ev_available,
         is_vehicle_present_during_active_drive,
     )
     from modules.setpoint_control import (
@@ -103,6 +104,7 @@ else:
         get_forecast_drive_context,
         get_ongoing_and_next_drive,
         get_settled_simulated_ev_charge_action,
+        is_forecast_ev_available,
         is_vehicle_present_during_active_drive,
     )  # noqa: F401
     from setpoint_control import (
@@ -530,7 +532,11 @@ def get_low_pv_reserve_soc(house_power: float, pv_power: float, battery_cells_ba
         return 0
     if house_power <= 0:
         return 0
-    return 15 if pv_power < house_power * 0.75 else 0
+    # Preserve the full 15% reserve below 75% PV coverage, then release it
+    # continuously as PV approaches the house load.  The former hard 75%
+    # switch made the battery target and EV current jump under passing clouds.
+    pv_coverage = max(0, pv_power) / house_power
+    return 15 * clip((1 - pv_coverage) / 0.25, 0, 1)
 
 
 def get_ev_requested_energy_today():
@@ -674,12 +680,15 @@ def _get_excess_target(
         if next_planned_drive is not None:
             next_planned_drive = with_timezone(next_planned_drive)
             planned_leave_soon = (next_planned_drive - t_now).total_seconds() / 3600 < 24
-        # charge EV slowly to reserve capacity at noon
-        if not planned_leave_soon and pv_power > 2000:
+        # Reserve PV for the home battery with a continuous ramp.  The former
+        # 2 kW threshold flipped the target by roughly 2 kW in one control
+        # interval and made the wallbox oscillate between 6 and 14 A.
+        if not planned_leave_soon:
             if ev_soc > ev_required_soc:
-                power = max(power, pv_power - 4000)
+                pv_charge_reserve = max(0, pv_power - 4000)
             else:
-                power = max(power, pv_power / 3)
+                pv_charge_reserve = min(pv_power / 3, max(0, pv_power - 1500))
+            power = max(power, pv_charge_reserve)
 
     return power
 
@@ -856,9 +865,15 @@ def get_spendable_solar_cycle_curve(
 
 @pyscript_compile
 def parse_full_schedule(
-    schedule_data: dict[str, list[dict[str, Any]]], default_required_soc: float
+    schedule_data: dict[str, list[dict[str, Any]]], default_required_soc: float, t_now=None
 ) -> list["EVScheduleEntry"]:
-    today = date.today()
+    # ``now`` is a Pyscript runtime helper and cannot safely be resolved from
+    # inside a ``@pyscript_compile`` function.  Callers must freeze the time
+    # before entering this deterministic parser.
+    if t_now is None:
+        raise ValueError("parse_full_schedule requires t_now")
+    t_now = with_timezone(t_now)
+    today = t_now.date()
     today_weekday = today.weekday()
     day_map = {
         name: i for i, name in enumerate(["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"])
@@ -878,10 +893,18 @@ def parse_full_schedule(
             distance = event.get("data", {}).get("distance")  # km
             soc = get_drive_required_soc(soc, distance, default_required_soc)
 
+            event_start = with_timezone(datetime.combine(event_date, event["from"]))
+            event_end = with_timezone(datetime.combine(event_date, event["to"]))
+            if event_end <= event_start:
+                event_end += timedelta(days=1)
+            if event_end <= t_now:
+                event_start += timedelta(days=7)
+                event_end += timedelta(days=7)
+
             entries.append(
                 EVScheduleEntry(
-                    start=with_timezone(datetime.combine(event_date, event["from"])),
-                    end=with_timezone(datetime.combine(event_date, event["to"])),
+                    start=event_start,
+                    end=event_end,
                     required_soc=float(soc) if soc is not None else None,
                     distance=float(distance) if distance is not None else None,
                 )
@@ -890,12 +913,14 @@ def parse_full_schedule(
     return sorted(entries, key=lambda x: x.start)
 
 
-def get_ev_schedule():
+def get_ev_schedule(t_now=None):
+    if t_now is None:
+        t_now = now()
     ev_schedule = (schedule.get_schedule(entity_id="schedule.tesla_planned_drives") or {}).get(
         "schedule.tesla_planned_drives", {}
     )
     ev_required_soc = get(EV.required_soc, 80)
-    return parse_full_schedule(ev_schedule, default_required_soc=ev_required_soc)
+    return parse_full_schedule(ev_schedule, default_required_soc=ev_required_soc, t_now=t_now)
 
 
 @time_trigger
@@ -905,7 +930,11 @@ def forecast_surplus():
     task.unique("forecast_surplus", kill_me=True)
     epex_prices = get_attr(ElectricityPrices.epex_forecast_prices, "data", [])
     t_now = now()
+    ev_schedule = get_ev_schedule(t_now)
+    _, next_departure = get_ongoing_and_next_drive(ev_schedule, t_now)
     t_end = t_now + timedelta(hours=80)
+    if next_departure:
+        t_end = max(t_end, next_departure.end + timedelta(hours=6))
 
     setpoint = get(Grid.power_setpoint_basis, -20)
     battery_capacity = get(Battery.capacity, 1337)
@@ -1115,8 +1144,12 @@ def forecast_surplus():
         detail=detail_without_ev_vectorized,
     )
 
-    ev_schedule = get_ev_schedule()
     if ev_schedule:
+        forecast_ev_charging_enabled = bool(
+            get(Automation.auto_ev_charging, False)
+            or get(Charger.force_charge, False)
+            or get(EV.is_charging, False)
+        )
         # Re-run the conservative, optional-export-free baseline with EV loads
         # included.  Its spendable curve is directly comparable with the base
         # surplus budget because both use the same 80% PV factor, protected
@@ -1127,9 +1160,9 @@ def forecast_surplus():
             battery_energy=battery_energy,
             setpoint=setpoint,
             forecast_dampening=0.8,
-            with_ev_charging=True,
+            with_ev_charging=forecast_ev_charging_enabled,
             ev_schedule=ev_schedule,
-            battery_min_energy=forecast_battery_floor,
+            battery_min_energy=surplus_battery_floor,
             max_battery_power_target=max_battery_power_target,
             headroom_schedule=headroom_schedule,
             grid_target_schedule=None,
@@ -1146,9 +1179,9 @@ def forecast_surplus():
             battery_energy=battery_energy,
             setpoint=setpoint,
             forecast_dampening=1,
-            with_ev_charging=True,
+            with_ev_charging=forecast_ev_charging_enabled,
             ev_schedule=ev_schedule,
-            battery_min_energy=forecast_battery_floor,
+            battery_min_energy=surplus_battery_floor,
             max_battery_power_target=max_battery_power_target,
             headroom_schedule=headroom_schedule,
             grid_target_schedule=None,
@@ -1200,7 +1233,10 @@ def forecast_surplus():
                 departure_ev_soc = departure_ev_energy / EVConst.ev_capacity * 100
                 departure_shortfall = max(0, required_departure_energy - departure_ev_energy)
                 planned_charge_energy = sum(
-                    [entry.ev_charge_power * period_hours / 1000 for entry in departure_entries]
+                    [
+                        entry.ev_charge_power * period_hours / 1000 * EVConst.charge_efficiency
+                        for entry in departure_entries
+                    ]
                 )
                 first_charge_entry = next(
                     iter([entry for entry in departure_entries if entry.ev_charge_power > 100]),
@@ -1233,6 +1269,7 @@ def forecast_surplus():
             Final battery energy: {forecast_no_ev.detail[-1].battery_energy:.2f} kWh
             Surplus: {surplus:.2f} kWh
             Surplus after EV charging: {surplus_after_ev_charging:.2f} kWh
+            EV charging controller enabled: {forecast_ev_charging_enabled}
             {active_drive_forecast_summary}
             {departure_forecast_summary}
             last entry date: {forecast_no_ev.detail[-1].period_start if len(forecast_no_ev.detail) > 0 else "n/a"}
@@ -1254,6 +1291,7 @@ def forecast_surplus():
             House.energy_forecast_with_ev,
             round(forecast_with_ev.detail[-1].battery_energy, 2),
             **energy_kwh_attributes,
+            ev_charging_enabled=forecast_ev_charging_enabled,
             detail=detail_with_ev_vectorized,
         )
         set_energy_surplus(House.energy_surplus_after_ev_charging, surplus_after_ev_charging)
@@ -1449,6 +1487,7 @@ def forecast(
     min_discharge_price: float | None = None,
     charger_ready: bool | None = None,
     charger_ready_since: datetime | None = None,
+    ev_plugged_in: bool | None = None,
     eff_dis: bool | None = None,
     battery_cells_balanced: bool | None = None,
     t_now: datetime | None = None,
@@ -1460,16 +1499,25 @@ def forecast(
 
     ev_required_soc = ev_required_soc or get(EV.required_soc, 80)
     ev_soc = ev_soc or get(EV.soc, 100)
-    is_charging_ev = is_charging_ev or get(EV.is_charging, False)
+    is_charging_ev = is_charging_ev if is_charging_ev is not None else get(EV.is_charging, False)
 
-    smart_limiter_active = smart_limiter_active or get(Automation.auto_charge_limit, False)
+    smart_limiter_active = (
+        smart_limiter_active
+        if smart_limiter_active is not None
+        else get(Automation.auto_charge_limit, False)
+    )
     charge_limit = charge_limit or get(Battery.force_charge_up_to, 0)
     max_charge_price = max_charge_price or get(Battery.max_charge_price, 0)
-    force_charge_switch = force_charge_switch or get(Battery.force_charge_switch, False)
+    force_charge_switch = (
+        force_charge_switch
+        if force_charge_switch is not None
+        else get(Battery.force_charge_switch, False)
+    )
     min_discharge_price = min_discharge_price or float(get(Automation.min_discharge_price, default=0))
-    charger_ready = charger_ready or get(Charger.ready, False)
+    charger_ready = charger_ready if charger_ready is not None else get(Charger.ready, False)
     charger_ready_since = charger_ready_since or get_attr(Charger.ready, "last_changed")
-    eff_dis = eff_dis or get(Automation.efficient_discharge, False)
+    ev_plugged_in = ev_plugged_in if ev_plugged_in is not None else get(EV.plugged_in, False)
+    eff_dis = eff_dis if eff_dis is not None else get(Automation.efficient_discharge, False)
     battery_cells_balanced = (
         battery_cells_balanced if battery_cells_balanced is not None else get(Battery.cells_balanced, False)
     )
@@ -1510,6 +1558,7 @@ def forecast(
         min_discharge_price=min_discharge_price,
         charger_ready=charger_ready,
         charger_ready_since=charger_ready_since,
+        ev_plugged_in=ev_plugged_in,
         eff_dis=eff_dis,
         battery_cells_balanced=battery_cells_balanced,
         t_now=t_now,
@@ -1553,6 +1602,7 @@ def _forecast(
     min_discharge_price: float | None = None,
     charger_ready: bool | None = None,
     charger_ready_since: datetime | None = None,
+    ev_plugged_in: bool | None = None,
     eff_dis: bool | None = None,
     battery_cells_balanced: bool | None = None,
     t_now: datetime | None = None,
@@ -1595,6 +1645,7 @@ def _forecast(
         charger_ready_since,
         is_charging_ev,
     )
+    vehicle_present_now = bool(ev_plugged_in or charger_ready or is_charging_ev)
 
     if with_ev_charging:
         assert ev_energy is not None, "ev_energy must be provided if with_ev_charging is True"
@@ -1610,7 +1661,13 @@ def _forecast(
         )
         return (
             with_ev_charging
-            and ((charger_ready or is_charging_ev or not next_drive or dt > next_drive.end) and ongoing_drive is None)
+            and is_forecast_ev_available(
+                ev_schedule,
+                t_now,
+                dt,
+                ongoing_drive,
+                vehicle_present_now,
+            )
             and ev_energy < EVConst.ev_capacity * (smart_charge_limit or 101) / 100
         )
 
@@ -1674,9 +1731,9 @@ def _forecast(
         house_power = daily_power if 7 < start.hour < 19 else nightly_power
         period_battery_min_energy = battery_min_energy
         if battery_floor_schedule is not None:
-            period_battery_min_energy = battery_floor_schedule.get(
-                start.isoformat(),
+            period_battery_min_energy = max(
                 period_battery_min_energy,
+                battery_floor_schedule.get(start.isoformat(), period_battery_min_energy),
             )
         low_pv_reserve_soc = get_low_pv_reserve_soc(
             house_power=house_power,
@@ -1754,6 +1811,7 @@ def _forecast(
                     t_now=start,
                     inverter_mode=inverter_mode,
                     battery_force_charge=is_force_charging,
+                    battery_floor_soc=period_battery_min_energy / battery_capacity * 100,
                 )
             )
 
@@ -1804,7 +1862,7 @@ def _forecast(
 
         # --- Apply EV Charging Physics ---
         if is_charging_ev and ev_charge_power > 1:
-            added_ev_energy = ev_charge_power * period_hours / 1000
+            added_ev_energy = ev_charge_power * period_hours / 1000 * EVConst.charge_efficiency
             ev_charge_energy_limit = get_ev_charge_energy_limit(
                 charge_mode,
                 ev_required_soc,
@@ -1813,7 +1871,11 @@ def _forecast(
             if ev_energy + added_ev_energy > ev_charge_energy_limit:
                 added_ev_energy = max(0, ev_charge_energy_limit - ev_energy)
                 # Recalculate power to match the energy cap
-                ev_charge_power = (added_ev_energy * 1000) / period_hours if period_hours > 0 else 0
+                ev_charge_power = (
+                    (added_ev_energy * 1000) / (period_hours * EVConst.charge_efficiency)
+                    if period_hours > 0
+                    else 0
+                )
 
             ev_energy += added_ev_energy
             free_capacity = (
@@ -2086,6 +2148,50 @@ def merge_forecast_results(a: ForecastResult, b: ForecastResult, t_split: dateti
     return merged_setpoint
 
 
+@pyscript_compile
+def extend_pv_forecast_to_horizon(
+    forecast: list[PVForecastWithPrices],
+    t_end: datetime,
+    price_by_period: dict[tuple[int, int, int], float],
+) -> list[PVForecastWithPrices]:
+    """Extend a provider-limited forecast so scheduled drives stay visible.
+
+    Solcast currently publishes five days.  For a later scheduled drive, reuse
+    the latest available value for each wall-clock bucket.  Actual future EPEX
+    prices win when present; otherwise the matching source bucket's price is
+    retained.  This projected tail is display/planning context only: the live
+    surplus budget still ends at the next solar-cycle trough.
+    """
+    if len(forecast) < 2:
+        return forecast
+
+    period = forecast[1].period_start - forecast[0].period_start
+    latest_by_clock = {}
+    for entry in forecast:
+        latest_by_clock[(entry.period_start.hour, entry.period_start.minute)] = entry
+
+    extended = list(forecast)
+    cursor = forecast[-1].period_start + period
+    while cursor < t_end:
+        template = latest_by_clock.get((cursor.hour, cursor.minute))
+        projected_pv = template.pv_estimate if template is not None else 0
+        fallback_price = template.price_per_kwh if template is not None else 0
+        projected_price = price_by_period.get(
+            (cursor.day, cursor.hour, cursor.minute),
+            fallback_price,
+        )
+        extended.append(
+            PVForecastWithPrices(
+                cursor,
+                pv_estimate=projected_pv,
+                price_per_kwh=projected_price,
+            )
+        )
+        cursor += period
+
+    return extended
+
+
 def get_pv_forecast_with_prices(t_start: datetime, t_end: datetime, epex_prices: list[dict]):
     forecast = [
         el
@@ -2120,6 +2226,7 @@ def get_pv_forecast_with_prices(t_start: datetime, t_end: datetime, epex_prices:
         prices[get_date_tuple(start_time)] = entry["price_per_kwh"]
         prices[get_date_tuple(start_time + timedelta(hours=period_hours))] = entry["price_per_kwh"]
 
+    source_forecast_end = forecast[-1]["period_start"]
     for idx, forecast_entry in enumerate(list(forecast)):
         # insert price
         start_time = forecast_entry["period_start"]
@@ -2131,6 +2238,13 @@ def get_pv_forecast_with_prices(t_start: datetime, t_end: datetime, epex_prices:
         )
         if forecast[idx].price_per_kwh is None:
             log.warning(f"No price found for forecast entry {get_date_tuple(start_time)}")
+
+    forecast = extend_pv_forecast_to_horizon(forecast, t_end, prices)
+    if forecast[-1].period_start > source_forecast_end:
+        log.warning(
+            f"PV forecast source ends at {source_forecast_end}; projected the final daily profile "
+            f"through {forecast[-1].period_start} to cover the EV schedule"
+        )
 
     return forecast
 
@@ -2196,7 +2310,11 @@ def auto_setpoint_target():
     # example:
     # data = {'monday': [], 'tuesday': [], 'wednesday': [{'from': datetime.time(7, 30), 'to': datetime.time(17, 0)}], 'thursday': [], 'friday': [], 'saturday': [], 'sunday': [{'from': datetime.time(9, 30), 'to': datetime.time(10, 0), 'data': {'required_charge': 50}}]}
     ev_required_soc = get(EV.required_soc, 80)
-    ev_schedule = parse_full_schedule(ev_schedule, default_required_soc=ev_required_soc)
+    ev_schedule = parse_full_schedule(
+        ev_schedule,
+        default_required_soc=ev_required_soc,
+        t_now=t_now,
+    )
     drive_ongoing = next(iter([s for s in ev_schedule if s.start <= t_now < s.end]), None)
     ev_energy = get(EV.energy, EVConst.ev_capacity)
 

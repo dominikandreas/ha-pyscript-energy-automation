@@ -546,8 +546,9 @@ class SetpointControlTests(unittest.TestCase):
         self.assertEqual(len(conservative_ev_forecasts), 1)
         keywords = conservative_ev_forecasts[0]
         self.assertEqual(keywords["forecast_dampening"].value, 0.8)
-        self.assertTrue(keywords["with_ev_charging"].value)
+        self.assertEqual(keywords["with_ev_charging"].id, "forecast_ev_charging_enabled")
         self.assertEqual(keywords["surplus_energy"].id, "surplus")
+        self.assertEqual(keywords["battery_min_energy"].id, "surplus_battery_floor")
 
         raw_minimum_publications = [
             node

@@ -26,3 +26,5 @@ class EV:
     """The maximum number of phases the EV charger can provide"""
     voltage = 230
     """The voltage of the EV charger"""
+    charge_efficiency = 0.9
+    """Wallbox-to-battery efficiency used by the energy forecast."""

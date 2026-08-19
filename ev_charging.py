@@ -260,14 +260,39 @@ def set_phases_and_current(phases, current, reason: str | None = None):
 @time_trigger
 @time_trigger("period(now, 30sec)")
 def ev_energy_needed():
-    """Calculate the energy needed to charge the EV to the required state of charge"""
-    required_soc = get(EV.required_soc, 80)
+    """Publish the same effective trip target used by live EV control."""
+    fallback_required_soc = get(EV.required_soc, 80)
+    required_soc = fallback_required_soc
     current_soc = get(EV.soc, 0)
     smart_charge_limit = get(EV.smart_charge_limit, required_soc)
     smart_limiter_active = get(Automation.auto_charge_limit, False)
 
+    target_source = "input"
+    scheduled_required_soc = None
+    next_drive = None
+    ev_schedule = get_ev_schedule()
+    if ev_schedule:
+        _, next_drive_event = get_ongoing_and_next_drive(ev_schedule, now())
+        if next_drive_event:
+            next_drive = next_drive_event.start
+            scheduled_required_soc = next_drive_event.required_soc
+            if scheduled_required_soc is not None:
+                required_soc = scheduled_required_soc
+                target_source = "schedule"
+
     energy_needed = _get_ev_energy_needed(required_soc, current_soc, smart_charge_limit, smart_limiter_active)
-    set_state(EV.energy_needed, energy_needed)
+    effective_required_soc = min(required_soc, smart_charge_limit) if smart_limiter_active else required_soc
+    set_state(
+        EV.energy_needed,
+        energy_needed,
+        unit_of_measurement="kWh",
+        fallback_required_soc=fallback_required_soc,
+        scheduled_required_soc=scheduled_required_soc,
+        effective_required_soc=effective_required_soc,
+        smart_charge_limit=smart_charge_limit,
+        target_source=target_source,
+        next_drive=next_drive.isoformat() if next_drive else None,
+    )
 
 
 @pyscript_compile
@@ -290,11 +315,16 @@ EVScheduleEntry = define_interfaces()
 
 @pyscript_compile
 def parse_full_schedule(
-    schedule_data: dict[str, list[dict[str, Any]]], default_required_soc: float
+    schedule_data: dict[str, list[dict[str, Any]]], default_required_soc: float, t_now=None
 ) -> list["EVScheduleEntry"]:
-    from datetime import date, datetime
+    from datetime import datetime
 
-    today = date.today()
+    # Freeze runtime time outside this compiled helper.  Pyscript runtime
+    # helpers such as ``now`` are not safe to resolve from compiled code.
+    if t_now is None:
+        raise ValueError("parse_full_schedule requires t_now")
+    t_now = with_timezone(t_now)
+    today = t_now.date()
     today_weekday = today.weekday()
     day_map = {
         name: i for i, name in enumerate(["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"])
@@ -314,10 +344,18 @@ def parse_full_schedule(
             distance = event.get("data", {}).get("distance")  # km
             soc = get_drive_required_soc(soc, distance, default_required_soc)
 
+            event_start = with_timezone(datetime.combine(event_date, event["from"]))
+            event_end = with_timezone(datetime.combine(event_date, event["to"]))
+            if event_end <= event_start:
+                event_end += timedelta(days=1)
+            if event_end <= t_now:
+                event_start += timedelta(days=7)
+                event_end += timedelta(days=7)
+
             entries.append(
                 EVScheduleEntry(
-                    start=with_timezone(datetime.combine(event_date, event["from"])),
-                    end=with_timezone(datetime.combine(event_date, event["to"])),
+                    start=event_start,
+                    end=event_end,
                     required_soc=float(soc) if soc is not None else None,
                     distance=float(distance) if distance is not None else None,
                 )
@@ -326,12 +364,14 @@ def parse_full_schedule(
     return sorted(entries, key=lambda x: x.start)
 
 
-def get_ev_schedule():
+def get_ev_schedule(t_now=None):
+    if t_now is None:
+        t_now = now()
     ev_schedule = (schedule.get_schedule(entity_id=EV.planned_drives) or {}).get(
         EV.planned_drives, {}
     )
     ev_required_soc = get(EV.required_soc, 80)
-    return parse_full_schedule(ev_schedule, default_required_soc=ev_required_soc)
+    return parse_full_schedule(ev_schedule, default_required_soc=ev_required_soc, t_now=t_now)
 
 
 @time_trigger
@@ -369,13 +409,24 @@ async def auto_ev_charging():
 
     battery_soc = get(Battery.soc, 0)
 
-    pv_total_power = get(PVProduction.power_now_estimated, 0)  # in W
+    # Live actuation must use measured PV. Forecast PV is for planning only and
+    # can be badly wrong under fast-moving clouds.
+    pv_total_power = get(PVProduction.total_power, 0)  # in W
 
     # target excess is the amount of power requested by the home battery to be able to cover the house loads in the near future
     # it is dynamically updated by a separate automation
     excess_target = get(Excess.target, 0)  # in W
     # surplus energy is the amount of energy that is likely available after accounting for house loads in the near future
     surplus_energy = get(House.energy_surplus, 0)  # in kWh
+    protected_battery_floor_kwh = float(
+        get_attr(House.energy_surplus, "protected_battery_floor", 0) or 0
+    )
+    battery_capacity_kwh = get(Battery.capacity, 0)
+    battery_floor_soc = (
+        protected_battery_floor_kwh / battery_capacity_kwh * 100
+        if battery_capacity_kwh > 0
+        else 0
+    )
 
     # this is the maximum charge current that the vehicle should be charge with right now
     configured_current = get(Charger.current_setting, default=None, mapper=float)
@@ -404,7 +455,7 @@ async def auto_ev_charging():
     msg = ""
     # next drive is the point in time where the user needs to have the car charged to the required soc
     ongoing = get(EV.planned_drives, False)
-    if ev_schedule is not None:
+    if ev_schedule:
         ongoing, next_drive_event = get_ongoing_and_next_drive(ev_schedule, t_now)
         if next_drive_event:
             next_drive = next_drive_event.start
@@ -444,7 +495,7 @@ async def auto_ev_charging():
         f"Excess: {excess_power:.0f} W, Target: {excess_target:.0f} W "
         f"Energy needed: {energy_needed:.2f} kWh, Time needed: {min_hours_needed:.2f}h, "
         f"low price: {low_price}, high price: {high_price}, next drive: {next_drive}, "
-        f"EV charge limit: {ev_charge_limit:.0f}%"
+        f"EV charge limit: {ev_charge_limit:.0f}%, protected battery floor: {battery_floor_soc:.1f}%"
     )
 
     #  -------------------------- Charging Strategy Logic -----------------------------------
@@ -475,6 +526,7 @@ async def auto_ev_charging():
         inverter_mode=inverter_mode,
         battery_force_charge=battery_force_charge,
         wallbox_power=wallbox_power,
+        battery_floor_soc=battery_floor_soc,
     )
 
     hours_available_to_charge = ((next_drive - t_now).total_seconds() / 3600) if next_drive else 999

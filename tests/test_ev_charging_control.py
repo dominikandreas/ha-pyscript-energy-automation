@@ -1,8 +1,10 @@
 import ast
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time, timedelta, timezone
+from math import pi
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 
 class _EVConst:
@@ -12,6 +14,7 @@ class _EVConst:
     min_current = 6
     min_phases = 1
     voltage = 230
+    charge_efficiency = 0.9
 
 
 class _Victron:
@@ -41,6 +44,7 @@ def _load_energy_core_symbols():
         "get_forecast_drive_context",
         "get_ongoing_and_next_drive",
         "is_vehicle_present_during_active_drive",
+        "is_forecast_ev_available",
         "_get_charge_action",
     }
     selected = []
@@ -105,6 +109,102 @@ class EVChargingControlTests(unittest.TestCase):
         self.assertEqual(action, self.core["ChargeAction"].on)
         self.assertEqual(charge_mode, self.core["ChargeMode"].surplus)
         self.assertEqual((phases, current), (1, 11))
+
+    def test_negative_battery_discharge_target_is_not_ev_surplus(self):
+        available_power = self.core["calculate_available_ev_power"](
+            excess_power=-457,
+            excess_target=-2401,
+            wallbox_power=0,
+            is_charging=False,
+        )
+
+        self.assertEqual(available_power, -457)
+
+    def test_protected_home_battery_floor_blocks_optional_ev_charge(self):
+        t_now = datetime(2026, 8, 19, 11, 0, tzinfo=timezone.utc)
+        action, _phases, _current, reason, mode = self.core["_get_charge_action"](
+            next_drive=t_now + timedelta(days=6),
+            current_soc=47,
+            required_soc=80,
+            energy_needed=19.8,
+            excess_power=2500,
+            excess_target=-1500,
+            surplus_energy=5,
+            smart_charge_limit=80,
+            smart_limiter_active=True,
+            configured_phases=1,
+            configured_current=6,
+            is_low_price=False,
+            pv_total_power=3000,
+            battery_soc=12.1,
+            is_charging=False,
+            t_now=t_now,
+            inverter_mode="off",
+            battery_force_charge=False,
+            wallbox_power=0,
+            battery_floor_soc=18.125,
+        )
+
+        self.assertEqual(action, self.core["ChargeAction"].off)
+        self.assertEqual(mode, self.core["ChargeMode"].hard_stop)
+        self.assertIn("Protected home battery floor", reason)
+
+    def test_trip_emergency_overrides_home_battery_floor(self):
+        t_now = datetime(2026, 8, 19, 11, 0, tzinfo=timezone.utc)
+        action, phases, current, _reason, mode = self.core["_get_charge_action"](
+            next_drive=t_now + timedelta(hours=1),
+            current_soc=47,
+            required_soc=80,
+            energy_needed=19.8,
+            excess_power=-500,
+            excess_target=500,
+            surplus_energy=0,
+            smart_charge_limit=100,
+            smart_limiter_active=False,
+            configured_phases=1,
+            configured_current=6,
+            is_low_price=False,
+            pv_total_power=0,
+            battery_soc=12.1,
+            is_charging=False,
+            t_now=t_now,
+            inverter_mode="off",
+            battery_force_charge=False,
+            wallbox_power=0,
+            battery_floor_soc=18.125,
+        )
+
+        self.assertEqual(action, self.core["ChargeAction"].on)
+        self.assertEqual(mode, self.core["ChargeMode"].required)
+        self.assertEqual((phases, current), (3, 16))
+
+    def test_cheap_required_window_overrides_home_battery_floor(self):
+        t_now = datetime(2026, 8, 19, 1, 0, tzinfo=timezone.utc)
+        action, _phases, _current, _reason, mode = self.core["_get_charge_action"](
+            next_drive=t_now + timedelta(hours=12),
+            current_soc=47,
+            required_soc=80,
+            energy_needed=19.8,
+            excess_power=-500,
+            excess_target=500,
+            surplus_energy=0,
+            smart_charge_limit=100,
+            smart_limiter_active=False,
+            configured_phases=3,
+            configured_current=6,
+            is_low_price=True,
+            pv_total_power=0,
+            battery_soc=12.1,
+            is_charging=False,
+            t_now=t_now,
+            inverter_mode="off",
+            battery_force_charge=False,
+            wallbox_power=0,
+            battery_floor_soc=18.125,
+        )
+
+        self.assertEqual(action, self.core["ChargeAction"].on)
+        self.assertEqual(mode, self.core["ChargeMode"].required)
 
     def test_active_drive_does_not_hide_the_following_departure(self):
         t_now = datetime(2026, 8, 17, 18, 10, tzinfo=timezone.utc)
@@ -193,6 +293,18 @@ class EVChargingControlTests(unittest.TestCase):
         )
 
         self.assertTrue(vehicle_present)
+
+    def test_forecast_keeps_initially_present_ev_available_after_simulated_stop(self):
+        t_now = datetime(2026, 8, 19, 11, 0, tzinfo=timezone.utc)
+        available = self.core["is_forecast_ev_available"](
+            ev_schedule=[],
+            t_now=t_now,
+            forecast_time=t_now + timedelta(days=1),
+            ongoing_drive=None,
+            vehicle_present_now=True,
+        )
+
+        self.assertTrue(available)
 
     def test_required_charge_bucket_caps_at_required_soc(self):
         required_limit = self.core["get_ev_charge_energy_limit"](
@@ -286,7 +398,7 @@ class EVChargingControlTests(unittest.TestCase):
         self.assertEqual(applied_currents[-1], 0)
         self.assertAlmostEqual(cumulative_grid_import_kwh, 0.0)
 
-    def test_evening_surplus_charge_settles_before_battery_floor_import(self):
+    def test_evening_negative_target_does_not_transfer_home_battery_to_ev(self):
         buckets = [
             (17, 0, 2049.4, 844.0, -2443.829),
             (17, 30, 1711.2, 844.0, -2269.544),
@@ -338,9 +450,126 @@ class EVChargingControlTests(unittest.TestCase):
             battery_energy -= battery_discharge_w * 0.5 / 1000
             cumulative_grid_import_kwh += grid_import_w * 0.5 / 1000
 
-        self.assertEqual(applied_currents, [15, 14, 0, 0, 0, 0, 0])
+        self.assertEqual(applied_currents, [0, 0, 0, 0, 0, 0, 0])
+        # Only the ordinary house deficit may discharge the battery.
+        self.assertAlmostEqual(battery_energy, 18.4252)
         self.assertGreater(battery_energy, battery_floor)
         self.assertAlmostEqual(cumulative_grid_import_kwh, 0.0)
+
+    def test_same_weekday_completed_drive_rolls_to_next_week(self):
+        project_root = Path(__file__).parents[1]
+        t_now = datetime(2026, 8, 18, 21, 0, tzinfo=timezone.utc)
+        schedule_data = {
+            "tuesday": [
+                {
+                    "from": time(14, 30),
+                    "to": time(18, 30),
+                    "data": {"required": 85, "distance": 265.625},
+                }
+            ]
+        }
+
+        for relative_path in ("ev_charging.py", "energy.py"):
+            source_path = project_root / relative_path
+            tree = ast.parse(source_path.read_text())
+            parser = next(
+                node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "parse_full_schedule"
+            )
+            parser.decorator_list = []
+            namespace = {
+                "Any": Any,
+                "datetime": datetime,
+                "timedelta": timedelta,
+                "with_timezone": lambda value: value.replace(tzinfo=timezone.utc)
+                if value.tzinfo is None
+                else value,
+                "now": lambda: t_now,
+                "get_drive_required_soc": self.core["get_drive_required_soc"],
+                "EVScheduleEntry": lambda **kwargs: SimpleNamespace(**kwargs),
+            }
+            module = ast.Module(body=[parser], type_ignores=[])
+            exec(compile(ast.fix_missing_locations(module), str(source_path), "exec"), namespace)
+            entries = namespace["parse_full_schedule"](schedule_data, 65, t_now=t_now)
+
+            self.assertEqual(entries[0].start, datetime(2026, 8, 25, 14, 30, tzinfo=timezone.utc))
+            self.assertEqual(entries[0].end, datetime(2026, 8, 25, 18, 30, tzinfo=timezone.utc))
+
+    def test_provider_forecast_is_extended_through_scheduled_drive_horizon(self):
+        source_path = Path(__file__).parents[1] / "energy.py"
+        tree = ast.parse(source_path.read_text())
+        extender = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "extend_pv_forecast_to_horizon"
+        )
+        extender.decorator_list = []
+        namespace = {
+            "datetime": datetime,
+            "PVForecastWithPrices": lambda period_start, pv_estimate, price_per_kwh: SimpleNamespace(
+                period_start=period_start,
+                pv_estimate=pv_estimate,
+                price_per_kwh=price_per_kwh,
+            )
+        }
+        module = ast.Module(body=[extender], type_ignores=[])
+        exec(compile(ast.fix_missing_locations(module), str(source_path), "exec"), namespace)
+
+        start = datetime(2026, 8, 23, 0, 0, tzinfo=timezone.utc)
+        source = [
+            namespace["PVForecastWithPrices"](start, 0.4, 0.10),
+            namespace["PVForecastWithPrices"](start + timedelta(minutes=30), 0.1, 0.11),
+        ]
+        t_end = datetime(2026, 8, 24, 1, 0, tzinfo=timezone.utc)
+        projected = namespace["extend_pv_forecast_to_horizon"](
+            source,
+            t_end,
+            {(23, 1, 0): 0.08},
+        )
+
+        self.assertEqual(projected[-1].period_start, datetime(2026, 8, 24, 0, 30, tzinfo=timezone.utc))
+        self.assertEqual(projected[2].price_per_kwh, 0.08)
+        self.assertEqual(projected[2].pv_estimate, 0)
+        self.assertEqual(projected[-1].pv_estimate, 0.1)
+
+    def test_pv_reserve_targets_are_continuous_across_old_thresholds(self):
+        source_path = Path(__file__).parents[1] / "energy.py"
+        tree = ast.parse(source_path.read_text())
+        selected = []
+        for name in ("get_low_pv_reserve_soc", "_get_excess_target"):
+            node = next(
+                node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == name
+            )
+            node.decorator_list = []
+            selected.append(node)
+        namespace = {
+            "clip": _clip,
+            "pi": pi,
+            "with_timezone": lambda value: value,
+        }
+        module = ast.Module(body=selected, type_ignores=[])
+        exec(compile(ast.fix_missing_locations(module), str(source_path), "exec"), namespace)
+
+        reserve = namespace["get_low_pv_reserve_soc"]
+        self.assertEqual(reserve(1000, 740, False), 15)
+        self.assertAlmostEqual(reserve(1000, 875, False), 7.5)
+        self.assertEqual(reserve(1000, 1000, False), 0)
+
+        t_now = datetime(2026, 8, 19, 10, 30, tzinfo=timezone.utc)
+        targets = [
+            namespace["_get_excess_target"](
+                battery_target_soc=5,
+                battery_soc=13,
+                ev_required_soc=80,
+                ev_is_charging=True,
+                next_planned_drive=t_now + timedelta(days=6),
+                pv_power=pv_power,
+                ev_soc=47,
+                t_now=t_now,
+                efficient_discharge=True,
+            )
+            for pv_power in (1999, 2001)
+        ]
+        self.assertLess(abs(targets[1] - targets[0]), 10)
 
     def test_live_and_forecast_use_the_shared_schedule_context(self):
         project_root = Path(__file__).parents[1]
@@ -380,6 +609,7 @@ class EVChargingControlTests(unittest.TestCase):
         self.assertGreaterEqual(len(forecast_context_calls), 2)
         for node in (forecast_wrapper_node, forecast_node):
             self.assertIn("charger_ready_since", [argument.arg for argument in node.args.args])
+            self.assertIn("ev_plugged_in", [argument.arg for argument in node.args.args])
         forecast_delegate = next(
             call
             for call in ast.walk(forecast_wrapper_node)
@@ -388,6 +618,7 @@ class EVChargingControlTests(unittest.TestCase):
             and call.func.id == "_forecast"
         )
         self.assertIn("charger_ready_since", [keyword.arg for keyword in forecast_delegate.keywords])
+        self.assertIn("ev_plugged_in", [keyword.arg for keyword in forecast_delegate.keywords])
         forecast_charge_call = next(
             call
             for call in ast.walk(forecast_node)
@@ -416,6 +647,32 @@ class EVChargingControlTests(unittest.TestCase):
                     for node in ast.walk(parser)
                 )
             )
+            self.assertFalse(
+                any(
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id == "now"
+                    for node in ast.walk(parser)
+                ),
+                "compiled schedule parsers must receive a frozen t_now from runtime code",
+            )
+
+        live_pv_assignment = next(
+            node
+            for node in ast.walk(live_node)
+            if isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Name) and target.id == "pv_total_power" for target in node.targets)
+        )
+        self.assertIn("PVProduction.total_power", ast.unparse(live_pv_assignment.value))
+
+        forecast_surplus_source = ast.unparse(forecast_surplus_node)
+        self.assertIn("next_departure.end + timedelta(hours=6)", forecast_surplus_source)
+        self.assertIn("forecast_ev_charging_enabled", forecast_surplus_source)
+        self.assertGreaterEqual(
+            forecast_surplus_source.count("with_ev_charging=forecast_ev_charging_enabled"),
+            2,
+        )
+        self.assertIn("EVConst.charge_efficiency", ast.unparse(forecast_node))
 
 
 if __name__ == "__main__":
