@@ -153,6 +153,12 @@ power_w_attributes = {
     "state_class": "measurement",
 }
 
+grid_setpoint_basis_attributes = {
+    **power_w_attributes,
+    "min": -5500,
+    "max": 5500,
+}
+
 power_kw_attributes = {
     "unit_of_measurement": "kW",
     "device_class": "power",
@@ -2752,7 +2758,7 @@ def auto_setpoint_target():
             key: [getattr(entry, key) for entry in unified_forecast.detail]
             for key in ForecastEntry.__annotations__.keys()
         }
-        set_state(Grid.power_setpoint_basis, current_target, **power_w_attributes)
+        set_state(Grid.power_setpoint_basis, current_target, **grid_setpoint_basis_attributes)
         set_state(
             Grid.power_setpoint_target,
             current_target,
@@ -2844,7 +2850,7 @@ def auto_setpoint_target():
         set_state(
             Grid.power_setpoint_basis,
             fallback_setpoint,
-            **power_w_attributes,
+            **grid_setpoint_basis_attributes,
         )
         return
 
@@ -3302,7 +3308,7 @@ def auto_setpoint_target():
     set_state(
         Grid.power_setpoint_basis,
         setpoint_result.setpoint,
-        **power_w_attributes,
+        **grid_setpoint_basis_attributes,
     )
 
     detail_with_ev_vectorized = {

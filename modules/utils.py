@@ -231,6 +231,13 @@ def write_output_states(state_attributes):
                 domain_states[domain][state_id] = v
                 del state_attributes[k]
 
+    for state_id, attributes in domain_states.get("input_number", {}).items():
+        missing = [key for key in ("min", "max") if key not in attributes]
+        if missing:
+            raise ValueError(
+                f"Refusing to write invalid input_number.{state_id}: missing {', '.join(missing)}"
+            )
+
     for domain, states in domain_states.items():
         write_entity_definitions(domain, states)
 
@@ -280,7 +287,18 @@ def load_output_states():
 
 
 class OutputStateRegistry:
-    _attribute_keys = {"device_class", "friendly_name", "icon", "state_class", "unit_of_measurement", "min", "max"}
+    _attribute_keys = {
+        "device_class",
+        "friendly_name",
+        "icon",
+        "state_class",
+        "unit_of_measurement",
+        "min",
+        "max",
+        "step",
+        "mode",
+        "initial",
+    }
 
     def __init__(self):
         loaded = await hass.async_add_executor_job(load_output_states)
@@ -292,23 +310,36 @@ class OutputStateRegistry:
         for k, v in loaded.items():
             self._state_attributes[k] = v
 
-        self._last_written = {*self._state_attributes}
+        self._last_written = self.get_all_states()
 
     def set(self, id, attributes):
-        # if id.startswith("input_number") and not ("min" in attributes and "max" in attributes):
-        #     raise ValueError("input_number must have min and max attributes set")
-        self._state_attributes[id] = {k: v for k, v in attributes.items() if k in self._attribute_keys}
+        # Runtime state updates often provide only measurement metadata.  Merge
+        # that metadata into the loaded entity schema so required input_number
+        # bounds are not erased by a later set_state() call.
+        merged = {
+            k: v
+            for k, v in self._state_attributes.get(id, {}).items()
+            if k in self._attribute_keys
+        }
+        merged.update({k: v for k, v in attributes.items() if k in self._attribute_keys})
+        if id.startswith("input_number") and not ("min" in merged and "max" in merged):
+            raise ValueError(f"input_number {id} must define min and max attributes")
+        self._state_attributes[id] = merged
 
     def write_if_necessary(self):
         all_states = self.get_all_states()
-        state_keys = set(all_states.keys())
-        if self._last_written_keys is None or state_keys != self._last_written_keys:
-            awaitable = hass.async_add_executor_job(write_output_states, all_states)
-            self._last_written_keys = state_keys
-            return awaitable
+        if all_states != self._last_written:
+            self._last_written = {key: dict(value) for key, value in all_states.items()}
+            self._last_written_keys = set(all_states.keys())
+            # write_output_states normalizes its argument in place on an
+            # executor thread.  Never share the registry snapshot with it.
+            write_payload = {key: dict(value) for key, value in all_states.items()}
+            return hass.async_add_executor_job(write_output_states, write_payload)
 
     def get_all_states(self) -> dict:
-        return dict(**self._state_attributes)
+        # The writer normalizes its input in place.  Return independent value
+        # dictionaries so writing YAML cannot mutate the registry snapshot.
+        return {key: dict(value) for key, value in self._state_attributes.items()}
 
 
 output_state_registry = OutputStateRegistry()
