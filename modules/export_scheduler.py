@@ -94,10 +94,11 @@ def get_optional_export_grid_target(
     max_grid_export_w: float,
     neutral_grid_target_w: float,
     ev_is_charging: bool = False,
+    ev_requires_charge: bool = False,
 ) -> float:
     """Apply one optional export request to the shared neutral grid target."""
 
-    if ev_is_charging:
+    if ev_is_charging or ev_requires_charge:
         return neutral_grid_target_w
 
     optional_export_power_w = max(0.0, optional_export_power_w)
@@ -107,6 +108,20 @@ def get_optional_export_grid_target(
         -max_grid_export_w,
         min(neutral_grid_target_w, requested_target_w),
     )
+
+
+def is_ev_available_for_charging(
+    charger_ready: bool,
+    charger_control_enabled: bool,
+    ev_is_charging: bool,
+) -> bool:
+    """Return whether the home wallbox can presently serve the EV.
+
+    ``charger_ready`` is false while a charging transaction is active, so it
+    must never be used on its own as the forecast-availability signal.
+    """
+
+    return bool(charger_ready or charger_control_enabled or ev_is_charging)
 
 
 def _is_quiet_hour(period_start: datetime, quiet_start_hour: int, quiet_end_hour: int) -> bool:

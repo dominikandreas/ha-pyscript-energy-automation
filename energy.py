@@ -46,6 +46,7 @@ if TYPE_CHECKING:
         build_unified_export_schedule,
         fit_export_schedule_to_energy_budget,
         get_optional_export_grid_target,
+        is_ev_available_for_charging,
     )
 
     # These are provided pyscript and defined for type inference only. They do not need to
@@ -125,6 +126,7 @@ else:
         build_unified_export_schedule,
         fit_export_schedule_to_energy_budget,
         get_optional_export_grid_target,
+        is_ev_available_for_charging,
     )
     from electricity_price import is_low_price, get_price
 
@@ -2261,6 +2263,10 @@ def get_pv_forecast_with_prices(t_start: datetime, t_end: datetime, epex_prices:
     f"or {Automation.unified_export_scheduler} or {Automation.efficient_export_power} "
     f"or {Automation.quiet_export_price_tolerance}"
 )
+@state_trigger(EV.is_charging)
+@state_trigger(EV.energy_needed)
+@state_trigger(Charger.ready)
+@state_trigger(Charger.control_switch)
 def auto_setpoint_target():
     task.unique("auto setpoint target", kill_me=True)
     t_now = now()
@@ -2324,10 +2330,16 @@ def auto_setpoint_target():
     drive_ongoing = next(iter([s for s in ev_schedule if s.start <= t_now < s.end]), None)
     ev_energy = get(EV.energy, EVConst.ev_capacity)
 
-    wallbox_connected = get(Charger.ready, False)
+    wallbox_connected = is_ev_available_for_charging(
+        charger_ready=get(Charger.ready, False),
+        charger_control_enabled=get(Charger.control_switch, False),
+        ev_is_charging=get(EV.is_charging, False),
+    )
     assume_able_to_charge_on_arrival = get(EV.able_to_charge_on_arrival, False)
 
-    with_ev_charging = wallbox_connected or drive_ongoing and assume_able_to_charge_on_arrival
+    with_ev_charging = wallbox_connected or (
+        drive_ongoing and assume_able_to_charge_on_arrival
+    )
 
     def forecast_setpoint_local(
         pv_forecast,
@@ -2777,6 +2789,8 @@ def auto_setpoint_target():
             planned_house_power_w=round(current_detail.house_power, 1),
             planned_pv_power_w=round(current_detail.pv_estimate, 1),
             planned_ev_charge_power_w=round(current_detail.ev_charge_power, 1),
+            ev_available_for_charging=bool(wallbox_connected),
+            ev_energy_needed_kwh=round(get(EV.energy_needed, 0), 2),
             max_battery_power_target=max_battery_discharge_w,
             max_grid_export_w=hard_max_grid_export_w,
             planned_max_grid_export_w=planned_max_grid_export_w,
@@ -3333,6 +3347,7 @@ def auto_setpoint_target():
 
 
 prev_house_loads = None
+prev_optional_export_ev_hold = None
 
 
 @time_trigger
@@ -3345,6 +3360,7 @@ def auto_apply_setpoint():
         return
 
     global prev_house_loads
+    global prev_optional_export_ev_hold
     if prev_house_loads is None:
         prev_house_loads = get(House.loads, 500)
 
@@ -3360,6 +3376,27 @@ def auto_apply_setpoint():
     setpoint_target = get(Grid.power_setpoint_target, 0)
     max_setpoint_target = get(Grid.max_feedin_target, 0)
     unified_scheduler_active = get_attr(Grid.power_setpoint_target, "unified_scheduler_active", False)
+    ev_is_charging = get(EV.is_charging, False)
+    ev_available_for_charging = is_ev_available_for_charging(
+        charger_ready=get(Charger.ready, False),
+        charger_control_enabled=get(Charger.control_switch, False),
+        ev_is_charging=ev_is_charging,
+    )
+    ev_energy_needed = get(EV.energy_needed, 0)
+    ev_requires_charge = ev_available_for_charging and ev_energy_needed > 0.05
+    optional_export_ev_hold = unified_scheduler_active and (
+        ev_is_charging or ev_requires_charge
+    )
+
+    if optional_export_ev_hold != prev_optional_export_ev_hold:
+        if optional_export_ev_hold:
+            log.warning(
+                f"Holding optional battery export neutral for EV: charging={ev_is_charging}, "
+                f"available={ev_available_for_charging}, energy needed={ev_energy_needed:.2f} kWh"
+            )
+        elif prev_optional_export_ev_hold:
+            log.warning("Releasing optional battery export EV hold")
+        prev_optional_export_ev_hold = optional_export_ev_hold
 
     if unified_scheduler_active:
         planned_optional_export_power_w = get_attr(
@@ -3376,7 +3413,8 @@ def auto_apply_setpoint():
             optional_export_power_w=planned_optional_export_power_w,
             max_grid_export_w=min(planned_max_grid_export_w, max_setpoint_target),
             neutral_grid_target_w=max_setpoint,
-            ev_is_charging=get(EV.is_charging, False),
+            ev_is_charging=ev_is_charging,
+            ev_requires_charge=ev_requires_charge,
         )
         msg += (
             f" unified target {setpoint:.0f} W from budgeted optional export "
@@ -3390,7 +3428,6 @@ def auto_apply_setpoint():
         setpoint = min(max_setpoint, setpoint_target)
         msg += f" updated setpoint to {setpoint}"
 
-    ev_is_charging = get(EV.is_charging, False)
     if ev_is_charging:
         msg = f"setpoint adjusted to {max_setpoint} since EV is charging"
         setpoint = max_setpoint
@@ -3415,7 +3452,6 @@ def auto_apply_setpoint():
         max_battery_power_target,
     )
 
-    ev_energy_needed = get(EV.energy_needed, 0)
     min_ev_charge_power = EVConst.voltage * EVConst.min_current
     ev_has_pv_headroom = pv_power > house_loads + min_ev_charge_power
     protect_opportunistic_ev_from_battery = ev_is_charging and ev_energy_needed <= 0 and ev_has_pv_headroom

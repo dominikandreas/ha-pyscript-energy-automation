@@ -8,6 +8,7 @@ from modules.export_scheduler import (
     build_unified_export_schedule,
     fit_export_schedule_to_energy_budget,
     get_optional_export_grid_target,
+    is_ev_available_for_charging,
 )
 
 
@@ -285,6 +286,36 @@ class UnifiedExportSchedulerTests(unittest.TestCase):
                 ev_is_charging=True,
             ),
             -100.0,
+        )
+
+    def test_optional_export_target_is_neutral_while_connected_ev_needs_charge(self):
+        self.assertEqual(
+            get_optional_export_grid_target(
+                optional_export_power_w=5250.0,
+                max_grid_export_w=5350.0,
+                neutral_grid_target_w=-100.0,
+                ev_is_charging=False,
+                ev_requires_charge=True,
+            ),
+            -100.0,
+        )
+
+    def test_active_charge_control_counts_as_ev_available(self):
+        self.assertTrue(
+            is_ev_available_for_charging(
+                charger_ready=False,
+                charger_control_enabled=True,
+                ev_is_charging=True,
+            )
+        )
+
+    def test_ready_charger_counts_as_ev_available_after_charge_stops(self):
+        self.assertTrue(
+            is_ev_available_for_charging(
+                charger_ready=True,
+                charger_control_enabled=False,
+                ev_is_charging=False,
+            )
         )
 
     def test_reserve_trajectory_tracks_deficit_until_solar_meets_load(self):

@@ -391,6 +391,44 @@ class SetpointControlTests(unittest.TestCase):
         ]
         self.assertEqual(planned_battery_reads, [])
 
+        call_keywords = {keyword.arg: keyword.value for keyword in calls[0].keywords}
+        self.assertIsInstance(call_keywords.get("ev_requires_charge"), ast.Name)
+        self.assertEqual(call_keywords["ev_requires_charge"].id, "ev_requires_charge")
+
+    def test_setpoint_planner_tracks_ev_availability_transitions(self):
+        source = Path(__file__).parents[1].joinpath("energy.py").read_text()
+        tree = ast.parse(source)
+        target_node = next(
+            node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "auto_setpoint_target"
+        )
+
+        trigger_entities = {
+            ast.unparse(decorator.args[0])
+            for decorator in target_node.decorator_list
+            if isinstance(decorator, ast.Call)
+            and isinstance(decorator.func, ast.Name)
+            and decorator.func.id == "state_trigger"
+            and decorator.args
+            and not isinstance(decorator.args[0], ast.JoinedStr)
+        }
+        self.assertTrue(
+            {"EV.is_charging", "EV.energy_needed", "Charger.ready", "Charger.control_switch"}
+            <= trigger_entities
+        )
+
+        availability_calls = [
+            node
+            for node in ast.walk(target_node)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "is_ev_available_for_charging"
+        ]
+        self.assertEqual(len(availability_calls), 1)
+        availability_source = ast.unparse(availability_calls[0])
+        self.assertIn("Charger.ready", availability_source)
+        self.assertIn("Charger.control_switch", availability_source)
+        self.assertIn("EV.is_charging", availability_source)
+
     def test_unified_live_mode_enforces_the_planned_battery_floor(self):
         source = Path(__file__).parents[1].joinpath("modules/victron.py").read_text()
         tree = ast.parse(source)
