@@ -9,6 +9,7 @@ from modules.export_scheduler import (
     fit_export_schedule_to_energy_budget,
     get_optional_export_grid_target,
     is_ev_available_for_charging,
+    is_ev_plan_fresh,
 )
 
 
@@ -288,16 +289,84 @@ class UnifiedExportSchedulerTests(unittest.TestCase):
             -100.0,
         )
 
-    def test_optional_export_target_is_neutral_while_connected_ev_needs_charge(self):
+    def test_stale_charging_transition_holds_optional_export_neutral(self):
+        plan_time = datetime(2026, 8, 20, 10, 46, 20, tzinfo=timezone.utc)
+        plan_is_fresh = is_ev_plan_fresh(
+            planned_ev_available=True,
+            planned_ev_is_charging=True,
+            planned_ev_energy_needed_kwh=11.4,
+            plan_calculated_at=plan_time,
+            live_ev_available=True,
+            live_ev_is_charging=False,
+            live_ev_energy_needed_kwh=11.4,
+            current_time=plan_time + timedelta(seconds=11),
+        )
+
+        self.assertFalse(plan_is_fresh)
         self.assertEqual(
             get_optional_export_grid_target(
                 optional_export_power_w=5250.0,
                 max_grid_export_w=5350.0,
                 neutral_grid_target_w=-100.0,
                 ev_is_charging=False,
-                ev_requires_charge=True,
+                hold_optional_export=not plan_is_fresh,
             ),
             -100.0,
+        )
+
+    def test_refreshed_plan_allows_safe_export_while_ev_still_needs_charge(self):
+        plan_time = datetime(2026, 8, 20, 10, 46, 31, tzinfo=timezone.utc)
+        plan_is_fresh = is_ev_plan_fresh(
+            planned_ev_available=True,
+            planned_ev_is_charging=False,
+            planned_ev_energy_needed_kwh=1.0,
+            plan_calculated_at=plan_time.isoformat(),
+            live_ev_available=True,
+            live_ev_is_charging=False,
+            live_ev_energy_needed_kwh=1.0,
+            current_time=plan_time + timedelta(seconds=2),
+        )
+
+        self.assertTrue(plan_is_fresh)
+        self.assertEqual(
+            get_optional_export_grid_target(
+                optional_export_power_w=5250.0,
+                max_grid_export_w=5350.0,
+                neutral_grid_target_w=-100.0,
+                ev_is_charging=False,
+                hold_optional_export=not plan_is_fresh,
+            ),
+            -5350.0,
+        )
+
+    def test_aged_plan_holds_optional_export(self):
+        plan_time = datetime(2026, 8, 20, 12, 0, tzinfo=timezone.utc)
+        self.assertFalse(
+            is_ev_plan_fresh(
+                planned_ev_available=True,
+                planned_ev_is_charging=False,
+                planned_ev_energy_needed_kwh=1.0,
+                plan_calculated_at=plan_time,
+                live_ev_available=True,
+                live_ev_is_charging=False,
+                live_ev_energy_needed_kwh=1.0,
+                current_time=plan_time + timedelta(seconds=181),
+            )
+        )
+
+    def test_changed_ev_energy_demand_stales_plan(self):
+        plan_time = datetime(2026, 8, 20, 12, 0, tzinfo=timezone.utc)
+        self.assertFalse(
+            is_ev_plan_fresh(
+                planned_ev_available=True,
+                planned_ev_is_charging=False,
+                planned_ev_energy_needed_kwh=1.0,
+                plan_calculated_at=plan_time,
+                live_ev_available=True,
+                live_ev_is_charging=False,
+                live_ev_energy_needed_kwh=1.2,
+                current_time=plan_time + timedelta(seconds=2),
+            )
         )
 
     def test_active_charge_control_counts_as_ev_available(self):

@@ -392,8 +392,24 @@ class SetpointControlTests(unittest.TestCase):
         self.assertEqual(planned_battery_reads, [])
 
         call_keywords = {keyword.arg: keyword.value for keyword in calls[0].keywords}
-        self.assertIsInstance(call_keywords.get("ev_requires_charge"), ast.Name)
-        self.assertEqual(call_keywords["ev_requires_charge"].id, "ev_requires_charge")
+        self.assertIsInstance(call_keywords.get("hold_optional_export"), ast.Name)
+        self.assertEqual(
+            call_keywords["hold_optional_export"].id,
+            "optional_export_ev_plan_hold",
+        )
+        self.assertNotIn(
+            "ev_requires_charge",
+            {node.id for node in ast.walk(apply_node) if isinstance(node, ast.Name)},
+        )
+
+        freshness_calls = [
+            node
+            for node in ast.walk(apply_node)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "is_ev_plan_fresh"
+        ]
+        self.assertEqual(len(freshness_calls), 1)
 
     def test_setpoint_planner_tracks_ev_availability_transitions(self):
         source = Path(__file__).parents[1].joinpath("energy.py").read_text()
@@ -427,7 +443,37 @@ class SetpointControlTests(unittest.TestCase):
         availability_source = ast.unparse(availability_calls[0])
         self.assertIn("Charger.ready", availability_source)
         self.assertIn("Charger.control_switch", availability_source)
-        self.assertIn("EV.is_charging", availability_source)
+        self.assertIn("ev_is_charging", availability_source)
+
+        charging_snapshot_assignments = [
+            node
+            for node in ast.walk(target_node)
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == "ev_is_charging"
+                for target in node.targets
+            )
+            and "EV.is_charging" in ast.unparse(node.value)
+        ]
+        self.assertEqual(len(charging_snapshot_assignments), 1)
+
+        published_signature_attributes = {
+            keyword.arg
+            for node in ast.walk(target_node)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "set_state"
+            for keyword in node.keywords
+        }
+        self.assertTrue(
+            {
+                "ev_available_for_charging",
+                "ev_is_charging",
+                "ev_energy_needed_kwh",
+                "plan_calculated_at",
+            }
+            <= published_signature_attributes
+        )
 
     def test_unified_live_mode_enforces_the_planned_battery_floor(self):
         source = Path(__file__).parents[1].joinpath("modules/victron.py").read_text()

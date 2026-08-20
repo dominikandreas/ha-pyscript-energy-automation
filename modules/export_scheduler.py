@@ -94,11 +94,11 @@ def get_optional_export_grid_target(
     max_grid_export_w: float,
     neutral_grid_target_w: float,
     ev_is_charging: bool = False,
-    ev_requires_charge: bool = False,
+    hold_optional_export: bool = False,
 ) -> float:
     """Apply one optional export request to the shared neutral grid target."""
 
-    if ev_is_charging or ev_requires_charge:
+    if ev_is_charging or hold_optional_export:
         return neutral_grid_target_w
 
     optional_export_power_w = max(0.0, optional_export_power_w)
@@ -122,6 +122,58 @@ def is_ev_available_for_charging(
     """
 
     return bool(charger_ready or charger_control_enabled or ev_is_charging)
+
+
+def is_ev_plan_fresh(
+    planned_ev_available: bool | None,
+    planned_ev_is_charging: bool | None,
+    planned_ev_energy_needed_kwh: float | None,
+    plan_calculated_at: str | datetime | None,
+    live_ev_available: bool,
+    live_ev_is_charging: bool,
+    live_ev_energy_needed_kwh: float,
+    current_time: datetime,
+    max_age_seconds: float = 180.0,
+    energy_tolerance_kwh: float = 0.1,
+) -> bool:
+    """Return whether a published export plan matches the live EV state.
+
+    Optional export is safe only when the scheduler saw the same EV inputs as
+    the live controller.  This closes the short transition window after a
+    charging-state change without blocking export merely because a connected
+    EV still has planned energy demand.
+    """
+
+    if planned_ev_available is None or planned_ev_is_charging is None:
+        return False
+    if bool(planned_ev_available) != bool(live_ev_available):
+        return False
+    if bool(planned_ev_is_charging) != bool(live_ev_is_charging):
+        return False
+
+    try:
+        planned_energy_needed_kwh = float(planned_ev_energy_needed_kwh)
+        live_energy_needed_kwh = float(live_ev_energy_needed_kwh)
+    except (TypeError, ValueError):
+        return False
+    if abs(planned_energy_needed_kwh - live_energy_needed_kwh) > max(
+        0.0,
+        energy_tolerance_kwh,
+    ):
+        return False
+
+    if isinstance(plan_calculated_at, str):
+        try:
+            plan_calculated_at = datetime.fromisoformat(plan_calculated_at)
+        except ValueError:
+            return False
+    if not isinstance(plan_calculated_at, datetime):
+        return False
+    if plan_calculated_at.tzinfo is None or current_time.tzinfo is None:
+        return False
+
+    plan_age_seconds = (current_time - plan_calculated_at).total_seconds()
+    return -5.0 <= plan_age_seconds <= max(0.0, max_age_seconds)
 
 
 def _is_quiet_hour(period_start: datetime, quiet_start_hour: int, quiet_end_hour: int) -> bool:
