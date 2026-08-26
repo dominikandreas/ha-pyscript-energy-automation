@@ -248,6 +248,35 @@ def choose_stable_candidate(
     return best
 
 
+def calculate_auto_max_setpoint(
+    spendable_surplus_kwh: float,
+    horizon_hours: float,
+    minimum_bias_w: float = 20.0,
+    full_bias_w: float = 100.0,
+    rounding_w: float = 10.0,
+) -> float:
+    """Budget a small export bias over the remaining solar-cycle horizon.
+
+    The bias protects against Victron tracking error without turning the
+    neutral setpoint into an unpriced battery-export schedule. The caller
+    supplies the conservative surplus after planned EV charging, so the
+    maximum possible bias energy is covered by energy that is already
+    spendable. Intentional export remains the export scheduler's job.
+    """
+
+    if horizon_hours <= 0:
+        raise ValueError("horizon_hours must be positive")
+    if minimum_bias_w < 0 or full_bias_w < minimum_bias_w:
+        raise ValueError("invalid bias limits")
+    if rounding_w <= 0:
+        raise ValueError("rounding_w must be positive")
+
+    energy_bounded_bias_w = max(0.0, spendable_surplus_kwh) * 1000 / horizon_hours
+    bias_w = max(minimum_bias_w, min(full_bias_w, energy_bounded_bias_w))
+    rounded_bias_w = round(bias_w / rounding_w) * rounding_w
+    return -rounded_bias_w
+
+
 def limit_target_step(desired_w: float, previous_w: float, max_step_w: float = MAX_TARGET_STEP_W) -> float:
     """Apply a symmetric per-cycle slew limit to a grid setpoint target."""
 

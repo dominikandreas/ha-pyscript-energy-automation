@@ -323,10 +323,18 @@ def _get_charge_action(
         )
 
     # if no more charging needed, turn off the charger
-    active_surplus_charge = is_charging and surplus_energy > 0 and current_soc < surplus_charge_limit
+    active_surplus_charge = (
+        is_charging
+        and surplus_available
+        and surplus_energy > 0
+        and current_soc < surplus_charge_limit
+    )
     if energy_needed <= 0 and not (surplus_available and current_soc < surplus_charge_limit) and not active_surplus_charge:
         reason = f"Required SoC reached and no PV surplus charging room, energy_needed={energy_needed:.2f}kWh"
-        return (ChargeAction.off, 1, 6, reason, ChargeMode.idle)
+        # Reaching the trip target while importing is a terminal condition, not
+        # a transient PV deficit.  The live wrapper must bypass surplus
+        # minimum-run and stop-confirmation timers here.
+        return (ChargeAction.off, 1, 6, reason, ChargeMode.hard_stop)
 
     elif smart_limiter_active and current_soc >= smart_charge_limit:
         return (
@@ -359,7 +367,7 @@ def _get_charge_action(
     elif (
         surplus_available
         and (  # prevent charging by discharging from battery when we can excess charge the next day
-            battery_soc > 90 or pv_total_power > 1500 or hours_available_to_charge < 14 or current_soc < 40
+            battery_soc > 90 or pv_total_power > 1500 or current_soc < 40
         )
     ):
         # Hysteresis logic with proper unit conversion (W->kW)

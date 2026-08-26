@@ -4,6 +4,8 @@ from datetime import datetime, timedelta, timezone
 from modules.export_scheduler import (
     ExportSchedulerSlot,
     ReserveTrajectorySlot,
+    adapt_grid_target_to_live_power,
+    build_hard_cap_storage_hold_schedule,
     build_reserve_energy_schedule,
     build_unified_export_schedule,
     fit_export_schedule_to_energy_budget,
@@ -50,6 +52,8 @@ class UnifiedExportSchedulerTests(unittest.TestCase):
         deadline=None,
         tolerance=0.05,
         headroom_reference_price=0.0,
+        headroom_requirements=None,
+        hard_headroom_requirements=None,
     ):
         return build_unified_export_schedule(
             slots=slots,
@@ -63,6 +67,8 @@ class UnifiedExportSchedulerTests(unittest.TestCase):
             quiet_boost_penalty_fraction=tolerance,
             headroom_reference_price=headroom_reference_price,
             headroom_min_price_spread=0.01,
+            headroom_requirements=headroom_requirements,
+            hard_headroom_requirements=hard_headroom_requirements,
         )
 
     def test_evening_incident_replay_uses_the_highest_price_buckets(self):
@@ -158,6 +164,44 @@ class UnifiedExportSchedulerTests(unittest.TestCase):
             1.0,
         )
 
+    def test_forecast_uncertainty_reserve_inflates_load_and_discounts_pv(self):
+        night = ReserveTrajectorySlot(
+            period_start=self.start,
+            duration_hours=1.0,
+            house_power_w=600.0,
+            pv_power_w=0.0,
+            reserve_soc=5.0,
+        )
+        marginal_solar = ReserveTrajectorySlot(
+            period_start=self.start + timedelta(hours=1),
+            duration_hours=1.0,
+            house_power_w=600.0,
+            pv_power_w=800.0,
+            reserve_soc=5.0,
+        )
+
+        baseline = build_reserve_energy_schedule(
+            [night, marginal_solar],
+            battery_capacity_kwh=60.0,
+            uncertainty_margin_kwh=1.0,
+        )
+        robust = build_reserve_energy_schedule(
+            [night, marginal_solar],
+            battery_capacity_kwh=60.0,
+            uncertainty_margin_kwh=1.0,
+            house_load_margin_fraction=0.15,
+            pv_confidence_factor=0.75,
+        )
+
+        self.assertAlmostEqual(baseline[marginal_solar.period_start.isoformat()], 4.0)
+        self.assertAlmostEqual(baseline[night.period_start.isoformat()], 4.6)
+        self.assertAlmostEqual(robust[marginal_solar.period_start.isoformat()], 4.09)
+        self.assertAlmostEqual(robust[night.period_start.isoformat()], 4.78)
+        self.assertGreater(
+            robust[night.period_start.isoformat()],
+            robust[marginal_solar.period_start.isoformat()],
+        )
+
     def test_zero_quiet_tolerance_uses_maximum_power_at_the_highest_price(self):
         lower = self.slot(0, 0.32663)
         higher = self.slot(1, 0.33885)
@@ -217,7 +261,7 @@ class UnifiedExportSchedulerTests(unittest.TestCase):
         self.assertAlmostEqual(plan.headroom_energy_kwh, 0.25)
         self.assertAlmostEqual(plan.unallocated_headroom_kwh, 0.75)
 
-    def test_soft_headroom_skips_an_unprofitable_battery_cycle(self):
+    def test_physical_headroom_ignores_an_unprofitable_price_spread(self):
         flat_price = self.slot(0, 0.09)
         plan = self.plan(
             [flat_price],
@@ -227,9 +271,9 @@ class UnifiedExportSchedulerTests(unittest.TestCase):
             headroom_reference_price=0.09,
         )
 
-        self.assertAlmostEqual(plan.headroom_energy_kwh, 0.0)
-        self.assertAlmostEqual(plan.unallocated_headroom_kwh, 0.875)
-        self.assertEqual(plan.battery_power_delta_schedule[flat_price.period_start.isoformat()], 0.0)
+        self.assertAlmostEqual(plan.headroom_energy_kwh, 0.875)
+        self.assertAlmostEqual(plan.unallocated_headroom_kwh, 0.0)
+        self.assertEqual(plan.battery_power_delta_schedule[flat_price.period_start.isoformat()], 3500.0)
 
     def test_soft_headroom_uses_a_profitable_price_spread(self):
         valuable_export = self.slot(0, 0.20)
@@ -246,6 +290,108 @@ class UnifiedExportSchedulerTests(unittest.TestCase):
             plan.battery_power_delta_schedule[valuable_export.period_start.isoformat()],
             3500.0,
         )
+
+    def test_cumulative_headroom_is_exported_before_the_first_solar_deadline(self):
+        first_solar_window = self.slot(0, -0.01)
+        later_valuable_slot = self.slot(1, 0.30)
+        plan = self.plan(
+            [first_solar_window, later_valuable_slot],
+            energy=0.875,
+            headroom=0.875,
+            deadline=later_valuable_slot.period_start + timedelta(minutes=15),
+            headroom_requirements=[
+                (first_solar_window.period_start + timedelta(minutes=15), 0.875),
+            ],
+        )
+
+        self.assertEqual(
+            plan.battery_power_delta_schedule[first_solar_window.period_start.isoformat()],
+            3500.0,
+        )
+        self.assertEqual(
+            plan.battery_power_delta_schedule[later_valuable_slot.period_start.isoformat()],
+            0.0,
+        )
+
+    def test_negative_price_headroom_fills_contiguous_power_bands(self):
+        negative_price_slot = self.slot(0, -0.01)
+        plan = self.plan(
+            [negative_price_slot],
+            energy=1.35,
+            headroom=1.35,
+            deadline=negative_price_slot.period_start + timedelta(minutes=15),
+        )
+
+        self.assertEqual(
+            plan.battery_power_delta_schedule[negative_price_slot.period_start.isoformat()],
+            5400.0,
+        )
+        self.assertAlmostEqual(plan.allocated_energy_kwh, 1.35)
+
+    def test_hard_grid_cap_headroom_wins_when_energy_budget_is_short(self):
+        early_preferred_slot = self.slot(0, 0.05)
+        later_hard_slot = self.slot(1, 0.30)
+        plan = self.plan(
+            [early_preferred_slot, later_hard_slot],
+            energy=0.875,
+            headroom=0.875,
+            deadline=later_hard_slot.period_start + timedelta(minutes=15),
+            headroom_requirements=[
+                (early_preferred_slot.period_start + timedelta(minutes=15), 0.875),
+            ],
+            hard_headroom_requirements=[
+                (later_hard_slot.period_start + timedelta(minutes=15), 0.875),
+            ],
+        )
+
+        self.assertEqual(
+            plan.battery_power_delta_schedule[early_preferred_slot.period_start.isoformat()],
+            0.0,
+        )
+        self.assertEqual(
+            plan.battery_power_delta_schedule[later_hard_slot.period_start.isoformat()],
+            3500.0,
+        )
+        self.assertAlmostEqual(plan.hard_headroom_shortfall_kwh, 0.0)
+        self.assertAlmostEqual(plan.unallocated_headroom_kwh, 0.875)
+
+    def test_hard_grid_cap_headroom_is_created_just_before_the_deadline(self):
+        earlier_high_price = self.slot(0, 0.40)
+        later_low_price = self.slot(1, -0.01)
+        deadline = later_low_price.period_start + timedelta(minutes=15)
+        plan = self.plan(
+            [earlier_high_price, later_low_price],
+            energy=0.875,
+            hard_headroom_requirements=[(deadline, 0.875)],
+        )
+
+        self.assertEqual(
+            plan.battery_power_delta_schedule[earlier_high_price.period_start.isoformat()],
+            0.0,
+        )
+        self.assertEqual(
+            plan.battery_power_delta_schedule[later_low_price.period_start.isoformat()],
+            3500.0,
+        )
+
+    def test_hard_cap_hold_preserves_headroom_through_sub_cap_pv_slots(self):
+        before_peak = self.slot(0, 0.20, battery_power=2000.0, grid_export=100.0)
+        first_violation = self.slot(1, 0.20, grid_export=5200.0)
+        sub_cap_peak = self.slot(2, 0.20, battery_power=3000.0, grid_export=100.0)
+        last_violation = self.slot(3, 0.20, grid_export=5600.0)
+        after_peak = self.slot(4, 0.20, battery_power=1000.0, grid_export=100.0)
+
+        hold = build_hard_cap_storage_hold_schedule(
+            [before_peak, first_violation, sub_cap_peak, last_violation, after_peak],
+            max_grid_export_w=5000.0,
+            neutral_grid_target_w=-100.0,
+        )
+
+        self.assertNotIn(before_peak.period_start.isoformat(), hold)
+        self.assertEqual(hold[first_violation.period_start.isoformat()], 4900.0)
+        self.assertEqual(hold[sub_cap_peak.period_start.isoformat()], 3000.0)
+        self.assertEqual(hold[last_violation.period_start.isoformat()], 4900.0)
+        self.assertNotIn(after_peak.period_start.isoformat(), hold)
 
     def test_existing_pv_export_reduces_room_below_the_grid_cap(self):
         slot = self.slot(0, 0.30, grid_export=5000.0)
@@ -265,6 +411,37 @@ class UnifiedExportSchedulerTests(unittest.TestCase):
             optional_export_power_w=0.0,
             max_grid_export_w=5500.0,
             neutral_grid_target_w=-100.0,
+        )
+        self.assertEqual(target, -100.0)
+
+    def test_live_target_preserves_planned_battery_power_with_live_pv(self):
+        target = adapt_grid_target_to_live_power(
+            planned_battery_power_w=0.0,
+            house_load_w=2400.0,
+            pv_power_w=7500.0,
+            max_grid_export_w=5000.0,
+            neutral_grid_target_w=-100.0,
+        )
+        self.assertEqual(target, -5000.0)
+
+    def test_live_target_preserves_planned_discharge_without_import(self):
+        target = adapt_grid_target_to_live_power(
+            planned_battery_power_w=-3500.0,
+            house_load_w=2000.0,
+            pv_power_w=0.0,
+            max_grid_export_w=5000.0,
+            neutral_grid_target_w=-100.0,
+        )
+        self.assertEqual(target, -1500.0)
+
+    def test_stale_plan_holds_live_power_adaptation_neutral(self):
+        target = adapt_grid_target_to_live_power(
+            planned_battery_power_w=0.0,
+            house_load_w=500.0,
+            pv_power_w=7500.0,
+            max_grid_export_w=5000.0,
+            neutral_grid_target_w=-100.0,
+            hold_optional_export=True,
         )
         self.assertEqual(target, -100.0)
 

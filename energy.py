@@ -30,6 +30,7 @@ if TYPE_CHECKING:
     )
     from modules.setpoint_control import (
         FeedinCandidate,
+        calculate_auto_max_setpoint,
         apply_hard_feedin_control,
         build_price_aware_headroom_schedule,
         calculate_energy_bounded_control,
@@ -42,10 +43,11 @@ if TYPE_CHECKING:
     from modules.export_scheduler import (
         ExportSchedulerSlot,
         ReserveTrajectorySlot,
+        adapt_grid_target_to_live_power,
+        build_hard_cap_storage_hold_schedule,
         build_reserve_energy_schedule,
         build_unified_export_schedule,
         fit_export_schedule_to_energy_budget,
-        get_optional_export_grid_target,
         is_ev_available_for_charging,
         is_ev_plan_fresh,
     )
@@ -111,6 +113,7 @@ else:
     )  # noqa: F401
     from setpoint_control import (
         FeedinCandidate,
+        calculate_auto_max_setpoint,
         apply_hard_feedin_control,
         build_price_aware_headroom_schedule,
         calculate_energy_bounded_control,
@@ -123,10 +126,11 @@ else:
     from export_scheduler import (
         ExportSchedulerSlot,
         ReserveTrajectorySlot,
+        adapt_grid_target_to_live_power,
+        build_hard_cap_storage_hold_schedule,
         build_reserve_energy_schedule,
         build_unified_export_schedule,
         fit_export_schedule_to_energy_budget,
-        get_optional_export_grid_target,
         is_ev_available_for_charging,
         is_ev_plan_fresh,
     )
@@ -149,6 +153,15 @@ class Const:
 
     ev_phase_switch_delay = 20
     """The delay in seconds between switching the number of phases of the EV charger"""
+
+
+# Recorder calibration through 2026-08-26: the 90th-percentile 00:00-07:00
+# house load was about 12% above the configured nightly baseline, while the
+# 20th-percentile actual/Solcast power ratio was about 0.76.  Round outward so
+# optional export keeps a risk reserve that is released as the morning nears.
+EXPORT_HOUSE_LOAD_MARGIN_FRACTION = 0.15
+EXPORT_PV_CONFIDENCE_FACTOR = 0.75
+EXPORT_BASE_UNCERTAINTY_MARGIN_KWH = 1.0
 
 
 power_w_attributes = {
@@ -1046,7 +1059,9 @@ def forecast_surplus():
         battery_floor_schedule = build_reserve_energy_schedule(
             reserve_slots,
             battery_capacity_kwh=battery_capacity,
-            uncertainty_margin_kwh=1.0,
+            uncertainty_margin_kwh=EXPORT_BASE_UNCERTAINTY_MARGIN_KWH,
+            house_load_margin_fraction=EXPORT_HOUSE_LOAD_MARGIN_FRACTION,
+            pv_confidence_factor=EXPORT_PV_CONFIDENCE_FACTOR,
         )
 
     forecast_no_ev = forecast(
@@ -2259,9 +2274,54 @@ def get_pv_forecast_with_prices(t_start: datetime, t_end: datetime, epex_prices:
     return forecast
 
 
+@time_trigger
+@time_trigger("period(now, 120sec)")
+@state_trigger(f"{Automation.auto_max_setpoint} or {House.energy_surplus_after_ev_charging}")
+def update_auto_max_setpoint():
+    """Set the neutral export bias from conservatively spendable energy."""
+
+    if not get(Automation.auto_max_setpoint, False):
+        return
+
+    t_now = now()
+    spendable_surplus_kwh = get(
+        House.energy_surplus_after_ev_charging,
+        get(House.energy_surplus, 0),
+    )
+    spendable_horizon = get_attr(House.energy_surplus, "spendable_horizon", None)
+    horizon_hours = 24.0
+    if spendable_horizon is not None:
+        try:
+            horizon_hours = (with_timezone(spendable_horizon) - t_now).total_seconds() / 3600
+        except (TypeError, ValueError):
+            log.warning(f"Invalid spendable surplus horizon {spendable_horizon}; using 24 hours")
+            horizon_hours = 24.0
+    horizon_hours = max(1.0, min(36.0, horizon_hours))
+
+    # One day of live history at the neutral -100 W command showed a 5-second
+    # p99 tracking error of 71 W. A 100 W ceiling covers that plus margin;
+    # larger biases bought negligible import reduction while continuously
+    # exporting more energy outside the price-aware scheduler.
+    target_setpoint = calculate_auto_max_setpoint(
+        spendable_surplus_kwh=spendable_surplus_kwh,
+        horizon_hours=horizon_hours,
+        minimum_bias_w=20.0,
+        full_bias_w=100.0,
+    )
+    current_setpoint = get(Grid.max_setpoint, -20)
+    if abs(target_setpoint - current_setpoint) >= 5:
+        set_state(Grid.max_setpoint, target_setpoint)
+    log.warning(
+        f"Auto max setpoint target {target_setpoint:.0f} W (previous {current_setpoint:.0f} W) from "
+        f"{spendable_surplus_kwh:.2f} kWh spendable surplus after EV over "
+        f"{horizon_hours:.1f} hours"
+    )
+
+
 @time_trigger("period(now, 120sec)")
 @state_trigger(
     f"{Grid.max_feedin_target} or {Grid.max_pv_feedin_target} or {Automation.auto_setpoint} "
+    f"or {Grid.max_setpoint} or {Automation.auto_max_setpoint} "
     f"or {Automation.unified_export_scheduler} or {Automation.efficient_export_power} "
     f"or {Automation.quiet_export_price_tolerance}"
 )
@@ -2462,7 +2522,9 @@ def auto_setpoint_target():
     unified_scheduler_enabled = unified_scheduler_requested and not automation_disabled
     if unified_scheduler_enabled:
         hard_max_grid_export_w = min(5500.0, max_feedin_limit)
-        export_cap_margin_w = 150.0
+        # Keep the normal controller well clear of the independent roof-PV
+        # trip point (300 W below the legal/configured cap).
+        export_cap_margin_w = 500.0
         planned_max_grid_export_w = max(
             0.0,
             hard_max_grid_export_w - export_cap_margin_w,
@@ -2519,7 +2581,9 @@ def auto_setpoint_target():
         battery_floor_schedule = build_reserve_energy_schedule(
             reserve_slots,
             battery_capacity_kwh=battery_capacity,
-            uncertainty_margin_kwh=1.0,
+            uncertainty_margin_kwh=EXPORT_BASE_UNCERTAINTY_MARGIN_KWH,
+            house_load_margin_fraction=EXPORT_HOUSE_LOAD_MARGIN_FRACTION,
+            pv_confidence_factor=EXPORT_PV_CONFIDENCE_FACTOR,
         )
 
         # The neutral replay supplies capacity and spill estimates only. The
@@ -2568,6 +2632,7 @@ def auto_setpoint_target():
             )
 
         scheduler_slots = []
+        scheduler_period_ends = {}
         for index, detail_entry in enumerate(neutral_forecast.detail):
             if index + 1 < len(neutral_forecast.detail):
                 period_end = neutral_forecast.detail[index + 1].period_start
@@ -2594,8 +2659,13 @@ def auto_setpoint_target():
                     intentional_grid_import_w=detail_entry.power_from_grid,
                 )
             )
+            scheduler_period_ends[detail_entry.period_start.isoformat()] = period_end
 
         pv_feedin_samples = []
+        preferred_headroom_requirements = []
+        hard_headroom_requirements = []
+        cumulative_preferred_overflow_kwh = 0.0
+        cumulative_hard_overflow_kwh = 0.0
         raw_peak_w = 0.0
         raw_peak_time = None
         headroom_reference_value = 0.0
@@ -2610,6 +2680,28 @@ def auto_setpoint_target():
                 * scheduler_slot.duration_hours
                 / 1000
             )
+            hard_overflow_kwh = (
+                max(0.0, detail_entry.feedin - planned_max_grid_export_w)
+                * scheduler_slot.duration_hours
+                / 1000
+            )
+            cumulative_preferred_overflow_kwh += preferred_overflow_kwh
+            cumulative_hard_overflow_kwh += hard_overflow_kwh
+            period_end = scheduler_period_ends[detail_entry.period_start.isoformat()]
+            preferred_requirement_kwh = calculate_headroom_energy_requirement(
+                cumulative_preferred_overflow_kwh,
+                cumulative_preferred_overflow_kwh,
+            )
+            hard_requirement_kwh = calculate_headroom_energy_requirement(
+                cumulative_hard_overflow_kwh,
+                cumulative_hard_overflow_kwh,
+            )
+            if preferred_overflow_kwh > 0:
+                preferred_headroom_requirements.append(
+                    (period_end, preferred_requirement_kwh)
+                )
+            if hard_overflow_kwh > 0:
+                hard_headroom_requirements.append((period_end, hard_requirement_kwh))
             headroom_reference_energy_kwh += preferred_overflow_kwh
             headroom_reference_value += preferred_overflow_kwh * detail_entry.epex_price
         overflow_energy_kwh = calculate_pv_overflow_energy(
@@ -2627,6 +2719,16 @@ def auto_setpoint_target():
             else 0.0
         )
         headroom_min_price_spread = 0.01
+        hard_headroom_energy_kwh = (
+            hard_headroom_requirements[-1][1]
+            if hard_headroom_requirements
+            else 0.0
+        )
+        next_headroom_deadline = (
+            preferred_headroom_requirements[0][0]
+            if preferred_headroom_requirements
+            else raw_peak_time
+        )
 
         schedule_plan = build_unified_export_schedule(
             slots=scheduler_slots,
@@ -2640,6 +2742,8 @@ def auto_setpoint_target():
             quiet_boost_penalty_fraction=quiet_price_tolerance,
             headroom_reference_price=headroom_reference_price,
             headroom_min_price_spread=headroom_min_price_spread,
+            headroom_requirements=preferred_headroom_requirements,
+            hard_headroom_requirements=hard_headroom_requirements,
         )
         optional_export_power_schedule = dict(schedule_plan.battery_power_delta_schedule)
 
@@ -2683,9 +2787,24 @@ def auto_setpoint_target():
             locked_keys={current_period_key},
         )
 
-        scheduled_export_energy_kwh = 0.0
+        # Once hard headroom has been created, keep it available through the
+        # critical solar window. These controls route PV to the grid without
+        # authorizing extra battery discharge, so they are applied after the
+        # battery-energy budget fit.
+        hard_cap_hold_schedule = build_hard_cap_storage_hold_schedule(
+            scheduler_slots,
+            max_grid_export_w=planned_max_grid_export_w,
+            neutral_grid_target_w=max_setpoint,
+        )
+        for key, hold_power_w in hard_cap_hold_schedule.items():
+            optional_export_power_schedule[key] = max(
+                optional_export_power_schedule.get(key, 0.0),
+                hold_power_w,
+            )
+
+        scheduled_control_energy_kwh = 0.0
         for scheduler_slot in scheduler_slots:
-            scheduled_export_energy_kwh += (
+            scheduled_control_energy_kwh += (
                 optional_export_power_schedule.get(
                     scheduler_slot.period_start.isoformat(),
                     0.0,
@@ -2693,6 +2812,7 @@ def auto_setpoint_target():
                 * scheduler_slot.duration_hours
                 / 1000
             )
+        scheduled_export_energy_kwh = schedule_plan.allocated_energy_kwh
 
         unified_forecast = forecast_setpoint_local(
             pv_forecast=epex_pv_forecast,
@@ -2731,11 +2851,17 @@ def auto_setpoint_target():
                 "falling back to the neutral trajectory"
             )
             optional_export_power_schedule = {}
+            hard_cap_hold_schedule = {}
             unified_forecast = neutral_forecast
             scheduled_export_energy_kwh = 0.0
+            scheduled_control_energy_kwh = 0.0
             allocated_headroom_energy_kwh = 0.0
+            unallocated_headroom_energy_kwh = headroom_energy_kwh
+            hard_headroom_shortfall_kwh = hard_headroom_energy_kwh
         else:
             allocated_headroom_energy_kwh = schedule_plan.headroom_energy_kwh
+            unallocated_headroom_energy_kwh = schedule_plan.unallocated_headroom_kwh
+            hard_headroom_shortfall_kwh = schedule_plan.hard_headroom_shortfall_kwh
 
         current_detail = unified_forecast.detail[0]
         for detail_entry in unified_forecast.detail:
@@ -2761,7 +2887,9 @@ def auto_setpoint_target():
             )
         log.warning(
             f"Unified optional export schedule: {scheduled_export_energy_kwh:.2f} kWh requested "
-            f"({allocated_headroom_energy_kwh:.2f}/{headroom_energy_kwh:.2f} kWh soft PV headroom, "
+            f"({allocated_headroom_energy_kwh:.2f}/{headroom_energy_kwh:.2f} kWh preferred PV headroom, "
+            f"hard cap {hard_headroom_energy_kwh:.2f} kWh with "
+            f"{hard_headroom_shortfall_kwh:.2f} kWh deadline shortfall, "
             f"reference {headroom_reference_price:.3f}/kWh), "
             f"safe budget {safe_export_energy_kwh:.2f} kWh, raw PV peak {raw_peak_w:.0f} W at "
             f"{raw_peak_time}, current target {current_target:.0f} W, "
@@ -2801,20 +2929,32 @@ def auto_setpoint_target():
             max_grid_export_w=hard_max_grid_export_w,
             planned_max_grid_export_w=planned_max_grid_export_w,
             export_cap_margin_w=export_cap_margin_w,
+            export_house_load_margin_fraction=EXPORT_HOUSE_LOAD_MARGIN_FRACTION,
+            export_pv_confidence_factor=EXPORT_PV_CONFIDENCE_FACTOR,
+            export_base_uncertainty_margin_kwh=EXPORT_BASE_UNCERTAINTY_MARGIN_KWH,
             safe_export_energy_kwh=round(safe_export_energy_kwh, 3),
             scheduled_export_energy_kwh=round(scheduled_export_energy_kwh, 3),
+            scheduled_control_energy_kwh=round(scheduled_control_energy_kwh, 3),
+            hard_cap_hold_schedule={
+                key: round(value, 1)
+                for key, value in hard_cap_hold_schedule.items()
+                if value > 0.1
+            },
             headroom_constraint_active=headroom_energy_kwh > 0,
             headroom_control_w=current_target,
             headroom_energy_kwh=round(headroom_energy_kwh, 3),
             headroom_allocated_kwh=round(allocated_headroom_energy_kwh, 3),
             headroom_reference_price=round(headroom_reference_price, 5),
             headroom_min_price_spread=round(headroom_min_price_spread, 5),
-            headroom_is_soft=True,
-            headroom_unallocated_kwh=round(
-                max(0.0, headroom_energy_kwh - allocated_headroom_energy_kwh),
-                3,
+            headroom_is_soft=False,
+            headroom_unallocated_kwh=round(unallocated_headroom_energy_kwh, 3),
+            hard_headroom_energy_kwh=round(hard_headroom_energy_kwh, 3),
+            hard_headroom_shortfall_kwh=round(hard_headroom_shortfall_kwh, 3),
+            headroom_deadline=(
+                next_headroom_deadline.isoformat()
+                if next_headroom_deadline is not None
+                else None
             ),
-            headroom_deadline=raw_peak_time.isoformat() if raw_peak_time is not None else None,
             headroom_schedule={},
             raw_pv_feedin_peak_w=round(raw_peak_w, 1),
             quiet_efficient_power_w=round(efficient_discharge_w, 1),
@@ -3439,21 +3579,31 @@ def auto_apply_setpoint():
             "planned_optional_export_power_w",
             0,
         )
+        planned_battery_power_w = get_attr(
+            Grid.power_setpoint_target,
+            "planned_battery_power_w",
+            0,
+        )
         planned_max_grid_export_w = get_attr(
             Grid.power_setpoint_target,
             "planned_max_grid_export_w",
             min(5500, max_setpoint_target),
         )
-        setpoint = get_optional_export_grid_target(
-            optional_export_power_w=planned_optional_export_power_w,
+        live_pv_power_w = get(PVProduction.total_power, 0)
+        setpoint = adapt_grid_target_to_live_power(
+            planned_battery_power_w=planned_battery_power_w,
+            house_load_w=house_loads,
+            pv_power_w=live_pv_power_w,
             max_grid_export_w=min(planned_max_grid_export_w, max_setpoint_target),
             neutral_grid_target_w=max_setpoint,
             ev_is_charging=ev_is_charging,
             hold_optional_export=optional_export_ev_plan_hold,
         )
         msg += (
-            f" unified target {setpoint:.0f} W from budgeted optional export "
-            f"{planned_optional_export_power_w:.0f} W"
+            f" unified live target {setpoint:.0f} W from planned battery "
+            f"{planned_battery_power_w:.0f} W, optional export "
+            f"{planned_optional_export_power_w:.0f} W, live loads "
+            f"{house_loads:.0f} W and PV {live_pv_power_w:.0f} W"
         )
     elif setpoint_target < (max_setpoint - 30):
         current_diff_from_avg = house_power_long_term_average - house_loads

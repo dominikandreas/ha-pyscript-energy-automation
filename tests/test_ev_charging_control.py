@@ -206,6 +206,63 @@ class EVChargingControlTests(unittest.TestCase):
         self.assertEqual(action, self.core["ChargeAction"].on)
         self.assertEqual(mode, self.core["ChargeMode"].required)
 
+    def test_reaching_trip_target_during_grid_import_is_an_immediate_hard_stop(self):
+        t_now = datetime(2026, 8, 26, 0, 25, tzinfo=timezone.utc)
+        action, _phases, _current, reason, mode = self.core["_get_charge_action"](
+            next_drive=t_now + timedelta(hours=8),
+            current_soc=85,
+            required_soc=85,
+            energy_needed=0,
+            excess_power=-3130,
+            excess_target=-764,
+            surplus_energy=19.45,
+            smart_charge_limit=95,
+            smart_limiter_active=True,
+            configured_phases=1,
+            configured_current=12,
+            is_low_price=True,
+            pv_total_power=0,
+            battery_soc=18.1,
+            is_charging=True,
+            t_now=t_now,
+            inverter_mode="off",
+            battery_force_charge=False,
+            wallbox_power=2890,
+            battery_floor_soc=18.1,
+        )
+
+        self.assertEqual(action, self.core["ChargeAction"].off)
+        self.assertEqual(mode, self.core["ChargeMode"].hard_stop)
+        self.assertIn("Required SoC reached", reason)
+
+    def test_cheap_required_charge_is_not_reclassified_as_pv_surplus_at_night(self):
+        t_now = datetime(2026, 8, 26, 0, 1, tzinfo=timezone.utc)
+        action, _phases, _current, _reason, mode = self.core["_get_charge_action"](
+            next_drive=t_now + timedelta(hours=8),
+            current_soc=82,
+            required_soc=85,
+            energy_needed=1.8,
+            excess_power=-946,
+            excess_target=-1217,
+            surplus_energy=20.13,
+            smart_charge_limit=95,
+            smart_limiter_active=True,
+            configured_phases=3,
+            configured_current=9,
+            is_low_price=True,
+            pv_total_power=0,
+            battery_soc=20,
+            is_charging=True,
+            t_now=t_now,
+            inverter_mode="on",
+            battery_force_charge=False,
+            wallbox_power=6210,
+            battery_floor_soc=18.1,
+        )
+
+        self.assertEqual(action, self.core["ChargeAction"].on)
+        self.assertEqual(mode, self.core["ChargeMode"].required)
+
     def test_active_drive_does_not_hide_the_following_departure(self):
         t_now = datetime(2026, 8, 17, 18, 10, tzinfo=timezone.utc)
         active = SimpleNamespace(

@@ -243,6 +243,8 @@ class Automation:
     """Minimal SOC calculated by automation"""
     auto_setpoint = "input_boolean.auto_update_setpoint"
     """Switch to enable/disable automatic setpoint updates"""
+    auto_max_setpoint = "input_boolean.auto_max_setpoint"
+    """Switch to derive the neutral grid bias from forecast spendable surplus"""
     auto_charge_limit = "input_boolean.auto_charge_limit"
     """Switch to enable/disable automatic charge limit calculation"""
     efficient_discharge = "input_boolean.efficient_discharge"

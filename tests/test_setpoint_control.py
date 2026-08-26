@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 from modules.setpoint_control import (
     FeedinCandidate,
+    calculate_auto_max_setpoint,
     apply_hard_feedin_control,
     build_price_aware_headroom_schedule,
     calculate_energy_bounded_control,
@@ -39,6 +40,34 @@ class SetpointControlTests(unittest.TestCase):
         overflow = calculate_pv_overflow_energy(samples, 3000.0, self.t_now)
         self.assertAlmostEqual(overflow, 0.25)
         self.assertTrue(feedin_constraint_exceeded(FeedinCandidate(-100.0, 3500.0, overflow), 3000.0))
+
+    def test_auto_max_setpoint_keeps_legacy_bias_without_surplus(self):
+        self.assertEqual(
+            calculate_auto_max_setpoint(0.0, horizon_hours=24.0),
+            -20.0,
+        )
+
+    def test_auto_max_setpoint_budgets_partial_surplus_over_horizon(self):
+        self.assertEqual(
+            calculate_auto_max_setpoint(1.0, horizon_hours=20.0),
+            -50.0,
+        )
+
+    def test_auto_max_setpoint_caps_abundant_surplus_at_measured_margin(self):
+        self.assertEqual(
+            calculate_auto_max_setpoint(13.9, horizon_hours=23.5),
+            -100.0,
+        )
+
+    def test_auto_max_setpoint_rejects_invalid_horizon(self):
+        with self.assertRaises(ValueError):
+            calculate_auto_max_setpoint(1.0, horizon_hours=0.0)
+
+    def test_auto_max_setpoint_ignores_negative_surplus(self):
+        self.assertEqual(
+            calculate_auto_max_setpoint(-2.0, horizon_hours=12.0),
+            -20.0,
+        )
 
     def test_observed_insensitive_search_keeps_neutral_baseline(self):
         candidates = [
@@ -363,7 +392,7 @@ class SetpointControlTests(unittest.TestCase):
         ]
         self.assertEqual(len(reserve_builds), 1)
 
-    def test_live_unified_control_uses_only_budgeted_optional_export(self):
+    def test_live_unified_control_preserves_replayed_battery_power(self):
         source = Path(__file__).parents[1].joinpath("energy.py").read_text()
         tree = ast.parse(source)
         apply_node = next(
@@ -374,7 +403,7 @@ class SetpointControlTests(unittest.TestCase):
             for node in ast.walk(apply_node)
             if isinstance(node, ast.Call)
             and isinstance(node.func, ast.Name)
-            and node.func.id == "get_optional_export_grid_target"
+            and node.func.id == "adapt_grid_target_to_live_power"
         ]
         self.assertEqual(len(calls), 1)
 
@@ -389,7 +418,7 @@ class SetpointControlTests(unittest.TestCase):
             for node in ast.walk(apply_node)
             if isinstance(node, ast.Constant) and node.value == "planned_battery_power_w"
         ]
-        self.assertEqual(planned_battery_reads, [])
+        self.assertEqual(len(planned_battery_reads), 1)
 
         call_keywords = {keyword.arg: keyword.value for keyword in calls[0].keywords}
         self.assertIsInstance(call_keywords.get("hold_optional_export"), ast.Name)
