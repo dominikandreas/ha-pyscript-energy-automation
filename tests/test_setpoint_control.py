@@ -421,6 +421,14 @@ class SetpointControlTests(unittest.TestCase):
         self.assertEqual(len(planned_battery_reads), 1)
 
         call_keywords = {keyword.arg: keyword.value for keyword in calls[0].keywords}
+        self.assertIsInstance(
+            call_keywords.get("planned_optional_export_power_w"),
+            ast.Name,
+        )
+        self.assertEqual(
+            call_keywords["planned_optional_export_power_w"].id,
+            "planned_optional_export_power_w",
+        )
         self.assertIsInstance(call_keywords.get("hold_optional_export"), ast.Name)
         self.assertEqual(
             call_keywords["hold_optional_export"].id,
@@ -546,6 +554,26 @@ class SetpointControlTests(unittest.TestCase):
         self.assertEqual(enforced_mode, namespace["InverterMode"].off)
         self.assertEqual(normal_mode, namespace["InverterMode"].on)
 
+        ev_common = {
+            **common,
+            "ev_is_charging": True,
+            "surplus_energy": -5.0,
+            "battery_headroom_energy": 3.0,
+            "battery_soc": 35.0,
+            "target_soc": 36.0,
+        }
+        enforced_ev_mode, _, _, _ = namespace["get_auto_inverter_mode"](
+            **ev_common,
+            enforce_battery_floor=True,
+        )
+        normal_ev_mode, _, _, _ = namespace["get_auto_inverter_mode"](
+            **ev_common,
+            enforce_battery_floor=False,
+        )
+
+        self.assertEqual(enforced_ev_mode, namespace["InverterMode"].on)
+        self.assertEqual(normal_ev_mode, namespace["InverterMode"].off)
+
         energy_tree = ast.parse(Path(__file__).parents[1].joinpath("energy.py").read_text())
         live_node = next(
             node for node in energy_tree.body
@@ -635,6 +663,146 @@ class SetpointControlTests(unittest.TestCase):
         self.assertAlmostEqual(curve[0], 0.71)
         self.assertTrue(all(value >= 0 for value in curve))
 
+    def test_incident_ev_obligation_eliminates_false_positive_surplus(self):
+        source = Path(__file__).parents[1].joinpath("energy.py").read_text()
+        tree = ast.parse(source)
+        helper = next(
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "calculate_ev_adjusted_spendable_energy"
+        )
+        helper.decorator_list = []
+        namespace = {}
+        exec(
+            compile(
+                ast.fix_missing_locations(ast.Module(body=[helper], type_ignores=[])),
+                "energy.py",
+                "exec",
+            ),
+            namespace,
+        )
+        calculate = namespace["calculate_ev_adjusted_spendable_energy"]
+
+        # Captured 2026-08-26 23:14: the EV needed 30.6 kWh by 08:00,
+        # while only 1.94 kWh remained locally spendable.  The EV replay bought
+        # energy from the grid and incorrectly reported 0.99 kWh as surplus.
+        self.assertEqual(
+            calculate(
+                base_spendable_energy_kwh=1.94,
+                ev_forecast_spendable_energy_kwh=0.99,
+                remaining_ev_energy_kwh=30.6,
+                charge_efficiency=0.9,
+                obligation_due_within_horizon=True,
+            ),
+            0.0,
+        )
+
+    def test_ev_adjusted_surplus_invariants_hold_over_energy_grid(self):
+        source = Path(__file__).parents[1].joinpath("energy.py").read_text()
+        tree = ast.parse(source)
+        helper = next(
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "calculate_ev_adjusted_spendable_energy"
+        )
+        helper.decorator_list = []
+        namespace = {}
+        exec(
+            compile(
+                ast.fix_missing_locations(ast.Module(body=[helper], type_ignores=[])),
+                "energy.py",
+                "exec",
+            ),
+            namespace,
+        )
+        calculate = namespace["calculate_ev_adjusted_spendable_energy"]
+
+        for base_kwh in (0.0, 1.94, 10.0, 40.0):
+            for ev_forecast_kwh in (0.0, 0.99, 6.0, 50.0):
+                previous = None
+                for ev_need_kwh in (0.0, 1.0, 10.0, 30.6, 60.0):
+                    result = calculate(
+                        base_spendable_energy_kwh=base_kwh,
+                        ev_forecast_spendable_energy_kwh=ev_forecast_kwh,
+                        remaining_ev_energy_kwh=ev_need_kwh,
+                        charge_efficiency=0.9,
+                        obligation_due_within_horizon=True,
+                    )
+                    with self.subTest(
+                        base_kwh=base_kwh,
+                        ev_forecast_kwh=ev_forecast_kwh,
+                        ev_need_kwh=ev_need_kwh,
+                    ):
+                        self.assertGreaterEqual(result, 0.0)
+                        self.assertLessEqual(result, base_kwh)
+                        self.assertLessEqual(result, ev_forecast_kwh)
+                        if previous is not None:
+                            self.assertLessEqual(result, previous)
+                    previous = result
+
+        # Enough local energy for both the EV wall loss and 6 kWh export.
+        self.assertAlmostEqual(
+            calculate(40.0, 40.0, 30.6, 0.9, True),
+            6.0,
+        )
+        # A departure beyond this solar-cycle horizon reserves nothing yet.
+        self.assertAlmostEqual(
+            calculate(1.94, 0.99, 30.6, 0.9, False),
+            0.99,
+        )
+        with self.assertRaises(ValueError):
+            calculate(10.0, 10.0, 1.0, 0.0, True)
+
+    def test_ev_surplus_curve_reserves_the_captured_deadline_obligation(self):
+        source = Path(__file__).parents[1].joinpath("energy.py").read_text()
+        tree = ast.parse(source)
+        selected = []
+        for name in (
+            "get_spendable_solar_cycle_energy",
+            "calculate_ev_adjusted_spendable_energy",
+            "get_ev_adjusted_spendable_solar_cycle_curve",
+        ):
+            node = next(
+                node for node in tree.body
+                if isinstance(node, ast.FunctionDef) and node.name == name
+            )
+            node.decorator_list = []
+            selected.append(node)
+        namespace = {"datetime": datetime}
+        exec(
+            compile(
+                ast.fix_missing_locations(ast.Module(body=selected, type_ignores=[])),
+                "energy.py",
+                "exec",
+            ),
+            namespace,
+        )
+
+        start = datetime(2026, 8, 26, 23, 0, tzinfo=timezone.utc)
+        base_detail = [
+            SimpleNamespace(period_start=start, pv_estimate=0.0, house_power=589.0, battery_energy=12.61, pv_feedin=0.0),
+            SimpleNamespace(period_start=start + timedelta(minutes=30), pv_estimate=0.0, house_power=589.0, battery_energy=7.74, pv_feedin=0.0),
+            SimpleNamespace(period_start=start + timedelta(hours=1), pv_estimate=0.0, house_power=589.0, battery_energy=8.0, pv_feedin=0.0),
+        ]
+        ev_detail = [
+            SimpleNamespace(period_start=start, pv_estimate=0.0, house_power=589.0, battery_energy=12.61, pv_feedin=0.0, ev_energy=26.4),
+            SimpleNamespace(period_start=start + timedelta(minutes=30), pv_estimate=0.0, house_power=589.0, battery_energy=6.79, pv_feedin=0.0, ev_energy=26.4),
+            SimpleNamespace(period_start=start + timedelta(hours=1), pv_estimate=0.0, house_power=589.0, battery_energy=7.0, pv_feedin=0.0, ev_energy=31.368),
+        ]
+        curve = namespace["get_ev_adjusted_spendable_solar_cycle_curve"](
+            base_detail=base_detail,
+            ev_detail=ev_detail,
+            battery_export_floor=5.8,
+            period_hours=0.5,
+            initial_ev_energy_kwh=26.4,
+            initial_ev_energy_needed_kwh=30.6,
+            next_departure=start + timedelta(minutes=30),
+            charge_efficiency=0.9,
+        )
+
+        self.assertEqual(curve[0], 0.0)
+        self.assertTrue(all(value >= 0.0 for value in curve))
+
     def test_ev_surplus_publication_uses_conservative_same_horizon_curve(self):
         source = Path(__file__).parents[1].joinpath("energy.py").read_text()
         tree = ast.parse(source)
@@ -660,7 +828,7 @@ class SetpointControlTests(unittest.TestCase):
         keywords = conservative_ev_forecasts[0]
         self.assertEqual(keywords["forecast_dampening"].value, 0.8)
         self.assertEqual(keywords["with_ev_charging"].id, "forecast_ev_charging_enabled")
-        self.assertEqual(keywords["surplus_energy"].id, "surplus")
+        self.assertEqual(keywords["surplus_energy"].value, 0)
         self.assertEqual(keywords["battery_min_energy"].id, "surplus_battery_floor")
 
         raw_minimum_publications = [
@@ -690,6 +858,14 @@ class SetpointControlTests(unittest.TestCase):
             )
         ]
         self.assertEqual(len(published_curve_assignments), 1)
+        self.assertTrue(
+            any(
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "get_ev_adjusted_spendable_solar_cycle_curve"
+                for node in ast.walk(forecast_surplus_node)
+            )
+        )
 
         base_curve_assignments = [
             node
@@ -710,6 +886,52 @@ class SetpointControlTests(unittest.TestCase):
         self.assertEqual(keywords["optional_export_power_schedule"].keys, [])
         self.assertEqual(keywords["battery_export_budget_kwh"].value, 0)
 
+        surplus_assignment = next(
+            node for node in ast.walk(forecast_surplus_node)
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name)
+                and target.id == "surplus_after_ev_charging"
+                for target in node.targets
+            )
+        )
+        self.assertIsInstance(surplus_assignment.value, ast.Call)
+        self.assertEqual(
+            surplus_assignment.value.func.id,
+            "calculate_ev_adjusted_spendable_energy",
+        )
+        published_surplus_calls = [
+            node for node in ast.walk(forecast_surplus_node)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "set_energy_surplus"
+            and any(
+                isinstance(child, ast.Attribute)
+                and child.attr == "energy_surplus_after_ev_charging"
+                for child in ast.walk(node)
+            )
+        ]
+        self.assertEqual(len(published_surplus_calls), 2)
+        incident_publication = next(
+            call for call in published_surplus_calls
+            if any(
+                keyword.arg == "ev_obligation_due_within_horizon"
+                and isinstance(keyword.value, ast.Name)
+                for keyword in call.keywords
+            )
+        )
+        publication_keywords = {keyword.arg for keyword in incident_publication.keywords}
+        self.assertTrue(
+            {
+                "base_spendable_energy",
+                "ev_forecast_spendable_energy",
+                "ev_energy_needed",
+                "ev_wall_energy_required",
+                "calculated_at",
+            }
+            <= publication_keywords
+        )
+
     def test_legacy_controller_remains_a_separate_flagged_branch(self):
         source = Path(__file__).parents[1].joinpath("energy.py").read_text()
         tree = ast.parse(source)
@@ -726,6 +948,87 @@ class SetpointControlTests(unittest.TestCase):
         ]
         self.assertTrue(feature_flag_reads)
         self.assertTrue(any(isinstance(node, ast.Return) for node in ast.walk(target_node)))
+
+    def test_unified_scheduler_uses_ev_aware_surplus_and_trajectory_floor(self):
+        source = Path(__file__).parents[1].joinpath("energy.py").read_text()
+        tree = ast.parse(source)
+        target_node = next(
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "auto_setpoint_target"
+        )
+
+        published_policy_assignment = next(
+            node for node in ast.walk(target_node)
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name)
+                and target.id == "published_policy_surplus_energy_kwh"
+                for target in node.targets
+            )
+        )
+        self.assertTrue(
+            any(
+                isinstance(node, ast.Attribute)
+                and isinstance(node.value, ast.Name)
+                and node.value.id == "House"
+                and node.attr == "energy_surplus_after_ev_charging"
+                for node in ast.walk(published_policy_assignment.value)
+            )
+        )
+
+        policy_assignment = next(
+            node for node in ast.walk(target_node)
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name)
+                and target.id == "policy_surplus_energy_kwh"
+                for target in node.targets
+            )
+        )
+        self.assertIsInstance(policy_assignment.value, ast.Call)
+        self.assertEqual(
+            policy_assignment.value.func.id,
+            "calculate_ev_adjusted_spendable_energy",
+        )
+        policy_keywords = {
+            keyword.arg: keyword.value for keyword in policy_assignment.value.keywords
+        }
+        self.assertEqual(policy_keywords["remaining_ev_energy_kwh"].id, "ev_energy_needed")
+        self.assertEqual(
+            policy_keywords["obligation_due_within_horizon"].id,
+            "ev_obligation_due_within_horizon",
+        )
+
+        budget_calls = [
+            node for node in ast.walk(target_node)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "get_policy_bounded_export_budget"
+        ]
+        self.assertEqual(len(budget_calls), 1)
+        budget_keywords = {
+            keyword.arg: keyword.value for keyword in budget_calls[0].keywords
+        }
+        self.assertEqual(
+            budget_keywords["spendable_energy_after_ev_kwh"].id,
+            "policy_surplus_energy_kwh",
+        )
+
+        floor_assignment = next(
+            node for node in target_node.body
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == "battery_min_energy"
+                for target in node.targets
+            )
+        )
+        self.assertIsInstance(floor_assignment.value, ast.IfExp)
+        self.assertTrue(
+            any(
+                isinstance(node, ast.Name) and node.id == "unified_scheduler_enabled"
+                for node in ast.walk(floor_assignment.value.test)
+            )
+        )
 
     def test_unified_neutral_target_does_not_feed_back_the_previous_basis(self):
         source = Path(__file__).parents[1].joinpath("energy.py").read_text()

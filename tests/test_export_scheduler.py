@@ -9,6 +9,7 @@ from modules.export_scheduler import (
     build_reserve_energy_schedule,
     build_unified_export_schedule,
     fit_export_schedule_to_energy_budget,
+    get_policy_bounded_export_budget,
     get_optional_export_grid_target,
     is_ev_available_for_charging,
     is_ev_plan_fresh,
@@ -414,19 +415,32 @@ class UnifiedExportSchedulerTests(unittest.TestCase):
         )
         self.assertEqual(target, -100.0)
 
-    def test_live_target_preserves_planned_battery_power_with_live_pv(self):
+    def test_live_target_absorbs_unforecast_pv_without_optional_export(self):
         target = adapt_grid_target_to_live_power(
-            planned_battery_power_w=0.0,
-            house_load_w=2400.0,
-            pv_power_w=7500.0,
+            planned_battery_power_w=4151.0,
+            planned_optional_export_power_w=0.0,
+            house_load_w=840.0,
+            pv_power_w=8949.0,
             max_grid_export_w=5000.0,
             neutral_grid_target_w=-100.0,
         )
-        self.assertEqual(target, -5000.0)
+        self.assertEqual(target, -100.0)
+
+    def test_live_target_preserves_planned_battery_power_for_optional_export(self):
+        target = adapt_grid_target_to_live_power(
+            planned_battery_power_w=4151.0,
+            planned_optional_export_power_w=1000.0,
+            house_load_w=840.0,
+            pv_power_w=8949.0,
+            max_grid_export_w=5000.0,
+            neutral_grid_target_w=-100.0,
+        )
+        self.assertEqual(target, -3958.0)
 
     def test_live_target_preserves_planned_discharge_without_import(self):
         target = adapt_grid_target_to_live_power(
             planned_battery_power_w=-3500.0,
+            planned_optional_export_power_w=3500.0,
             house_load_w=2000.0,
             pv_power_w=0.0,
             max_grid_export_w=5000.0,
@@ -437,6 +451,7 @@ class UnifiedExportSchedulerTests(unittest.TestCase):
     def test_stale_plan_holds_live_power_adaptation_neutral(self):
         target = adapt_grid_target_to_live_power(
             planned_battery_power_w=0.0,
+            planned_optional_export_power_w=1000.0,
             house_load_w=500.0,
             pv_power_w=7500.0,
             max_grid_export_w=5000.0,
@@ -466,6 +481,25 @@ class UnifiedExportSchedulerTests(unittest.TestCase):
             -100.0,
         )
 
+    def test_optional_export_never_exceeds_physical_or_policy_energy(self):
+        cases = [
+            (2.314, 0.0, 0.0),
+            (2.314, 0.99, 0.99),
+            (2.314, 4.0, 2.314),
+            (-1.0, 4.0, 0.0),
+            (4.0, -1.0, 0.0),
+        ]
+        for physical_kwh, policy_kwh, expected_kwh in cases:
+            with self.subTest(physical_kwh=physical_kwh, policy_kwh=policy_kwh):
+                result = get_policy_bounded_export_budget(
+                    physically_available_energy_kwh=physical_kwh,
+                    spendable_energy_after_ev_kwh=policy_kwh,
+                )
+                self.assertEqual(result, expected_kwh)
+                self.assertGreaterEqual(result, 0.0)
+                self.assertLessEqual(result, max(0.0, physical_kwh))
+                self.assertLessEqual(result, max(0.0, policy_kwh))
+
     def test_stale_charging_transition_holds_optional_export_neutral(self):
         plan_time = datetime(2026, 8, 20, 10, 46, 20, tzinfo=timezone.utc)
         plan_is_fresh = is_ev_plan_fresh(
@@ -491,7 +525,7 @@ class UnifiedExportSchedulerTests(unittest.TestCase):
             -100.0,
         )
 
-    def test_refreshed_plan_allows_safe_export_while_ev_still_needs_charge(self):
+    def test_refreshed_plan_releases_the_stale_plan_hold(self):
         plan_time = datetime(2026, 8, 20, 10, 46, 31, tzinfo=timezone.utc)
         plan_is_fresh = is_ev_plan_fresh(
             planned_ev_available=True,
@@ -590,6 +624,41 @@ class UnifiedExportSchedulerTests(unittest.TestCase):
         )
 
         self.assertEqual(schedule[slot.period_start.isoformat()], 4.0)
+
+    def test_reserve_trajectory_skips_cheap_deficit_but_carries_future_expensive_need(self):
+        cheap = ReserveTrajectorySlot(
+            self.start,
+            1.0,
+            1000.0,
+            0.0,
+            5.0,
+            protect_deficit=False,
+        )
+        expensive = ReserveTrajectorySlot(
+            self.start + timedelta(hours=1),
+            1.0,
+            1000.0,
+            0.0,
+            5.0,
+            protect_deficit=True,
+        )
+        solar = ReserveTrajectorySlot(
+            self.start + timedelta(hours=2),
+            1.0,
+            1000.0,
+            2000.0,
+            5.0,
+        )
+
+        schedule = build_reserve_energy_schedule(
+            [cheap, expensive, solar],
+            battery_capacity_kwh=60.0,
+            uncertainty_margin_kwh=1.0,
+        )
+
+        self.assertEqual(schedule[solar.period_start.isoformat()], 4.0)
+        self.assertEqual(schedule[expensive.period_start.isoformat()], 5.0)
+        self.assertEqual(schedule[cheap.period_start.isoformat()], 5.0)
 
 
 if __name__ == "__main__":

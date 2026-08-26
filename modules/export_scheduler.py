@@ -33,6 +33,7 @@ class ReserveTrajectorySlot:
     house_power_w: float
     pv_power_w: float
     reserve_soc: float
+    protect_deficit: bool = True
 
 
 @dataclass(frozen=True)
@@ -58,13 +59,14 @@ def build_reserve_energy_schedule(
 ) -> dict[str, float]:
     """Return the protected energy for every future interval.
 
-    Each deficit interval reserves enough energy to reach the next interval
-    where conservative PV meets conservative house demand.  Inflating house
-    load and discounting PV makes the reserve shrink naturally as uncertain
-    overnight intervals become observed history.  Once conservative PV covers
-    demand, only the installation reserve and base uncertainty margin remain.
-    Walking backwards makes the result deterministic and linear in the
-    forecast length.
+    Protected deficit intervals reserve enough energy to reach the next
+    interval where conservative PV meets conservative house demand.  Cheap
+    import intervals may be left unprotected while still carrying later,
+    expensive demand backwards.  Inflating house load and discounting PV makes
+    the reserve shrink naturally as uncertain overnight intervals become
+    observed history.  Once conservative PV covers demand, only the
+    installation reserve and base uncertainty margin remain.  Walking
+    backwards makes the result deterministic and linear in the forecast length.
     """
 
     battery_capacity_kwh = max(0.0, battery_capacity_kwh)
@@ -82,7 +84,7 @@ def build_reserve_energy_schedule(
         protected_pv_power_w = max(0.0, slot.pv_power_w) * pv_confidence_factor
         if protected_pv_power_w >= protected_house_power_w:
             deficit_until_solar_kwh = 0.0
-        else:
+        elif slot.protect_deficit:
             deficit_until_solar_kwh += (
                 (protected_house_power_w - protected_pv_power_w)
                 * duration_hours
@@ -120,6 +122,26 @@ def get_optional_export_grid_target(
     return max(
         -max_grid_export_w,
         min(neutral_grid_target_w, requested_target_w),
+    )
+
+
+def get_policy_bounded_export_budget(
+    physically_available_energy_kwh: float,
+    spendable_energy_after_ev_kwh: float,
+) -> float:
+    """Cap optional export by both physical headroom and the policy budget.
+
+    The policy budget is the energy left after all protected loads, including a
+    pending EV obligation.  Neither input may authorize energy the other one
+    has already reserved.
+    """
+
+    return max(
+        0.0,
+        min(
+            physically_available_energy_kwh,
+            spendable_energy_after_ev_kwh,
+        ),
     )
 
 
@@ -634,6 +656,7 @@ def build_unified_export_schedule(
 
 def adapt_grid_target_to_live_power(
     planned_battery_power_w: float,
+    planned_optional_export_power_w: float,
     house_load_w: float,
     pv_power_w: float,
     max_grid_export_w: float,
@@ -641,16 +664,19 @@ def adapt_grid_target_to_live_power(
     ev_is_charging: bool = False,
     hold_optional_export: bool = False,
 ) -> float:
-    """Preserve planned battery power using live load and PV measurements.
+    """Adapt the unified plan to live load and PV measurements.
 
-    A fixed neutral-minus-delta grid target loses its battery effect once
-    natural PV export is already more negative than that target. Rebuilding
-    the target from live natural flow keeps the replayed battery trajectory
-    effective while the export cap and neutral clamp prevent excess export or
-    avoidable import.
+    Without an optional export request, the neutral grid target lets ESS absorb
+    live PV above forecast instead of exporting the forecast error.  While an
+    optional export or hard-cap hold is active, rebuilding the target from live
+    natural flow preserves the explicitly planned battery trajectory.  The
+    export cap and neutral clamp prevent excess export or avoidable import.
     """
 
     if ev_is_charging or hold_optional_export:
+        return neutral_grid_target_w
+
+    if planned_optional_export_power_w <= 0:
         return neutral_grid_target_w
 
     natural_grid_power_w = house_load_w - pv_power_w

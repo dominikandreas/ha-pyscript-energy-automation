@@ -77,9 +77,17 @@ def get_auto_inverter_mode(
 
     # When ev is charging, disable inverter if no surplus energy or insufficient pv power
     if ev_is_charging:
-        # EV charging should use the stricter, reserve-aware surplus budget. Physical
-        # battery headroom is still reserved for house backup/normal operation here.
-        if surplus_energy > 0 or pv_power > (min_charge_power + daily_avg_power) and battery_soc > target_soc:
+        # The unified forecast already supplies a tariff-aware physical battery
+        # floor.  While there is headroom above it, that floor is authoritative;
+        # the broader optional-load surplus budget must not strand battery energy
+        # during a required EV charge.
+        if enforce_battery_floor and battery_headroom_energy > headroom_threshold:
+            reason = (
+                f"EV is charging with {battery_headroom_energy:.2f} kWh "
+                "above the planned battery floor"
+            )
+            new_mode = InverterMode.on
+        elif surplus_energy > 0 or pv_power > (min_charge_power + daily_avg_power) and battery_soc > target_soc:
             reason = f"EV is charging with surplus energy of {surplus_energy} or pv_power > (min_charge_power + daily_avg_power)  {pv_power} > ({min_charge_power} + {daily_avg_power})"
             new_mode = InverterMode.on
         else:
