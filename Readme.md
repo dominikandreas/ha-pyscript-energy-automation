@@ -117,6 +117,27 @@ The optimizer then uses a fast heuristic instead of an expensive global optimize
 
 This is the main cost-reduction strategy of the project: it keeps the battery available when future PV or price conditions make that valuable, discharges when that is economically useful, reserves capacity for surplus PV, and coordinates EV charging with the same forecast.
 
+### Export safety and economic meaning
+
+- `max_feedin_target` is a sustained combined-grid export limit. The planner
+  keeps a 500 W control margin and creates battery headroom before forecast PV
+  peaks. Short Victron tracking overshoots are acceptable; export above 5.5 kW
+  for several minutes or a 15-minute settlement interval should be prevented by
+  the planner whenever storage can absorb or pre-export the energy.
+- A separate Home Assistant automation turns off the roof PV when sustained
+  export still cannot be contained. That is an independent last-resort action,
+  not the normal control path and not implemented in this repository.
+- The raw EPEX market-price forecast only ranks *when* an already-safe energy
+  budget is exported; the import total-price forecast remains separate. Price
+  never authorizes energy. The budget is bounded by conservative PV/house
+  forecasts, protected battery floors, the pending EV obligation, and battery
+  conversion losses.
+- Battery export prices are compared after 90% inverter efficiency and a broker
+  margin of 3% of revenue. This keeps `min_discharge_price` in net stored-energy
+  terms. Until direct marketing is active the ranking is advisory; strict
+  surplus accounting prevents theoretical EPEX revenue from causing later grid
+  import.
+
 ## EV Schedule And Charging Policy
 
 EV charging is driven by `ev_charging.py`, with shared decision helpers in `modules/energy_core.py`. The policy is schedule-aware: it uses the next planned drive to decide how much energy the car needs, how urgently it needs it, and whether the car should wait for PV surplus or cheap electricity.

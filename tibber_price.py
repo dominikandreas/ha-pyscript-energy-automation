@@ -1,9 +1,16 @@
+"""Deprecated Tibber prototype.
+
+The integration and its former credentials are dead.  Keep this disabled file
+only as historical reference; any future implementation must use Home Assistant
+secrets rather than embedding credentials in source control.
+"""
+
 import aiohttp
 
 # Define the endpoint and headers
 url = "https://api.tibber.com/v1-beta/gql"
 headers = {
-    "Authorization": "TDUWuDv72DujIV4CtCmZkKYja8E2USybaNo5XqbgLLw",
+    "Authorization": "DEAD_LEGACY_TOKEN_REMOVED",
     "Content-Type": "application/json",
     "User-Agent": "REST",
 }

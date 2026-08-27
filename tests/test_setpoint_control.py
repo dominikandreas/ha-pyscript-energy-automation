@@ -23,6 +23,28 @@ class SetpointControlTests(unittest.TestCase):
     def setUp(self):
         self.t_now = datetime(2026, 8, 9, 12, 0, tzinfo=timezone.utc)
 
+    def test_battery_energy_accounting_applies_both_conversion_directions(self):
+        source = Path(__file__).parents[1].joinpath("energy.py").read_text()
+        tree = ast.parse(source)
+        helper = next(
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "calculate_battery_energy_delta_kwh"
+        )
+        helper.decorator_list = []
+        namespace = {}
+        exec(
+            compile(
+                ast.fix_missing_locations(ast.Module(body=[helper], type_ignores=[])),
+                "energy.py",
+                "exec",
+            ),
+            namespace,
+        )
+        calculate = namespace["calculate_battery_energy_delta_kwh"]
+        self.assertAlmostEqual(calculate(4000.0, 0.5, 0.90, 0.90), 1.8)
+        self.assertAlmostEqual(calculate(-3600.0, 0.5, 0.90, 0.90), -2.0)
+
     def test_five_watt_half_hour_exceedance_is_tiny(self):
         samples = [
             (self.t_now, 3005.0),
@@ -31,6 +53,131 @@ class SetpointControlTests(unittest.TestCase):
         overflow = calculate_pv_overflow_energy(samples, 3000.0, self.t_now)
         self.assertAlmostEqual(overflow, 0.0025)
         self.assertFalse(feedin_constraint_exceeded(FeedinCandidate(-100.0, 3005.0, overflow), 3000.0))
+
+    def test_legacy_surplus_fallback_is_independent_of_day_pv_distribution(self):
+        source = Path(__file__).parents[1].joinpath("energy.py").read_text()
+        tree = ast.parse(source)
+        helper = next(
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "calculate_legacy_surplus_fallback"
+        )
+        helper.decorator_list = []
+        namespace = {"PVForecastWithPrices": SimpleNamespace}
+        exec(
+            compile(
+                ast.fix_missing_locations(ast.Module(body=[helper], type_ignores=[])),
+                "energy.py",
+                "exec",
+            ),
+            namespace,
+        )
+        start = datetime(2026, 8, 27, 0, 0, tzinfo=timezone.utc)
+
+        def build(pv_values):
+            return [
+                SimpleNamespace(
+                    period_start=start + timedelta(hours=6 * index),
+                    pv_estimate=pv,
+                )
+                for index, pv in enumerate(pv_values)
+            ]
+
+        calculate = namespace["calculate_legacy_surplus_fallback"]
+        first = calculate(build([0.0, 2.0, 0.0, 2.0]), 20.0, 1000.0, 500.0, 0.8)
+        second = calculate(build([2.0, 0.0, 2.0, 0.0]), 20.0, 1000.0, 500.0, 0.8)
+        self.assertAlmostEqual(first, second)
+
+    def test_forecast_wrapper_preserves_explicit_zero_inputs(self):
+        source = Path(__file__).parents[1].joinpath("energy.py").read_text()
+        tree = ast.parse(source)
+        wrapper = next(
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "forecast"
+        )
+        assignments = {
+            target.id: ast.unparse(node.value)
+            for node in wrapper.body
+            if isinstance(node, ast.Assign)
+            for target in node.targets
+            if isinstance(target, ast.Name)
+        }
+        for name in (
+            "daily_power",
+            "nightly_power",
+            "ev_required_soc",
+            "ev_soc",
+            "charge_limit",
+            "max_charge_price",
+            "min_discharge_price",
+        ):
+            self.assertIn("is not None", assignments[name])
+
+    def test_partial_pv_forecast_and_missing_prices_are_safe(self):
+        source = Path(__file__).parents[1].joinpath("energy.py").read_text()
+        tree = ast.parse(source)
+        helper = next(
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "get_pv_forecast_with_prices"
+        )
+        helper.decorator_list = []
+
+        class PVForecastStub:
+            forecast_today = "today"
+            forecast_tomorrow = "tomorrow"
+            forecast_day_3 = "day_3"
+            forecast_day_4 = "day_4"
+            forecast_day_5 = "day_5"
+
+        class LogStub:
+            def warning(self, _message):
+                return None
+
+        start = datetime(2026, 8, 27, 6, 0, tzinfo=timezone.utc)
+        source_entries = []
+
+        def get_attr(entity, _name, default=None):
+            return source_entries if entity == "today" else default
+
+        namespace = {
+            "datetime": datetime,
+            "timedelta": timedelta,
+            "PVForecast": PVForecastStub,
+            "PVForecastWithPrices": lambda period_start, pv_estimate, price_per_kwh: SimpleNamespace(
+                period_start=period_start,
+                pv_estimate=pv_estimate,
+                price_per_kwh=price_per_kwh,
+            ),
+            "get_attr": get_attr,
+            "get_price": lambda _hour, _minute: 0.2875,
+            "extend_pv_forecast_to_horizon": lambda forecast, _end, _prices: forecast,
+            "log": LogStub(),
+        }
+        exec(
+            compile(
+                ast.fix_missing_locations(ast.Module(body=[helper], type_ignores=[])),
+                "energy.py",
+                "exec",
+            ),
+            namespace,
+        )
+        get_forecast = namespace["get_pv_forecast_with_prices"]
+        source_entries.append({"period_start": start, "pv_estimate": 1.0})
+        self.assertEqual(
+            get_forecast(start - timedelta(minutes=1), start + timedelta(hours=1), []),
+            [],
+        )
+
+        source_entries.append(
+            {"period_start": start + timedelta(minutes=30), "pv_estimate": 1.0}
+        )
+        result = get_forecast(
+            start - timedelta(minutes=1),
+            start + timedelta(hours=1),
+            [],
+        )
+        self.assertEqual([entry.price_per_kwh for entry in result], [0.2875, 0.2875])
 
     def test_meaningful_exceedance_is_expressed_as_headroom_energy(self):
         samples = [
@@ -697,6 +844,106 @@ class SetpointControlTests(unittest.TestCase):
             0.0,
         )
 
+    def test_ev_departure_budget_counts_only_non_grid_wall_energy(self):
+        source = Path(__file__).parents[1].joinpath("energy.py").read_text()
+        tree = ast.parse(source)
+        selected = []
+        for name in (
+            "calculate_ev_adjusted_spendable_energy",
+            "calculate_local_ev_wall_energy_before_departure",
+        ):
+            node = next(
+                node for node in tree.body
+                if isinstance(node, ast.FunctionDef) and node.name == name
+            )
+            node.decorator_list = []
+            selected.append(node)
+        namespace = {"datetime": datetime, "timedelta": timedelta}
+        exec(
+            compile(
+                ast.fix_missing_locations(ast.Module(body=selected, type_ignores=[])),
+                "energy.py",
+                "exec",
+            ),
+            namespace,
+        )
+
+        start = datetime(2026, 8, 27, 5, 0, tzinfo=timezone.utc)
+        base_detail = []
+        grid_funded_detail = []
+        locally_funded_detail = []
+        for offset in range(4):
+            period_start = start + timedelta(minutes=30 * offset)
+            base_detail.append(
+                SimpleNamespace(period_start=period_start, power_from_grid=0.0)
+            )
+            grid_funded_detail.append(
+                SimpleNamespace(
+                    period_start=period_start,
+                    power_from_grid=7000.0,
+                    ev_charge_power=7000.0,
+                )
+            )
+            locally_funded_detail.append(
+                SimpleNamespace(
+                    period_start=period_start,
+                    power_from_grid=2000.0,
+                    ev_charge_power=7000.0,
+                )
+            )
+
+        local_energy = namespace[
+            "calculate_local_ev_wall_energy_before_departure"
+        ]
+        departure = start + timedelta(hours=2)
+        self.assertEqual(
+            local_energy(
+                base_detail,
+                grid_funded_detail,
+                start,
+                departure,
+                0.5,
+            ),
+            0.0,
+        )
+        self.assertAlmostEqual(
+            local_energy(
+                base_detail,
+                locally_funded_detail,
+                start,
+                departure,
+                0.5,
+            ),
+            10.0,
+        )
+
+        calculate = namespace["calculate_ev_adjusted_spendable_energy"]
+        # 9 kWh into the EV is 10 kWh at the wall. Grid-funded charging must
+        # leave no export budget even when the departure follows the trough.
+        self.assertEqual(calculate(10.0, 10.0, 9.0, 0.9, True, 0.0), 0.0)
+        self.assertEqual(calculate(10.0, 10.0, 9.0, 0.9, True, 10.0), 10.0)
+
+    def test_ev_export_reservation_uses_departure_horizon_not_trough(self):
+        source = Path(__file__).parents[1].joinpath("energy.py").read_text()
+        tree = ast.parse(source)
+        for function_name in ("forecast_surplus", "auto_setpoint_target"):
+            function = next(
+                node for node in tree.body
+                if isinstance(node, ast.FunctionDef) and node.name == function_name
+            )
+            assignment = next(
+                node for node in ast.walk(function)
+                if isinstance(node, ast.Assign)
+                and any(
+                    isinstance(target, ast.Name)
+                    and target.id == "ev_obligation_due_within_horizon"
+                    for target in node.targets
+                )
+            )
+            expression = ast.unparse(assignment.value)
+            self.assertIn("EV_EXPORT_RESERVATION_HORIZON_HOURS", expression)
+            self.assertNotIn("spendable_horizon", expression)
+
     def test_ev_adjusted_surplus_invariants_hold_over_energy_grid(self):
         source = Path(__file__).parents[1].joinpath("energy.py").read_text()
         tree = ast.parse(source)
@@ -760,6 +1007,7 @@ class SetpointControlTests(unittest.TestCase):
         for name in (
             "get_spendable_solar_cycle_energy",
             "calculate_ev_adjusted_spendable_energy",
+            "calculate_local_ev_wall_energy_before_departure",
             "get_ev_adjusted_spendable_solar_cycle_curve",
         ):
             node = next(
@@ -768,7 +1016,7 @@ class SetpointControlTests(unittest.TestCase):
             )
             node.decorator_list = []
             selected.append(node)
-        namespace = {"datetime": datetime}
+        namespace = {"datetime": datetime, "timedelta": timedelta}
         exec(
             compile(
                 ast.fix_missing_locations(ast.Module(body=selected, type_ignores=[])),
@@ -798,6 +1046,8 @@ class SetpointControlTests(unittest.TestCase):
             initial_ev_energy_needed_kwh=30.6,
             next_departure=start + timedelta(minutes=30),
             charge_efficiency=0.9,
+            reservation_horizon_hours=80.0,
+            battery_discharge_efficiency=0.9,
         )
 
         self.assertEqual(curve[0], 0.0)

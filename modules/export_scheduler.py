@@ -50,12 +50,65 @@ class ExportSchedulePlan:
     hard_headroom_shortfall_kwh: float
 
 
+def calculate_net_battery_export_price(
+    gross_price_per_kwh: float,
+    inverter_efficiency: float = 0.90,
+    broker_revenue_margin_fraction: float = 0.03,
+) -> float:
+    """Return net revenue per stored battery kWh exported to the grid.
+
+    The market price is a ranking signal, not permission to export energy.  The
+    separate policy budget remains authoritative.  Applying conversion loss and
+    the broker's revenue share here makes ``min_discharge_price`` comparable to
+    the value of energy still stored in the battery.
+    """
+
+    inverter_efficiency = max(0.0, min(1.0, inverter_efficiency))
+    broker_revenue_margin_fraction = max(
+        0.0,
+        min(1.0, broker_revenue_margin_fraction),
+    )
+    return (
+        float(gross_price_per_kwh)
+        * inverter_efficiency
+        * (1.0 - broker_revenue_margin_fraction)
+    )
+
+
+def get_interval_price(
+    prices: list[dict],
+    period_start: datetime,
+    fallback: float | None = None,
+) -> float | None:
+    """Return the price whose published interval contains ``period_start``.
+
+    Home Assistant's EPEX integration publishes hourly intervals while this
+    controller simulates half-hour buckets.  Timestamp containment avoids
+    coupling the two resolutions and remains correct across DST transitions.
+    Malformed provider entries are ignored so one bad bucket does not stop the
+    surplus forecast or leave a stale export authorization active.
+    """
+
+    target_timestamp = period_start.timestamp()
+    for entry in prices:
+        try:
+            start = datetime.fromisoformat(entry["start_time"])
+            end = datetime.fromisoformat(entry["end_time"])
+            price = float(entry["price_per_kwh"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if start.timestamp() <= target_timestamp < end.timestamp():
+            return price
+    return fallback
+
+
 def build_reserve_energy_schedule(
     slots: list[ReserveTrajectorySlot],
     battery_capacity_kwh: float,
     uncertainty_margin_kwh: float = 1.0,
     house_load_margin_fraction: float = 0.0,
     pv_confidence_factor: float = 1.0,
+    discharge_efficiency: float = 1.0,
 ) -> dict[str, float]:
     """Return the protected energy for every future interval.
 
@@ -73,6 +126,7 @@ def build_reserve_energy_schedule(
     uncertainty_margin_kwh = max(0.0, uncertainty_margin_kwh)
     house_load_margin_fraction = max(0.0, house_load_margin_fraction)
     pv_confidence_factor = max(0.0, min(1.0, pv_confidence_factor))
+    discharge_efficiency = max(1e-9, min(1.0, discharge_efficiency))
     deficit_until_solar_kwh = 0.0
     schedule = {}
 
@@ -89,6 +143,7 @@ def build_reserve_energy_schedule(
                 (protected_house_power_w - protected_pv_power_w)
                 * duration_hours
                 / 1000
+                / discharge_efficiency
             )
 
         reserve_energy_kwh = (

@@ -11,7 +11,12 @@ class ElectricityPrices:
     low_price = "binary_sensor.low_electricity_price"
     high_price = "binary_sensor.high_electricity_price"
     current_price = "sensor.electricity_price"
+    # Keep import-cost and export-market forecasts separate even while the
+    # current EPEX integration happens to publish identical values (its import
+    # surcharges are configured to zero).  Import prices drive load decisions;
+    # raw market prices only rank already-authorized surplus export.
     epex_forecast_prices = "sensor.epex_spot_data_total_price"
+    epex_export_forecast_prices = "sensor.epex_spot_data_market_price"
 
 
 class Environment:

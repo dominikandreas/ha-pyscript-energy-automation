@@ -8,8 +8,10 @@ from modules.export_scheduler import (
     build_hard_cap_storage_hold_schedule,
     build_reserve_energy_schedule,
     build_unified_export_schedule,
+    calculate_net_battery_export_price,
     fit_export_schedule_to_energy_budget,
     get_policy_bounded_export_budget,
+    get_interval_price,
     get_optional_export_grid_target,
     is_ev_available_for_charging,
     is_ev_plan_fresh,
@@ -19,6 +21,56 @@ from modules.export_scheduler import (
 class UnifiedExportSchedulerTests(unittest.TestCase):
     def setUp(self):
         self.start = datetime(2026, 8, 13, 18, 0, tzinfo=timezone.utc)
+
+    def test_net_export_price_accounts_for_inverter_and_broker(self):
+        self.assertAlmostEqual(
+            calculate_net_battery_export_price(0.30, 0.90, 0.03),
+            0.2619,
+        )
+        self.assertAlmostEqual(
+            calculate_net_battery_export_price(0.17, 0.90, 0.03),
+            0.14841,
+        )
+
+    def test_raw_market_price_lookup_covers_subintervals_and_dst_offsets(self):
+        prices = [
+            {
+                "start_time": "2026-10-25T02:00:00+02:00",
+                "end_time": "2026-10-25T02:00:00+01:00",
+                "price_per_kwh": 0.30,
+            },
+            {
+                "start_time": "2026-10-25T02:00:00+01:00",
+                "end_time": "2026-10-25T03:00:00+01:00",
+                "price_per_kwh": 0.17,
+            },
+        ]
+        first_fold = datetime.fromisoformat("2026-10-25T02:30:00+02:00")
+        second_fold = datetime.fromisoformat("2026-10-25T02:30:00+01:00")
+
+        self.assertEqual(get_interval_price(prices, first_fold), 0.30)
+        self.assertEqual(get_interval_price(prices, second_fold), 0.17)
+        self.assertIsNone(
+            get_interval_price(
+                prices,
+                datetime.fromisoformat("2026-10-25T04:00:00+01:00"),
+            )
+        )
+
+    def test_high_price_cannot_create_export_without_policy_surplus(self):
+        safe_budget = get_policy_bounded_export_budget(
+            physically_available_energy_kwh=20.0,
+            spendable_energy_after_ev_kwh=0.0,
+        )
+        high_price = self.slot(0, 1.00)
+        plan = self.plan([high_price], energy=safe_budget)
+
+        self.assertEqual(safe_budget, 0.0)
+        self.assertEqual(plan.allocated_energy_kwh, 0.0)
+        self.assertEqual(
+            plan.grid_target_schedule[high_price.period_start.isoformat()],
+            high_price.baseline_setpoint_w,
+        )
 
     def slot(
         self,
@@ -201,6 +253,25 @@ class UnifiedExportSchedulerTests(unittest.TestCase):
         self.assertGreater(
             robust[night.period_start.isoformat()],
             robust[marginal_solar.period_start.isoformat()],
+        )
+
+    def test_reserve_converts_ac_deficit_to_required_stored_energy(self):
+        slot = ReserveTrajectorySlot(
+            period_start=self.start,
+            duration_hours=1.0,
+            house_power_w=1000.0,
+            pv_power_w=0.0,
+            reserve_soc=0.0,
+        )
+        schedule = build_reserve_energy_schedule(
+            [slot],
+            battery_capacity_kwh=60.0,
+            uncertainty_margin_kwh=0.0,
+            discharge_efficiency=0.90,
+        )
+        self.assertAlmostEqual(
+            schedule[slot.period_start.isoformat()],
+            1.0 / 0.90,
         )
 
     def test_zero_quiet_tolerance_uses_maximum_power_at_the_highest_price(self):

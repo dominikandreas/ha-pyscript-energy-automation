@@ -47,7 +47,9 @@ if TYPE_CHECKING:
         build_hard_cap_storage_hold_schedule,
         build_reserve_energy_schedule,
         build_unified_export_schedule,
+        calculate_net_battery_export_price,
         fit_export_schedule_to_energy_budget,
+        get_interval_price,
         get_policy_bounded_export_budget,
         is_ev_available_for_charging,
         is_ev_plan_fresh,
@@ -131,7 +133,9 @@ else:
         build_hard_cap_storage_hold_schedule,
         build_reserve_energy_schedule,
         build_unified_export_schedule,
+        calculate_net_battery_export_price,
         fit_export_schedule_to_energy_budget,
+        get_interval_price,
         get_policy_bounded_export_budget,
         is_ev_available_for_charging,
         is_ev_plan_fresh,
@@ -164,6 +168,38 @@ class Const:
 EXPORT_HOUSE_LOAD_MARGIN_FRACTION = 0.15
 EXPORT_PV_CONFIDENCE_FACTOR = 0.75
 EXPORT_BASE_UNCERTAINTY_MARGIN_KWH = 1.0
+
+# AC/DC conversion assumptions used consistently by forecast energy accounting
+# and economic export ranking.  Keeping these conservative is intentional: an
+# optimistic conversion factor can authorize export that the battery cannot
+# later replace.
+HOME_BATTERY_CHARGE_EFFICIENCY = 0.90
+HOME_BATTERY_DISCHARGE_EFFICIENCY = 0.90
+EXPORT_BROKER_REVENUE_MARGIN_FRACTION = 0.03
+
+# Do not tie up today's genuinely spendable energy for a distant weekly drive.
+# Within the trustworthy 80-hour planning horizon, however, the EV obligation
+# is energy-balanced through its actual departure rather than compared with a
+# single battery-trough timestamp.
+EV_EXPORT_RESERVATION_HORIZON_HOURS = 80.0
+
+
+@pyscript_compile
+def calculate_battery_energy_delta_kwh(
+    battery_ac_power_w: float,
+    duration_hours: float,
+    charge_efficiency: float = 0.90,
+    discharge_efficiency: float = 0.90,
+) -> float:
+    """Convert AC-side battery power into stored-energy change."""
+
+    duration_hours = max(0.0, duration_hours)
+    charge_efficiency = max(1e-9, min(1.0, charge_efficiency))
+    discharge_efficiency = max(1e-9, min(1.0, discharge_efficiency))
+    ac_energy_kwh = float(battery_ac_power_w) * duration_hours / 1000
+    if ac_energy_kwh >= 0:
+        return ac_energy_kwh * charge_efficiency
+    return ac_energy_kwh / discharge_efficiency
 
 
 power_w_attributes = {
@@ -799,6 +835,7 @@ def get_spendable_solar_cycle_energy(
     battery_export_floor: float,
     t_now: datetime,
     period_hours: float,
+    battery_discharge_efficiency: float = 1.0,
 ) -> tuple[float, float, float, datetime | None]:
     """Return a conservative energy budget for the current solar cycle.
 
@@ -836,7 +873,12 @@ def get_spendable_solar_cycle_energy(
                 break
             previous_energy = entry.battery_energy
         battery_headroom = max(0, trough_energy - battery_export_floor)
-        return battery_headroom, battery_headroom, 0, trough_time
+        return (
+            battery_headroom * battery_discharge_efficiency,
+            battery_headroom,
+            0,
+            trough_time,
+        )
 
     solar_end_time = solar_today[-1].period_start
 
@@ -860,7 +902,10 @@ def get_spendable_solar_cycle_energy(
 
     battery_headroom = max(0, trough_entry.battery_energy - battery_export_floor)
     pv_spill = sum(max(0, entry.pv_feedin - 20) for entry in cycle) * period_hours / 1000
-    spendable = battery_headroom + pv_spill
+    spendable = (
+        battery_headroom * battery_discharge_efficiency
+        + pv_spill
+    )
     return spendable, battery_headroom, pv_spill, trough_entry.period_start
 
 
@@ -869,6 +914,7 @@ def get_spendable_solar_cycle_curve(
     detail: list["ForecastEntry"],
     battery_export_floor: float,
     period_hours: float,
+    battery_discharge_efficiency: float = 1.0,
 ) -> list[float]:
     """Return the non-negative spendable budget at every forecast bucket.
 
@@ -883,6 +929,7 @@ def get_spendable_solar_cycle_curve(
             battery_export_floor,
             entry.period_start,
             period_hours,
+            battery_discharge_efficiency,
         )
         curve.append(spendable)
     return curve
@@ -895,6 +942,7 @@ def calculate_ev_adjusted_spendable_energy(
     remaining_ev_energy_kwh: float,
     charge_efficiency: float,
     obligation_due_within_horizon: bool,
+    local_ev_wall_energy_before_departure_kwh: float = 0.0,
 ) -> float:
     """Return local energy left after reserving an imminent EV obligation.
 
@@ -917,11 +965,73 @@ def calculate_ev_adjusted_spendable_energy(
         return conservative_forecast_budget_kwh
 
     remaining_ev_wall_energy_kwh = max(0.0, remaining_ev_energy_kwh) / charge_efficiency
+    uncovered_ev_wall_energy_kwh = max(
+        0.0,
+        remaining_ev_wall_energy_kwh
+        - max(0.0, local_ev_wall_energy_before_departure_kwh),
+    )
     obligation_budget_kwh = max(
         0.0,
-        base_spendable_energy_kwh - remaining_ev_wall_energy_kwh,
+        base_spendable_energy_kwh - uncovered_ev_wall_energy_kwh,
     )
     return min(conservative_forecast_budget_kwh, obligation_budget_kwh)
+
+
+@pyscript_compile
+def calculate_local_ev_wall_energy_before_departure(
+    base_detail: list["ForecastEntry"],
+    ev_detail: list["ForecastEntry"],
+    t_start: datetime,
+    departure: datetime,
+    fallback_period_hours: float,
+) -> float:
+    """Return forecast EV wall energy supplied without additional grid import.
+
+    Compare the EV replay with the same optional-export-free baseline.  EV load
+    that increases grid import is not local energy and must not make battery
+    headroom exportable.  EV load supplied by PV, battery, or avoided baseline
+    feed-in is local and can legitimately reduce the protected obligation.
+    """
+
+    if departure <= t_start:
+        return 0.0
+
+    ev_entry_by_start = {entry.period_start: entry for entry in ev_detail}
+    local_wall_energy_kwh = 0.0
+    for index, base_entry in enumerate(base_detail):
+        period_start = base_entry.period_start
+        if period_start >= departure:
+            break
+        ev_entry = ev_entry_by_start.get(period_start)
+        if ev_entry is None:
+            continue
+
+        if index + 1 < len(base_detail):
+            period_end = base_detail[index + 1].period_start
+        else:
+            period_end = period_start + timedelta(hours=fallback_period_hours)
+        effective_start = max(t_start, period_start)
+        effective_end = min(departure, period_end)
+        duration_hours = max(
+            0.0,
+            (effective_end - effective_start).total_seconds() / 3600,
+        )
+        if duration_hours <= 0:
+            continue
+
+        incremental_grid_import_w = max(
+            0.0,
+            ev_entry.power_from_grid - base_entry.power_from_grid,
+        )
+        local_ev_wall_power_w = max(
+            0.0,
+            ev_entry.ev_charge_power - incremental_grid_import_w,
+        )
+        local_wall_energy_kwh += (
+            local_ev_wall_power_w * duration_hours / 1000
+        )
+
+    return local_wall_energy_kwh
 
 
 @pyscript_compile
@@ -934,28 +1044,32 @@ def get_ev_adjusted_spendable_solar_cycle_curve(
     initial_ev_energy_needed_kwh: float,
     next_departure: datetime | None,
     charge_efficiency: float,
+    reservation_horizon_hours: float,
+    battery_discharge_efficiency: float,
 ) -> list[float]:
     """Return a curve that reserves the unfinished EV charge until departure."""
 
     ev_entry_by_start = {entry.period_start: entry for entry in ev_detail}
     curve = []
-    for base_entry in base_detail:
+    for index, base_entry in enumerate(base_detail):
         ev_entry = ev_entry_by_start.get(base_entry.period_start)
         if ev_entry is None:
             curve.append(0.0)
             continue
 
-        base_spendable, _, _, spendable_horizon = get_spendable_solar_cycle_energy(
+        base_spendable, _, _, _ = get_spendable_solar_cycle_energy(
             base_detail,
             battery_export_floor,
             base_entry.period_start,
             period_hours,
+            battery_discharge_efficiency,
         )
         ev_spendable, _, _, _ = get_spendable_solar_cycle_energy(
             ev_detail,
             battery_export_floor,
             ev_entry.period_start,
             period_hours,
+            battery_discharge_efficiency,
         )
         projected_ev_charge_kwh = max(
             0.0,
@@ -965,11 +1079,28 @@ def get_ev_adjusted_spendable_solar_cycle_curve(
             0.0,
             initial_ev_energy_needed_kwh - projected_ev_charge_kwh,
         )
+        if index + 1 < len(base_detail):
+            point_time = base_detail[index + 1].period_start
+        else:
+            point_time = base_entry.period_start + timedelta(hours=period_hours)
         obligation_due_within_horizon = bool(
             next_departure is not None
-            and spendable_horizon is not None
-            and next_departure <= spendable_horizon
+            and base_entry.period_start < next_departure
+            and next_departure
+            <= base_entry.period_start
+            + timedelta(hours=reservation_horizon_hours)
         )
+        local_ev_wall_energy_before_departure_kwh = 0.0
+        if obligation_due_within_horizon:
+            local_ev_wall_energy_before_departure_kwh = (
+                calculate_local_ev_wall_energy_before_departure(
+                    base_detail,
+                    ev_detail,
+                    point_time,
+                    next_departure,
+                    period_hours,
+                )
+            )
         curve.append(
             calculate_ev_adjusted_spendable_energy(
                 base_spendable_energy_kwh=base_spendable,
@@ -977,6 +1108,9 @@ def get_ev_adjusted_spendable_solar_cycle_curve(
                 remaining_ev_energy_kwh=remaining_ev_energy_kwh,
                 charge_efficiency=charge_efficiency,
                 obligation_due_within_horizon=obligation_due_within_horizon,
+                local_ev_wall_energy_before_departure_kwh=(
+                    local_ev_wall_energy_before_departure_kwh
+                ),
             )
         )
     return curve
@@ -1164,6 +1298,7 @@ def forecast_surplus():
             uncertainty_margin_kwh=EXPORT_BASE_UNCERTAINTY_MARGIN_KWH,
             house_load_margin_fraction=EXPORT_HOUSE_LOAD_MARGIN_FRACTION,
             pv_confidence_factor=EXPORT_PV_CONFIDENCE_FACTOR,
+            discharge_efficiency=HOME_BATTERY_DISCHARGE_EFFICIENCY,
         )
 
     forecast_no_ev = forecast(
@@ -1231,12 +1366,14 @@ def forecast_surplus():
             surplus_battery_floor,
             t_now,
             period_hours,
+            HOME_BATTERY_DISCHARGE_EFFICIENCY,
         )
     )
     spendable_surplus_curve = get_spendable_solar_cycle_curve(
         spendable_forecast.detail,
         surplus_battery_floor,
         period_hours,
+        HOME_BATTERY_DISCHARGE_EFFICIENCY,
     )
 
     forecast_today = [el for el in forecast_no_ev.detail if el.period_start.day == t_now.day]
@@ -1380,14 +1517,27 @@ def forecast_surplus():
             surplus_battery_floor,
             t_now,
             period_hours,
+            HOME_BATTERY_DISCHARGE_EFFICIENCY,
         )
         ev_energy_needed = max(0.0, float(get(EV.energy_needed, 0)))
         ev_obligation_due_within_horizon = bool(
             forecast_ev_charging_enabled
             and next_departure is not None
-            and spendable_horizon is not None
-            and next_departure.start <= spendable_horizon
+            and t_now < next_departure.start
+            and next_departure.start
+            <= t_now + timedelta(hours=EV_EXPORT_RESERVATION_HORIZON_HOURS)
         )
+        local_ev_wall_energy_before_departure_kwh = 0.0
+        if ev_obligation_due_within_horizon:
+            local_ev_wall_energy_before_departure_kwh = (
+                calculate_local_ev_wall_energy_before_departure(
+                    spendable_forecast.detail,
+                    spendable_forecast_with_ev.detail,
+                    t_now,
+                    next_departure.start,
+                    period_hours,
+                )
+            )
         ev_wall_energy_required = (
             ev_energy_needed / EVConst.charge_efficiency
             if ev_obligation_due_within_horizon
@@ -1399,6 +1549,9 @@ def forecast_surplus():
             remaining_ev_energy_kwh=ev_energy_needed,
             charge_efficiency=EVConst.charge_efficiency,
             obligation_due_within_horizon=ev_obligation_due_within_horizon,
+            local_ev_wall_energy_before_departure_kwh=(
+                local_ev_wall_energy_before_departure_kwh
+            ),
         )
         spendable_surplus_curve_with_ev = get_ev_adjusted_spendable_solar_cycle_curve(
             spendable_forecast.detail,
@@ -1409,6 +1562,8 @@ def forecast_surplus():
             ev_energy_needed,
             next_departure.start if forecast_ev_charging_enabled and next_departure else None,
             EVConst.charge_efficiency,
+            EV_EXPORT_RESERVATION_HORIZON_HOURS,
+            HOME_BATTERY_DISCHARGE_EFFICIENCY,
         )
         log.warning(
             f"""\n#################### Forecast Surplus  #####################\n
@@ -1425,7 +1580,8 @@ def forecast_surplus():
             Surplus: {surplus:.2f} kWh
             Surplus after EV charging: {surplus_after_ev_charging:.2f} kWh
             EV energy obligation: {ev_energy_needed:.2f} kWh ({ev_wall_energy_required:.2f} kWh at wall)
-            EV obligation due within spendable horizon: {ev_obligation_due_within_horizon}
+            Forecast local EV wall energy before departure: {local_ev_wall_energy_before_departure_kwh:.2f} kWh
+            EV obligation due within reservation horizon: {ev_obligation_due_within_horizon}
             EV charging controller enabled: {forecast_ev_charging_enabled}
             {active_drive_forecast_summary}
             {departure_forecast_summary}
@@ -1458,6 +1614,10 @@ def forecast_surplus():
             ev_forecast_spendable_energy=round(ev_forecast_spendable_energy, 3),
             ev_energy_needed=round(ev_energy_needed, 3),
             ev_wall_energy_required=round(ev_wall_energy_required, 3),
+            local_ev_wall_energy_before_departure=round(
+                local_ev_wall_energy_before_departure_kwh,
+                3,
+            ),
             ev_obligation_due_within_horizon=ev_obligation_due_within_horizon,
             next_departure=next_departure.start if next_departure else None,
             spendable_horizon=spendable_horizon,
@@ -1478,6 +1638,7 @@ def forecast_surplus():
             ev_forecast_spendable_energy=round(surplus, 3),
             ev_energy_needed=0.0,
             ev_wall_energy_required=0.0,
+            local_ev_wall_energy_before_departure=0.0,
             ev_obligation_due_within_horizon=False,
             next_departure=None,
             spendable_horizon=spendable_horizon,
@@ -1630,6 +1791,35 @@ def map_setpoint(
     return max(-(max_feedin + surplus_pv), min(min_setpoint, new_setpoint))
 
 
+@pyscript_compile
+def calculate_legacy_surplus_fallback(
+    forecast: list[PVForecastWithPrices],
+    battery_energy: float,
+    daily_power: float,
+    nightly_power: float,
+    forecast_dampening: float,
+) -> float:
+    """Return an order-independent fallback budget for legacy callers."""
+
+    if len(forecast) < 2:
+        return 0.0
+    period_hours = (
+        forecast[1].period_start - forecast[0].period_start
+    ).total_seconds() / 3600
+    net_forecast_demand_kwh = 0.0
+    for entry in forecast:
+        house_power = (
+            daily_power if 7 < entry.period_start.hour < 19 else nightly_power
+        )
+        pv_power = entry.pv_estimate * forecast_dampening * 1000
+        net_forecast_demand_kwh += (
+            (house_power - pv_power) * period_hours / 1000
+        )
+
+    required_energy_kwh = 5 + max(0.0, net_forecast_demand_kwh)
+    return max(0.0, battery_energy - required_energy_kwh)
+
+
 def forecast(
     forecast: list[PVForecastWithPrices],
     setpoint: float,
@@ -1671,13 +1861,13 @@ def forecast(
     battery_cells_balanced: bool | None = None,
     t_now: datetime | None = None,
 ):
-    t_now = t_now or now()
+    t_now = t_now if t_now is not None else now()
 
-    daily_power = daily_power or get(House.daily_average_power, 0)  # W
-    nightly_power = nightly_power or get(House.nightly_average_power, 0)  # W
+    daily_power = daily_power if daily_power is not None else get(House.daily_average_power, 0)  # W
+    nightly_power = nightly_power if nightly_power is not None else get(House.nightly_average_power, 0)  # W
 
-    ev_required_soc = ev_required_soc or get(EV.required_soc, 80)
-    ev_soc = ev_soc or get(EV.soc, 100)
+    ev_required_soc = ev_required_soc if ev_required_soc is not None else get(EV.required_soc, 80)
+    ev_soc = ev_soc if ev_soc is not None else get(EV.soc, 100)
     is_charging_ev = is_charging_ev if is_charging_ev is not None else get(EV.is_charging, False)
 
     smart_limiter_active = (
@@ -1685,14 +1875,18 @@ def forecast(
         if smart_limiter_active is not None
         else get(Automation.auto_charge_limit, False)
     )
-    charge_limit = charge_limit or get(Battery.force_charge_up_to, 0)
-    max_charge_price = max_charge_price or get(Battery.max_charge_price, 0)
+    charge_limit = charge_limit if charge_limit is not None else get(Battery.force_charge_up_to, 0)
+    max_charge_price = max_charge_price if max_charge_price is not None else get(Battery.max_charge_price, 0)
     force_charge_switch = (
         force_charge_switch
         if force_charge_switch is not None
         else get(Battery.force_charge_switch, False)
     )
-    min_discharge_price = min_discharge_price or float(get(Automation.min_discharge_price, default=0))
+    min_discharge_price = (
+        min_discharge_price
+        if min_discharge_price is not None
+        else float(get(Automation.min_discharge_price, default=0))
+    )
     charger_ready = charger_ready if charger_ready is not None else get(Charger.ready, False)
     charger_ready_since = charger_ready_since or get_attr(Charger.ready, "last_changed")
     ev_plugged_in = ev_plugged_in if ev_plugged_in is not None else get(EV.plugged_in, False)
@@ -1794,22 +1988,13 @@ def _forecast(
     prices_std = sqrt(sum([(p - prices_mean) ** 2 for p in prices]) / len(prices)) if len(prices) > 0 else 0
 
     if surplus_energy is None:
-        # Calculate an initial surplus estimate based on forecasted PV production and house demand
-        period_minutes = (forecast[1].period_start - forecast[0].period_start).total_seconds() / 60
-        period_hours = period_minutes / 60
-        forecast_days = {}
-        for entry in forecast:
-            day_key = entry.period_start.date()
-            if day_key not in forecast_days:
-                forecast_days[day_key] = 0
-            forecast_days[day_key] += entry.pv_estimate * forecast_dampening * period_hours / 1000  # kWh
-
-        required_energy = 5  # start with an overhead of 5 kWh
-        house_energy = (daily_power * 12 + nightly_power * 12) / 1000  # kWh
-        for pv_energy in forecast_days.values():
-            required_energy = house_energy - pv_energy
-
-        surplus_energy = max(0, battery_energy - required_energy)
+        surplus_energy = calculate_legacy_surplus_fallback(
+            forecast,
+            battery_energy,
+            daily_power,
+            nightly_power,
+            forecast_dampening,
+        )
 
     surplus = surplus_energy
     battery_export_budget_remaining_kwh = battery_export_budget_kwh
@@ -2108,7 +2293,14 @@ def _forecast(
 
             # Physical limit check (Capacity)
             max_intake_wh = (battery_capacity - current_bat_kwh) * 1000
-            possible_charge_power = min(target_charge_power, max_intake_wh / period_hours if period_hours > 0 else 0)
+            possible_charge_power = min(
+                target_charge_power,
+                max_intake_wh
+                / period_hours
+                / HOME_BATTERY_CHARGE_EFFICIENCY
+                if period_hours > 0
+                else 0,
+            )
 
             battery_power = possible_charge_power
 
@@ -2159,7 +2351,14 @@ def _forecast(
                     # Physical Constraints: Limit and Available Energy
                     max_discharge_rate = min(battery_charge_limit, max_battery_power_target)
                     available_energy_kwh = current_bat_kwh - period_battery_min_energy
-                    max_discharge_by_energy = (available_energy_kwh * 1000) / period_hours if period_hours > 0 else 0
+                    max_discharge_by_energy = (
+                        available_energy_kwh
+                        * HOME_BATTERY_DISCHARGE_EFFICIENCY
+                        * 1000
+                        / period_hours
+                        if period_hours > 0
+                        else 0
+                    )
 
                     actual_discharge_watts = min(
                         target_battery_discharge_watts,
@@ -2189,7 +2388,14 @@ def _forecast(
                 # Physical Constraints: Limit and Free Capacity
                 max_charge_rate = min(battery_charge_limit, max_battery_power_target)
                 free_capacity_kwh = battery_capacity - current_bat_kwh
-                max_charge_by_capacity = (free_capacity_kwh * 1000) / period_hours if period_hours > 0 else 0
+                max_charge_by_capacity = (
+                    free_capacity_kwh
+                    * 1000
+                    / period_hours
+                    / HOME_BATTERY_CHARGE_EFFICIENCY
+                    if period_hours > 0
+                    else 0
+                )
 
                 actual_charge_watts = min(target_charge_watts, max_charge_rate, max_charge_by_capacity)
 
@@ -2210,14 +2416,33 @@ def _forecast(
                 pv_feedin = min(feedin, max(0, -natural_deficit_watts))
 
         # --- Update Accumulator ---
-        added_battery_energy = (battery_power * period_hours) / 1000
+        added_battery_energy = calculate_battery_energy_delta_kwh(
+            battery_power,
+            period_hours,
+            charge_efficiency=HOME_BATTERY_CHARGE_EFFICIENCY,
+            discharge_efficiency=HOME_BATTERY_DISCHARGE_EFFICIENCY,
+        )
         accumulated_energy += added_battery_energy
 
         # Calculate final battery state for this step
         new_battery_energy = max(0, min(battery_capacity, battery_energy + accumulated_energy))
 
         # Track only energy that actually remains available after meeting load and imports.
-        surplus_delta = (battery_power - power_from_grid) * period_hours / 1000
+        # Surplus is an AC-deliverable policy budget.  Charging gains only the
+        # energy that can later survive both conversion directions; discharge
+        # and grid import are already AC-side quantities.
+        surplus_battery_power = battery_power
+        if battery_power > 0:
+            surplus_battery_power = (
+                battery_power
+                * HOME_BATTERY_CHARGE_EFFICIENCY
+                * HOME_BATTERY_DISCHARGE_EFFICIENCY
+            )
+        surplus_delta = (
+            (surplus_battery_power - power_from_grid)
+            * period_hours
+            / 1000
+        )
         surplus += surplus_delta
 
         # Update setpoint for next loop context
@@ -2383,8 +2608,10 @@ def get_pv_forecast_with_prices(t_start: datetime, t_end: datetime, epex_prices:
         ]
         if el["period_start"] > (t_start - timedelta(minutes=31)) and el["period_start"] < t_end
     ]
-    if len(forecast) == 0:
-        log.warning("No forecast data available")
+    if len(forecast) < 2:
+        log.warning(
+            f"Not enough forecast data available ({len(forecast)} entries)"
+        )
         return []
 
     def get_date_tuple(date_time: str | datetime):
@@ -2394,10 +2621,6 @@ def get_pv_forecast_with_prices(t_start: datetime, t_end: datetime, epex_prices:
             dt = datetime.fromisoformat(date_time).astimezone()
         return dt.day, dt.hour, dt.minute
 
-    prices = {
-        (get_date_tuple(entry["start_time"]), get_date_tuple(entry["end_time"])): entry["price_per_kwh"]
-        for entry in epex_prices
-    }
     period_hours = (forecast[1]["period_start"] - forecast[0]["period_start"]).total_seconds() / 60 / 60
     prices = {}
     for entry in epex_prices:
@@ -2410,13 +2633,22 @@ def get_pv_forecast_with_prices(t_start: datetime, t_end: datetime, epex_prices:
         # insert price
         start_time = forecast_entry["period_start"]
 
+        period_price = prices.get(get_date_tuple(start_time))
+        if period_price is None:
+            # Price data and PV data update independently.  A missing bucket must
+            # not kill surplus publication and leave an old energy authorization
+            # behind; fall back to the conservative import-tariff model.
+            period_price = get_price(start_time.hour, start_time.minute)
+            log.warning(
+                f"No EPEX price found for forecast entry {get_date_tuple(start_time)}; "
+                f"using fallback price {period_price:.4f}"
+            )
+
         forecast[idx] = PVForecastWithPrices(
             start_time,
             pv_estimate=forecast_entry["pv_estimate"],
-            price_per_kwh=prices.get(get_date_tuple(start_time)),
+            price_per_kwh=period_price,
         )
-        if forecast[idx].price_per_kwh is None:
-            log.warning(f"No price found for forecast entry {get_date_tuple(start_time)}")
 
     forecast = extend_pv_forecast_to_horizon(forecast, t_end, prices)
     if forecast[-1].period_start > source_forecast_end:
@@ -2594,7 +2826,7 @@ def auto_setpoint_target():
     ):
         if t_start is not None:
             pv_forecast = [entry for entry in pv_forecast if t_start < entry.period_start]
-        elif t_end is not None:
+        if t_end is not None:
             pv_forecast = [entry for entry in pv_forecast if entry.period_start < t_end]
         result = forecast(
             pv_forecast,
@@ -2676,6 +2908,11 @@ def auto_setpoint_target():
     # Binary search for optimal setpoint
     current_battery_energy = battery_energy
     epex_prices = get_attr(ElectricityPrices.epex_forecast_prices, "data", [])
+    epex_export_prices = get_attr(
+        ElectricityPrices.epex_export_forecast_prices,
+        "data",
+        [],
+    )
 
     if not epex_prices:
         log.warning("Unable to forecast setpoint, no EPEX prices available")
@@ -2689,8 +2926,11 @@ def auto_setpoint_target():
 
     if unified_scheduler_enabled:
         hard_max_grid_export_w = min(5500.0, max_feedin_limit)
-        # Keep the normal controller well clear of the independent roof-PV
-        # trip point (300 W below the legal/configured cap).
+        # This is the sustained planning cap, not a zero-duration trip point.
+        # Short Victron tracking overshoots are acceptable.  The scheduler must
+        # avoid multi-minute / settlement-interval violations where battery
+        # headroom can do so; an external HA automation disables roof PV only as
+        # the independent last resort when storage cannot contain the peak.
         export_cap_margin_w = 500.0
         planned_max_grid_export_w = max(
             0.0,
@@ -2708,15 +2948,41 @@ def auto_setpoint_target():
             House.energy_surplus_after_ev_charging,
             0,
         )
+        published_surplus_calculated_at = with_timezone(
+            get_attr(
+                House.energy_surplus_after_ev_charging,
+                "calculated_at",
+            )
+        )
+        published_surplus_age_seconds = None
+        if published_surplus_calculated_at is not None:
+            published_surplus_age_seconds = max(
+                0.0,
+                (t_now - published_surplus_calculated_at).total_seconds(),
+            )
+            if published_surplus_age_seconds > 300:
+                log.warning(
+                    f"Using {published_surplus_age_seconds / 60:.1f}-minute-old surplus "
+                    "under current physical battery floors and safety margins"
+                )
         base_spendable_energy_kwh = get(House.energy_surplus, 0)
-        spendable_horizon = with_timezone(
-            get_attr(House.energy_surplus, "spendable_horizon")
+        published_local_ev_wall_energy_kwh = max(
+            0.0,
+            float(
+                get_attr(
+                    House.energy_surplus_after_ev_charging,
+                    "local_ev_wall_energy_before_departure",
+                    0,
+                )
+                or 0
+            ),
         )
         ev_obligation_due_within_horizon = bool(
             with_ev_charging
             and next_departure is not None
-            and spendable_horizon is not None
-            and next_departure.start <= spendable_horizon
+            and t_now < next_departure.start
+            and next_departure.start
+            <= t_now + timedelta(hours=EV_EXPORT_RESERVATION_HORIZON_HOURS)
         )
         # Re-apply the same invariant with live EV demand.  This closes the
         # short race where EV.energy_needed changes before the surplus sensor's
@@ -2727,6 +2993,9 @@ def auto_setpoint_target():
             remaining_ev_energy_kwh=ev_energy_needed,
             charge_efficiency=EVConst.charge_efficiency,
             obligation_due_within_horizon=ev_obligation_due_within_horizon,
+            local_ev_wall_energy_before_departure_kwh=(
+                published_local_ev_wall_energy_kwh
+            ),
         )
         if policy_surplus_energy_kwh + 0.01 < published_policy_surplus_energy_kwh:
             log.warning(
@@ -2785,6 +3054,7 @@ def auto_setpoint_target():
             uncertainty_margin_kwh=EXPORT_BASE_UNCERTAINTY_MARGIN_KWH,
             house_load_margin_fraction=EXPORT_HOUSE_LOAD_MARGIN_FRACTION,
             pv_confidence_factor=EXPORT_PV_CONFIDENCE_FACTOR,
+            discharge_efficiency=HOME_BATTERY_DISCHARGE_EFFICIENCY,
         )
 
         # The neutral replay supplies capacity and spill estimates only. The
@@ -2815,7 +3085,7 @@ def auto_setpoint_target():
             neutral_forecast.detail[0].period_start.isoformat(),
             battery_min_energy,
         )
-        safe_export_energy_kwh = max(
+        safe_stored_energy_kwh = max(
             0.0,
             battery_energy - current_planned_floor_kwh - scheduler_safety_margin_kwh,
         )
@@ -2824,15 +3094,20 @@ def auto_setpoint_target():
                 detail_entry.period_start.isoformat(),
                 battery_min_energy,
             )
-            safe_export_energy_kwh = min(
-                safe_export_energy_kwh,
+            safe_stored_energy_kwh = min(
+                safe_stored_energy_kwh,
                 max(
                     0.0,
                     detail_entry.battery_energy - period_floor - scheduler_safety_margin_kwh,
                 ),
             )
 
-        physical_safe_export_energy_kwh = safe_export_energy_kwh
+        # ``safe_stored_energy_kwh`` is DC battery inventory.  The scheduler
+        # allocates AC grid export, so conversion loss must reduce its budget.
+        physical_safe_export_energy_kwh = (
+            safe_stored_energy_kwh
+            * HOME_BATTERY_DISCHARGE_EFFICIENCY
+        )
         safe_export_energy_kwh = get_policy_bounded_export_budget(
             physically_available_energy_kwh=physical_safe_export_energy_kwh,
             spendable_energy_after_ev_kwh=policy_surplus_energy_kwh,
@@ -2851,6 +3126,7 @@ def auto_setpoint_target():
 
         scheduler_slots = []
         scheduler_period_ends = {}
+        missing_export_price_periods = 0
         for index, detail_entry in enumerate(neutral_forecast.detail):
             if index + 1 < len(neutral_forecast.detail):
                 period_end = neutral_forecast.detail[index + 1].period_start
@@ -2862,11 +3138,28 @@ def auto_setpoint_target():
                 period_end = detail_entry.period_start + timedelta(minutes=15)
             effective_start = max(t_now, detail_entry.period_start)
             duration_hours = max(0.0, (period_end - effective_start).total_seconds() / 3600)
+            gross_export_price = get_interval_price(
+                epex_export_prices,
+                detail_entry.period_start,
+            )
+            if gross_export_price is None:
+                # The live surplus budget still prevents speculative export.
+                # Falling back to the EPEX total-price bucket keeps ranking
+                # available during a transient market-price attribute update;
+                # the installation currently configures zero import surcharge.
+                gross_export_price = detail_entry.epex_price
+                missing_export_price_periods += 1
             scheduler_slots.append(
                 ExportSchedulerSlot(
                     period_start=detail_entry.period_start,
                     duration_hours=duration_hours,
-                    price_per_kwh=detail_entry.epex_price,
+                    price_per_kwh=calculate_net_battery_export_price(
+                        gross_export_price,
+                        inverter_efficiency=HOME_BATTERY_DISCHARGE_EFFICIENCY,
+                        broker_revenue_margin_fraction=(
+                            EXPORT_BROKER_REVENUE_MARGIN_FRACTION
+                        ),
+                    ),
                     baseline_setpoint_w=min(
                         0.0,
                         detail_entry.power_from_grid - detail_entry.feedin,
@@ -2878,6 +3171,11 @@ def auto_setpoint_target():
                 )
             )
             scheduler_period_ends[detail_entry.period_start.isoformat()] = period_end
+        if missing_export_price_periods:
+            log.warning(
+                f"No raw EPEX export price for {missing_export_price_periods} forecast "
+                "periods; using the matching total-price bucket for timing only"
+            )
 
         pv_feedin_samples = []
         preferred_headroom_requirements = []
@@ -2921,7 +3219,9 @@ def auto_setpoint_target():
             if hard_overflow_kwh > 0:
                 hard_headroom_requirements.append((period_end, hard_requirement_kwh))
             headroom_reference_energy_kwh += preferred_overflow_kwh
-            headroom_reference_value += preferred_overflow_kwh * detail_entry.epex_price
+            headroom_reference_value += (
+                preferred_overflow_kwh * scheduler_slot.price_per_kwh
+            )
         overflow_energy_kwh = calculate_pv_overflow_energy(
             pv_feedin_samples,
             max_pv_feedin,
@@ -3151,13 +3451,34 @@ def auto_setpoint_target():
             export_house_load_margin_fraction=EXPORT_HOUSE_LOAD_MARGIN_FRACTION,
             export_pv_confidence_factor=EXPORT_PV_CONFIDENCE_FACTOR,
             export_base_uncertainty_margin_kwh=EXPORT_BASE_UNCERTAINTY_MARGIN_KWH,
+            home_battery_charge_efficiency=HOME_BATTERY_CHARGE_EFFICIENCY,
+            home_battery_discharge_efficiency=(
+                HOME_BATTERY_DISCHARGE_EFFICIENCY
+            ),
+            export_broker_revenue_margin_fraction=(
+                EXPORT_BROKER_REVENUE_MARGIN_FRACTION
+            ),
+            export_price_source=(
+                ElectricityPrices.epex_export_forecast_prices
+            ),
+            export_price_fallback_periods=missing_export_price_periods,
             safe_export_energy_kwh=round(safe_export_energy_kwh, 3),
+            safe_stored_energy_kwh=round(safe_stored_energy_kwh, 3),
             physical_safe_export_energy_kwh=round(
                 physical_safe_export_energy_kwh,
                 3,
             ),
             published_policy_surplus_energy_kwh=round(
                 published_policy_surplus_energy_kwh,
+                3,
+            ),
+            published_surplus_age_seconds=(
+                round(published_surplus_age_seconds, 1)
+                if published_surplus_age_seconds is not None
+                else None
+            ),
+            published_local_ev_wall_energy_kwh=round(
+                published_local_ev_wall_energy_kwh,
                 3,
             ),
             policy_surplus_energy_kwh=round(policy_surplus_energy_kwh, 3),
