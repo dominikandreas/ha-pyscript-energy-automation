@@ -19,6 +19,8 @@ if TYPE_CHECKING:
         _get_ev_smart_charge_limit,
         ChargeAction,
         ChargeMode,
+        apply_ev_surplus_start_confirmation,
+        calculate_ev_battery_support_power,
         get_drive_energy_drain,
         get_drive_required_soc,
         get_ev_charge_energy_limit,
@@ -105,6 +107,8 @@ else:
         _get_charge_action,
         ChargeAction,
         ChargeMode,
+        apply_ev_surplus_start_confirmation,
+        calculate_ev_battery_support_power,
         get_drive_energy_drain,
         get_drive_required_soc,
         get_ev_charge_energy_limit,
@@ -1193,6 +1197,7 @@ def forecast_surplus():
     battery_capacity = get(Battery.capacity, 1337)
     battery_energy = get(Battery.energy, 1337)
     current_surplus = get(House.energy_surplus, 0)
+    previous_ev_adjusted_surplus = get(House.energy_surplus_after_ev_charging, 0)
     ev_energy = get(EV.energy, 0)
     reserve_soc = get_reserve_soc()
     minimal_soc = get(Automation.minimal_soc, reserve_soc)
@@ -1441,7 +1446,10 @@ def forecast_surplus():
             battery_capacity=battery_capacity,
             battery_energy=battery_energy,
             setpoint=setpoint,
-            forecast_dampening=1,
+            # Publish the same conservative PV confidence used by the spendable
+            # budget.  The dashboard must not promise an EV start that live
+            # measured headroom is unlikely to sustain.
+            forecast_dampening=0.8,
             with_ev_charging=forecast_ev_charging_enabled,
             ev_schedule=ev_schedule,
             battery_min_energy=surplus_battery_floor,
@@ -1455,6 +1463,10 @@ def forecast_surplus():
             # logging=True,
             surplus_energy=surplus,
             ev_energy=ev_energy,
+            # Use the prior conservative publication to avoid a circular
+            # forecast.  The controller applies a further 3 kWh safety reserve,
+            # so a slightly old value fails gradually instead of overcommitting.
+            ev_battery_support_energy_kwh=previous_ev_adjusted_surplus,
         )
 
         min_battery_energy = min([el.battery_energy for el in forecast_with_ev.detail] or [0])
@@ -1505,12 +1517,17 @@ def forecast_surplus():
                     iter([entry for entry in departure_entries if entry.ev_charge_power > 100]),
                     None,
                 )
+                first_charge_time = None
+                if first_charge_entry:
+                    first_charge_time = first_charge_entry.period_start + timedelta(
+                        minutes=first_charge_entry.ev_charge_start_delay_minutes
+                    )
                 departure_forecast_summary = (
                     f"EV departure {next_departure.start}: required {required_departure_soc:.2f}% "
                     f"({required_departure_energy:.2f} kWh), forecast {departure_ev_soc:.2f}% "
                     f"({departure_ev_energy:.2f} kWh), shortfall {departure_shortfall:.2f} kWh, "
                     f"planned charge {planned_charge_energy:.2f} kWh, "
-                    f"first charge {first_charge_entry.period_start if first_charge_entry else 'none'}"
+                    f"first charge {first_charge_time if first_charge_time else 'none'}"
                 )
         ev_forecast_spendable_energy, _, _, _ = get_spendable_solar_cycle_energy(
             spendable_forecast_with_ev.detail,
@@ -1605,6 +1622,8 @@ def forecast_surplus():
             round(forecast_with_ev.detail[-1].battery_energy, 2),
             **energy_kwh_attributes,
             ev_charging_enabled=forecast_ev_charging_enabled,
+            forecast_pv_factor=0.8,
+            ev_battery_support_budget=round(previous_ev_adjusted_surplus, 3),
             detail=detail_with_ev_vectorized,
         )
         set_energy_surplus(
@@ -1685,6 +1704,8 @@ def define_interfaces():
         setpoint_spread: float
         ev_energy: float
         ev_charge_power: float
+        ev_charge_start_delay_minutes: float
+        ev_battery_support_power: float
         excess_target: float
         surplus: float
         power_from_grid: float
@@ -1843,6 +1864,7 @@ def forecast(
     logging=False,
     ev_schedule: list[EVScheduleEntry] | None = None,
     surplus_energy: float | None = None,
+    ev_battery_support_energy_kwh: float = 0,
     battery_export_budget_kwh: float | None = None,
     daily_power: float | None = None,
     nightly_power: float | None = None,
@@ -1918,6 +1940,7 @@ def forecast(
         logging=logging,
         ev_schedule=ev_schedule,
         surplus_energy=surplus_energy,
+        ev_battery_support_energy_kwh=ev_battery_support_energy_kwh,
         battery_export_budget_kwh=battery_export_budget_kwh,
         daily_power=daily_power,
         nightly_power=nightly_power,
@@ -1962,6 +1985,7 @@ def _forecast(
     logging=False,
     ev_schedule: list[EVScheduleEntry] | None = None,
     surplus_energy: float | None = None,
+    ev_battery_support_energy_kwh: float = 0,
     battery_export_budget_kwh: float | None = None,
     daily_power: float | None = None,
     nightly_power: float | None = None,
@@ -1997,6 +2021,7 @@ def _forecast(
         )
 
     surplus = surplus_energy
+    ev_battery_support_budget_remaining_kwh = max(0, ev_battery_support_energy_kwh)
     battery_export_budget_remaining_kwh = battery_export_budget_kwh
     orig_setpoint = setpoint
 
@@ -2152,9 +2177,16 @@ def _forecast(
 
         # --- EV Charging Action ---
         ev_charge_power = 0.0
+        ev_charge_start_delay_minutes = 0.0
+        ev_battery_support_power = 0.0
         charge_mode = ChargeMode.idle
+        was_charging_ev = is_charging_ev
 
         if could_charge_ev:
+            ev_battery_support_power = calculate_ev_battery_support_power(
+                excess_target=excess_target,
+                ev_adjusted_surplus_energy=ev_battery_support_budget_remaining_kwh,
+            )
             charge_action, new_charge_phases, charge_current, reason, charge_mode = (
                 get_settled_simulated_ev_charge_action(
                     next_drive=next_drive_event.start if next_drive_event else None,
@@ -2176,6 +2208,7 @@ def _forecast(
                     inverter_mode=inverter_mode,
                     battery_force_charge=is_force_charging,
                     battery_floor_soc=period_battery_min_energy / battery_capacity * 100,
+                    battery_support_power=ev_battery_support_power,
                 )
             )
 
@@ -2184,6 +2217,14 @@ def _forecast(
 
             if is_charging_ev:
                 ev_charge_power = charge_phases * charge_current * 230  # W
+                ev_charge_power, ev_charge_start_delay_minutes = (
+                    apply_ev_surplus_start_confirmation(
+                        ev_charge_power,
+                        period_minutes,
+                        was_charging_ev,
+                        charge_mode,
+                    )
+                )
                 # prevent unnecessary discharging of battety
                 battery_target_soc = tentative_batt_soc + 1
 
@@ -2242,6 +2283,20 @@ def _forecast(
                 )
 
             ev_energy += added_ev_energy
+            local_ev_headroom_power = max(
+                0,
+                power_production - house_power - max(0, excess_target),
+            )
+            actual_battery_support_power = min(
+                ev_battery_support_power,
+                max(0, ev_charge_power - local_ev_headroom_power),
+            )
+            ev_battery_support_budget_remaining_kwh = max(
+                0,
+                ev_battery_support_budget_remaining_kwh
+                - actual_battery_support_power * period_hours / 1000,
+            )
+            ev_battery_support_power = actual_battery_support_power
             free_capacity = (
                 ev_charge_energy_limit - ev_energy + battery_capacity - battery_energy
             )
@@ -2497,6 +2552,8 @@ def _forecast(
                 setpoint_spread=setpoint_spread,
                 ev_energy=ev_energy,
                 ev_charge_power=ev_charge_power,
+                ev_charge_start_delay_minutes=ev_charge_start_delay_minutes,
+                ev_battery_support_power=ev_battery_support_power,
                 excess_target=excess_target,
                 surplus=surplus,
                 power_from_grid=power_from_grid,

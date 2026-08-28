@@ -16,6 +16,9 @@ else:
 HYSTERESIS_BUFFER = 1200  # Watts buffer for phase switching
 SURPLUS_START_MARGIN = 300  # W above the physical minimum before starting
 SURPLUS_STOP_MARGIN = 300  # W tolerated below the physical minimum while running
+EV_SURPLUS_START_CONFIRMATION_MINUTES = 3.0
+EV_BATTERY_SUPPORT_RESERVE_KWH = 3.0
+EV_BATTERY_SUPPORT_BUDGET_HOURS = 1.0
 
 
 class ChargeAction:
@@ -134,7 +137,10 @@ def get_drive_required_soc(required_soc, distance, default_required_soc):
         return float(required_soc)
     if distance:
         drive_energy = min(Const.ev_capacity, float(distance) / 100 * Const.kwh_per_100km)
-        return min(100, round(drive_energy / Const.ev_capacity * 100 * 1.2, 2))
+        # The reserve is an absolute 10 percentage points of EV SOC.  A 20%
+        # multiplier on trip energy left almost no usable reserve on short
+        # drives (30 km previously produced a 10.2% target).
+        return min(100, round(drive_energy / Const.ev_capacity * 100 + 10, 2))
     return float(default_required_soc)
 
 
@@ -190,7 +196,11 @@ def calculate_charger_current_adjustment(
 
 @pyscript_compile
 def calculate_available_ev_power(
-    excess_power: float, excess_target: float, wallbox_power: float, is_charging: bool
+    excess_power: float,
+    excess_target: float,
+    wallbox_power: float,
+    is_charging: bool,
+    battery_support_power: float = 0,
 ) -> float:
     """Return EV power available at the configured excess target.
 
@@ -200,11 +210,59 @@ def calculate_available_ev_power(
     """
 
     active_wallbox_power = max(0, wallbox_power) if is_charging else 0
-    # A negative excess target deliberately requests home-battery discharge.
-    # That energy is not PV surplus and must never be offered to an optional EV
-    # charge.  Positive targets remain reserved for charging the home battery.
+    # Positive targets remain reserved for charging the home battery. Negative
+    # targets are offered only through the separately budgeted support power;
+    # this prevents a setpoint alone from turning stored energy into EV load.
     reserved_excess_power = max(0, excess_target)
-    return excess_power - reserved_excess_power + active_wallbox_power
+    return (
+        excess_power
+        - reserved_excess_power
+        + active_wallbox_power
+        + max(0, battery_support_power)
+    )
+
+
+@pyscript_compile
+def calculate_ev_battery_support_power(
+    excess_target: float,
+    ev_adjusted_surplus_energy: float,
+) -> float:
+    """Return bounded home-battery power that may support optional EV charging.
+
+    ``ev_adjusted_surplus_energy`` is the conservative, AC-deliverable budget
+    after the scheduled EV obligation and protected home-battery floor.  Keep a
+    further error reserve and never authorize more power than the negative
+    excess target requests or the remaining budget could sustain for one hour.
+    """
+
+    requested_discharge_power = max(0, -excess_target)
+    support_budget_kwh = max(
+        0,
+        ev_adjusted_surplus_energy - EV_BATTERY_SUPPORT_RESERVE_KWH,
+    )
+    energy_bounded_power = support_budget_kwh * 1000 / EV_BATTERY_SUPPORT_BUDGET_HOURS
+    return min(requested_discharge_power, energy_bounded_power)
+
+
+@pyscript_compile
+def apply_ev_surplus_start_confirmation(
+    ev_charge_power: float,
+    period_minutes: float,
+    was_charging: bool,
+    charge_mode: str,
+):
+    """Apply the live surplus-start confirmation delay to forecast power."""
+
+    if ev_charge_power <= 0 or was_charging or charge_mode != ChargeMode.surplus:
+        return ev_charge_power, 0.0
+    delay_minutes = min(
+        max(0, period_minutes),
+        EV_SURPLUS_START_CONFIRMATION_MINUTES,
+    )
+    if period_minutes <= 0:
+        return 0.0, delay_minutes
+    active_fraction = (period_minutes - delay_minutes) / period_minutes
+    return ev_charge_power * active_fraction, delay_minutes
 
 
 @pyscript_compile
@@ -253,6 +311,7 @@ def _get_charge_action(
     battery_force_charge=False,
     wallbox_power: float = 0,
     battery_floor_soc: float = 0,
+    battery_support_power: float = 0,
 ):
     """Calculate the action to take for EV charging based on various conditions.
 
@@ -298,6 +357,7 @@ def _get_charge_action(
         excess_target=excess_target,
         wallbox_power=wallbox_power,
         is_charging=is_charging,
+        battery_support_power=battery_support_power,
     )
     minimum_charge_power = Const.min_phases * Const.voltage * Const.min_current
     surplus_power_threshold = (
@@ -305,10 +365,10 @@ def _get_charge_action(
         if is_charging
         else minimum_charge_power + SURPLUS_START_MARGIN
     )
-    control_excess_target = max(0, excess_target)
+    control_excess_target = max(0, excess_target) - max(0, battery_support_power)
     # Positive ``excess_target`` reserves power needed by the home battery.
-    # Negative targets request battery discharge and are intentionally ignored
-    # for optional EV charging.
+    # A negative target is honored only up to ``battery_support_power``, which
+    # has already been limited by the EV-adjusted kWh budget.
     # Once the remaining physical headroom can sustain the charger's minimum,
     # a separate global-energy/3 kW gate must not force that PV into the grid.
     surplus_available = available_ev_power >= surplus_power_threshold
@@ -386,6 +446,12 @@ def _get_charge_action(
                 excess_power, control_excess_target, configured_phases, configured_current
             )
             target_current = configured_current + adj if phases <= configured_phases else 7
+            if battery_support_power > 0:
+                # The filtered control error may lag a fast charger ramp.  Cap
+                # the command immediately to power justified by current local
+                # headroom plus the explicitly authorized battery support.
+                safe_current = int(available_ev_power // (Const.voltage * phases))
+                target_current = min(target_current, safe_current)
         else:
             # Start at a setpoint the measured headroom can actually support.
             target_current = int(available_ev_power // (Const.voltage * phases))
@@ -393,8 +459,9 @@ def _get_charge_action(
         phases, current, reason = (
             phases,
             clip(target_current, Const.min_current, Const.max_current),
-            f"Excess power detected: {excess_power:.0f} W, PV reserve target: {control_excess_target:.0f} W, current power {current_power:.0f} W, "
-            f"Available Power for EV: {available_ev_power:.0f} W",
+            f"Local surplus power detected: {excess_power:.0f} W, control target: {control_excess_target:.0f} W, "
+            f"battery support: {battery_support_power:.0f} W, current power {current_power:.0f} W, "
+            f"available power for EV: {available_ev_power:.0f} W",
         )
         return (ChargeAction.on, phases, current, reason, ChargeMode.surplus)
 
@@ -478,6 +545,7 @@ def get_settled_simulated_ev_charge_action(
     inverter_mode,
     battery_force_charge,
     battery_floor_soc=0,
+    battery_support_power=0,
     max_control_steps=10,
 ):
     """Settle minute-rate EV control inside one forecast interval.
@@ -523,6 +591,7 @@ def get_settled_simulated_ev_charge_action(
             battery_force_charge=battery_force_charge,
             wallbox_power=wallbox_power,
             battery_floor_soc=battery_floor_soc,
+            battery_support_power=battery_support_power,
         )
         next_is_charging = action == ChargeAction.on
         if new_phases != phases:

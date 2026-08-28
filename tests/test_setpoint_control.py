@@ -1081,6 +1081,29 @@ class SetpointControlTests(unittest.TestCase):
         self.assertEqual(keywords["surplus_energy"].value, 0)
         self.assertEqual(keywords["battery_min_energy"].id, "surplus_battery_floor")
 
+        published_ev_forecasts = []
+        for node in ast.walk(forecast_surplus_node):
+            if not (
+                isinstance(node, ast.Assign)
+                and any(
+                    isinstance(target, ast.Name) and target.id == "forecast_with_ev"
+                    for target in node.targets
+                )
+                and isinstance(node.value, ast.Call)
+            ):
+                continue
+            published_ev_forecasts.append(
+                {keyword.arg: keyword.value for keyword in node.value.keywords}
+            )
+
+        self.assertEqual(len(published_ev_forecasts), 1)
+        published_keywords = published_ev_forecasts[0]
+        self.assertEqual(published_keywords["forecast_dampening"].value, 0.8)
+        self.assertEqual(
+            published_keywords["ev_battery_support_energy_kwh"].id,
+            "previous_ev_adjusted_surplus",
+        )
+
         raw_minimum_publications = [
             node
             for node in ast.walk(forecast_surplus_node)

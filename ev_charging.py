@@ -11,7 +11,9 @@ if TYPE_CHECKING:
     from modules.const import EV as Const
     from modules.energy_core import (
         ChargeMode,
+        EV_SURPLUS_START_CONFIRMATION_MINUTES,
         HYSTERESIS_BUFFER,
+        calculate_ev_battery_support_power,
         get_drive_required_soc,
         get_ongoing_and_next_drive,
     )
@@ -41,10 +43,12 @@ else:
     from states import Automation, Charger, ElectricityPrices, EV, Excess, Battery, House, PVProduction
     from energy_core import (
         ChargeMode,
+        EV_SURPLUS_START_CONFIRMATION_MINUTES,
         HYSTERESIS_BUFFER,
         _get_charge_action,
         _get_ev_energy_needed,
         _get_ev_smart_charge_limit,
+        calculate_ev_battery_support_power,
         get_drive_required_soc,
         get_ongoing_and_next_drive,
     )  # noqa: F401
@@ -72,7 +76,7 @@ def smart_charge_limit():
 last_ev_charging_phase_change = now() - timedelta(minutes=15)
 last_charger_reset = now() - timedelta(minutes=15)
 
-PV_SURPLUS_START_CONFIRMATION = timedelta(minutes=3)
+PV_SURPLUS_START_CONFIRMATION = timedelta(minutes=EV_SURPLUS_START_CONFIRMATION_MINUTES)
 PV_SURPLUS_STOP_CONFIRMATION = timedelta(minutes=5)
 PV_SURPLUS_MIN_RUN_TIME = timedelta(minutes=10)
 PV_SURPLUS_RESTART_LOCKOUT = timedelta(minutes=5)
@@ -402,8 +406,8 @@ async def auto_ev_charging():
     required_soc = get(EV.required_soc, 80)
 
     # the current excess power available, this is defined as power going into the battery or into the grid (or the opposite, depending on the sign)
-    excess_power = get(Excess.power_1m_average, 1337)  # in W
-    if excess_power == 1337:
+    excess_power_average = get(Excess.power_1m_average, 1337)  # in W
+    if excess_power_average == 1337:
         log.warning("Excess power is not set, cannot proceed with charging control.")
         return
 
@@ -416,8 +420,10 @@ async def auto_ev_charging():
     # target excess is the amount of power requested by the home battery to be able to cover the house loads in the near future
     # it is dynamically updated by a separate automation
     excess_target = get(Excess.target, 0)  # in W
-    # surplus energy is the amount of energy that is likely available after accounting for house loads in the near future
-    surplus_energy = get(House.energy_surplus, 0)  # in kWh
+    # Use only the conservative budget after the scheduled EV obligation.  This
+    # makes optional battery-supported charging consume genuine surplus instead
+    # of energy reserved for a departure or the protected home-battery floor.
+    surplus_energy = get(House.energy_surplus_after_ev_charging, 0)  # in kWh
     protected_battery_floor_kwh = float(
         get_attr(House.energy_surplus, "protected_battery_floor", 0) or 0
     )
@@ -442,6 +448,20 @@ async def auto_ev_charging():
         )
         return
     wallbox_power = get(Charger.power, 0)
+    battery_support_power = calculate_ev_battery_support_power(
+        excess_target=excess_target,
+        ev_adjusted_surplus_energy=surplus_energy,
+    )
+    instantaneous_excess_power = get(Excess.power, excess_power_average)
+    # The one-minute average prevents chatter, but is unsafe as the sole input
+    # while intentionally discharging the battery: charger ramp-up can outrun
+    # the filter by several kW.  Use the lower instantaneous value as a hard
+    # ceiling, while retaining the average for conservative ramp-up.
+    excess_power = (
+        min(excess_power_average, instantaneous_excess_power)
+        if battery_support_power > 0
+        else excess_power_average
+    )
 
     smart_limiter_active = get(Automation.auto_charge_limit, False)
     ev_charge_limit = get(EV.smart_charge_limit, 80)
@@ -492,10 +512,12 @@ async def auto_ev_charging():
 
     log.warning(
         f"Current SOC: {current_soc}%, Required SOC: {required_soc}%, Surplus {surplus_energy:.2f}, energy needed {energy_needed:.2f} "
-        f"Excess: {excess_power:.0f} W, Target: {excess_target:.0f} W "
+        f"Excess: {excess_power:.0f} W (1m {excess_power_average:.0f} W, instant {instantaneous_excess_power:.0f} W), "
+        f"Target: {excess_target:.0f} W "
         f"Energy needed: {energy_needed:.2f} kWh, Time needed: {min_hours_needed:.2f}h, "
         f"low price: {low_price}, high price: {high_price}, next drive: {next_drive}, "
-        f"EV charge limit: {ev_charge_limit:.0f}%, protected battery floor: {battery_floor_soc:.1f}%"
+        f"EV charge limit: {ev_charge_limit:.0f}%, protected battery floor: {battery_floor_soc:.1f}%, "
+        f"bounded battery support: {battery_support_power:.0f} W"
     )
 
     #  -------------------------- Charging Strategy Logic -----------------------------------
@@ -527,6 +549,7 @@ async def auto_ev_charging():
         battery_force_charge=battery_force_charge,
         wallbox_power=wallbox_power,
         battery_floor_soc=battery_floor_soc,
+        battery_support_power=battery_support_power,
     )
 
     hours_available_to_charge = ((next_drive - t_now).total_seconds() / 3600) if next_drive else 999

@@ -34,8 +34,13 @@ def _load_energy_core_symbols():
         "HYSTERESIS_BUFFER",
         "SURPLUS_START_MARGIN",
         "SURPLUS_STOP_MARGIN",
+        "EV_SURPLUS_START_CONFIRMATION_MINUTES",
+        "EV_BATTERY_SUPPORT_RESERVE_KWH",
+        "EV_BATTERY_SUPPORT_BUDGET_HOURS",
         "calculate_available_ev_power",
         "calculate_charger_current_adjustment",
+        "calculate_ev_battery_support_power",
+        "apply_ev_surplus_start_confirmation",
         "get_drive_energy_drain",
         "get_ev_charge_energy_limit",
         "get_settled_simulated_ev_charge_action",
@@ -143,6 +148,7 @@ class EVChargingControlTests(unittest.TestCase):
             battery_force_charge=False,
             wallbox_power=0,
             battery_floor_soc=18.125,
+            battery_support_power=2500,
         )
 
         self.assertEqual(action, self.core["ChargeAction"].off)
@@ -282,14 +288,175 @@ class EVChargingControlTests(unittest.TestCase):
         self.assertIs(ongoing, active)
         self.assertIs(next_drive, following)
 
-    def test_distance_based_trip_requirement_has_one_twenty_percent_margin(self):
+    def test_distance_based_trip_requirement_adds_ten_soc_points(self):
         required_soc = self.core["get_drive_required_soc"](
             required_soc=None,
             distance=265.625,
             default_required_soc=65,
         )
 
-        self.assertAlmostEqual(required_soc, 85.0)
+        self.assertAlmostEqual(required_soc, 80.83)
+
+    def test_short_drive_still_has_a_ten_point_soc_reserve(self):
+        required_soc = self.core["get_drive_required_soc"](
+            required_soc=None,
+            distance=30,
+            default_required_soc=65,
+        )
+
+        trip_soc = (
+            30
+            / 100
+            * self.core["Const"].kwh_per_100km
+            / self.core["Const"].ev_capacity
+            * 100
+        )
+        self.assertAlmostEqual(required_soc, round(trip_soc + 10, 2))
+        self.assertGreaterEqual(required_soc - trip_soc, 9.99)
+
+    def test_explicit_trip_soc_wins_and_distance_target_is_capped(self):
+        explicit = self.core["get_drive_required_soc"](
+            required_soc=72,
+            distance=500,
+            default_required_soc=65,
+        )
+        capped = self.core["get_drive_required_soc"](
+            required_soc=None,
+            distance=1000,
+            default_required_soc=65,
+        )
+
+        self.assertEqual(explicit, 72)
+        self.assertEqual(capped, 100)
+
+    def test_battery_support_requires_ev_adjusted_budget_and_negative_target(self):
+        calculate = self.core["calculate_ev_battery_support_power"]
+
+        self.assertEqual(calculate(-2500, 3.0), 0)
+        self.assertEqual(calculate(500, 20), 0)
+        self.assertEqual(calculate(-2500, 3.5), 500)
+        self.assertEqual(calculate(-2500, 15.5), 2500)
+
+    def test_forecast_applies_live_three_minute_surplus_start_confirmation(self):
+        apply_confirmation = self.core["apply_ev_surplus_start_confirmation"]
+
+        power, delay = apply_confirmation(
+            2300,
+            period_minutes=30,
+            was_charging=False,
+            charge_mode=self.core["ChargeMode"].surplus,
+        )
+        self.assertEqual(delay, 3)
+        self.assertEqual(power, 2070)
+
+        short_power, short_delay = apply_confirmation(
+            2300,
+            period_minutes=2,
+            was_charging=False,
+            charge_mode=self.core["ChargeMode"].surplus,
+        )
+        self.assertEqual(short_delay, 2)
+        self.assertEqual(short_power, 0)
+
+        required_power, required_delay = apply_confirmation(
+            2300,
+            period_minutes=30,
+            was_charging=False,
+            charge_mode=self.core["ChargeMode"].required,
+        )
+        self.assertEqual(required_delay, 0)
+        self.assertEqual(required_power, 2300)
+
+    def test_current_incident_budget_starts_bounded_battery_supported_charge(self):
+        t_now = datetime(2026, 8, 28, 11, 53, tzinfo=timezone.utc)
+        support_power = self.core["calculate_ev_battery_support_power"](-2500, 15.52)
+        action, phases, current, reason, mode = self.core["_get_charge_action"](
+            next_drive=t_now + timedelta(hours=4, minutes=37),
+            current_soc=23,
+            required_soc=18.5,
+            energy_needed=0,
+            excess_power=496,
+            excess_target=-2500,
+            surplus_energy=15.52,
+            smart_charge_limit=100,
+            smart_limiter_active=True,
+            configured_phases=1,
+            configured_current=6,
+            is_low_price=False,
+            pv_total_power=967,
+            battery_soc=81.5,
+            is_charging=False,
+            t_now=t_now,
+            inverter_mode="on",
+            battery_force_charge=False,
+            wallbox_power=0,
+            battery_floor_soc=15,
+            battery_support_power=support_power,
+        )
+
+        self.assertEqual(action, self.core["ChargeAction"].on)
+        self.assertEqual(mode, self.core["ChargeMode"].surplus)
+        self.assertEqual((phases, current), (1, 13))
+        self.assertIn("battery support: 2500 W", reason)
+
+    def test_negative_target_alone_cannot_start_optional_ev_charge(self):
+        t_now = datetime(2026, 8, 28, 11, 53, tzinfo=timezone.utc)
+        action, _phases, _current, _reason, mode = self.core["_get_charge_action"](
+            next_drive=t_now + timedelta(hours=5),
+            current_soc=23,
+            required_soc=18.5,
+            energy_needed=0,
+            excess_power=496,
+            excess_target=-2500,
+            surplus_energy=3,
+            smart_charge_limit=100,
+            smart_limiter_active=False,
+            configured_phases=1,
+            configured_current=6,
+            is_low_price=False,
+            pv_total_power=967,
+            battery_soc=81.5,
+            is_charging=False,
+            t_now=t_now,
+            inverter_mode="on",
+            battery_force_charge=False,
+            wallbox_power=0,
+            battery_floor_soc=15,
+            battery_support_power=0,
+        )
+
+        self.assertEqual(action, self.core["ChargeAction"].off)
+        self.assertEqual(mode, self.core["ChargeMode"].hard_stop)
+
+    def test_battery_supported_charge_caps_current_on_instantaneous_deficit(self):
+        t_now = datetime(2026, 8, 28, 12, 9, tzinfo=timezone.utc)
+        action, phases, current, _reason, mode = self.core["_get_charge_action"](
+            next_drive=t_now + timedelta(hours=4),
+            current_soc=23,
+            required_soc=18.5,
+            energy_needed=0,
+            excess_power=-5617,
+            excess_target=-2500,
+            surplus_energy=12.65,
+            smart_charge_limit=100,
+            smart_limiter_active=False,
+            configured_phases=3,
+            configured_current=11,
+            is_low_price=False,
+            pv_total_power=2702,
+            battery_soc=82.4,
+            is_charging=True,
+            t_now=t_now,
+            inverter_mode="on",
+            battery_force_charge=False,
+            wallbox_power=7910,
+            battery_floor_soc=18.1,
+            battery_support_power=2500,
+        )
+
+        self.assertEqual(action, self.core["ChargeAction"].on)
+        self.assertEqual(mode, self.core["ChargeMode"].surplus)
+        self.assertEqual((phases, current), (3, 6))
 
     def test_returned_car_is_available_during_only_the_current_drive_window(self):
         t_now = datetime(2026, 8, 17, 18, 10, tzinfo=timezone.utc)
@@ -684,6 +851,14 @@ class EVChargingControlTests(unittest.TestCase):
             and call.func.id == "get_settled_simulated_ev_charge_action"
         )
         self.assertIn("house_power", [keyword.arg for keyword in forecast_charge_call.keywords])
+        self.assertIn("battery_support_power", [keyword.arg for keyword in forecast_charge_call.keywords])
+        live_source = ast.unparse(live_node)
+        self.assertIn("House.energy_surplus_after_ev_charging", live_source)
+        self.assertIn("calculate_ev_battery_support_power", live_source)
+        self.assertIn("Excess.power", live_source)
+        forecast_source = ast.unparse(forecast_node)
+        self.assertIn("calculate_ev_battery_support_power", forecast_source)
+        self.assertIn("apply_ev_surplus_start_confirmation", forecast_source)
         self.assertFalse(
             any(isinstance(node, ast.GeneratorExp) for node in ast.walk(forecast_surplus_node)),
             "forecast_surplus must avoid generator expressions unsupported by Pyscript",
