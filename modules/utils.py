@@ -248,7 +248,8 @@ def write_output_states(state_attributes):
             v["name"] = id.replace("_", " ").title()
         v["unique_id"] = id
         v["state"] = "undefined"
-        for k in ("friendly_name",):
+        # not supported in template sensor
+        for k in ("friendly_name", "mode"):
             if k in v:
                 v.pop(k)
         sensors.append(v)

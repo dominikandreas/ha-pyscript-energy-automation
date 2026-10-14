@@ -17,6 +17,10 @@ class ElectricityPrices:
     # raw market prices only rank already-authorized surplus export.
     epex_forecast_prices = "sensor.epex_spot_data_total_price"
     epex_export_forecast_prices = "sensor.epex_spot_data_market_price"
+    # Realized feed-in compensation cap.  The installation currently earns a
+    # fixed tariff (~0.08 EUR/kWh) until the dynamic export contract switch;
+    # raise this to ~1.0 then so EPEX-ranked economic export can pay again.
+    feedin_compensation_cap = "input_number.feedin_compensation_cap"
 
 
 class Environment:
@@ -55,7 +59,7 @@ class Battery:
     charge_limit = "input_number.victron_charge_power_limit"
     """The charge power limit of the battery"""
     power = "sensor.victron_battery_power"
-    """The current power of the battery (positive when charging, negative when discharging)."""
+    """Battery power in kW (positive when charging, negative when discharging)."""
 
 
 class Charger:
@@ -118,6 +122,8 @@ class EV:
     able_to_charge_on_arrival = "input_boolean.ev_able_to_charge_on_arrival"
     """Whether it should be assumed that EV can charge when scheduled to arrive."""
     plugged_in = "binary_sensor.tesla_plugged_in"
+    charge_state = "sensor.ev_charge_state"
+    """Dashboard feedback for the EV surplus-timing state machine."""
 
 
 class House:
@@ -143,6 +149,8 @@ class House:
     """Battery energy in kWh above the hard battery floor before the next local forecast minimum"""
     energy_surplus_after_ev_charging = "sensor.energy_surplus_after_ev_charging"
     """Energy surplus in kWh after accounting for planned EV charging"""
+    energy_balance_5_day = "sensor.energy_balance_5_day"
+    """Signed net energy position in kWh over the next 5 days after reserving an EV minimum-charge top-up; negative means grid import will be needed"""
     energy_forecast = "sensor.energy_forecast"
     """Energy forecast in kWh, expected excess energy based on PV forecast and house consumption"""
     energy_forecast_with_ev = "sensor.energy_forecast_with_ev"
@@ -254,6 +262,8 @@ class Automation:
     """Switch to enable/disable automatic charge limit calculation"""
     efficient_discharge = "input_boolean.efficient_discharge"
     """Switch to enable/disable efficient discharge mode"""
+    silent_mode = "input_boolean.silent_mode"
+    """Switch to cap battery/grid exchange at silent power for quiet operation"""
     unified_export_scheduler = "input_boolean.unified_export_scheduler"
     """Switch between the legacy controller and the unified export scheduler"""
     efficient_export_power = "input_number.efficient_export_power"

@@ -1,15 +1,16 @@
+from datetime import datetime, timedelta
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     # The type checker (linter) does not know that utils can directly be imported in the pyscript engine.
     # Therefore during type checking we pretend to import them from modules.utils, which it can resolve.
     from modules.const import EV as Const
-    from modules.utils import clip
+    from modules.utils import clip, with_timezone
     from modules.victron import Victron
 
 else:
     from const import EV as Const
-    from utils import clip
+    from utils import clip, with_timezone
     from victron import Victron
 
 
@@ -31,6 +32,7 @@ class ChargeMode:
     idle = "idle"
     required = "required"
     surplus = "surplus"
+    arrival_precharge = "arrival_precharge"
 
 
 @pyscript_compile
@@ -142,6 +144,66 @@ def get_drive_required_soc(required_soc, distance, default_required_soc):
         # drives (30 km previously produced a 10.2% target).
         return min(100, round(drive_energy / Const.ev_capacity * 100 + 10, 2))
     return float(default_required_soc)
+
+
+@pyscript_compile
+def parse_ev_schedule_entries(
+    schedule_data,
+    default_required_soc,
+    t_now,
+    entry_cls,
+    preserve_recent_arrival=False,
+):
+    """Shared EV schedule parser behind both app-level ``parse_full_schedule`` forks.
+
+    ``now`` is a Pyscript runtime helper and cannot safely be resolved from
+    inside a ``@pyscript_compile`` function.  Callers must freeze the time
+    before entering this deterministic parser.
+    """
+
+    if t_now is None:
+        raise ValueError("parse_ev_schedule_entries requires t_now")
+    t_now = with_timezone(t_now)
+    today = t_now.date()
+    today_weekday = today.weekday()
+    day_map = {
+        name: i for i, name in enumerate(["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"])
+    }
+
+    entries = []
+    for day_name, events in schedule_data.items():
+        event_weekday = day_map.get(day_name, -1)
+        if event_weekday == -1:
+            continue
+
+        day_offset = (event_weekday - today_weekday + 7) % 7
+        event_date = today + timedelta(days=day_offset)
+
+        for event in events:
+            soc = event.get("data", {}).get("required")
+            distance = event.get("data", {}).get("distance")  # km
+            soc = get_drive_required_soc(soc, distance, default_required_soc)
+
+            event_start = with_timezone(datetime.combine(event_date, event["from"]))
+            event_end = with_timezone(datetime.combine(event_date, event["to"]))
+            if event_end <= event_start:
+                event_end += timedelta(days=1)
+            if event_end <= t_now and not (
+                preserve_recent_arrival and t_now - event_end <= timedelta(hours=80)
+            ):
+                event_start += timedelta(days=7)
+                event_end += timedelta(days=7)
+
+            entries.append(
+                entry_cls(
+                    start=event_start,
+                    end=event_end,
+                    required_soc=float(soc) if soc is not None else None,
+                    distance=float(distance) if distance is not None else None,
+                )
+            )
+
+    return sorted(entries, key=lambda x: x.start)
 
 
 @pyscript_compile
@@ -289,6 +351,98 @@ def get_simulated_ev_power_inputs(
 
 
 @pyscript_compile
+def is_arrival_precharge_allowed(
+    able_to_charge_on_arrival,
+    next_drive,
+    ongoing,
+    current_soc,
+    charge_limit,
+    hours_available_to_charge,
+    battery_soc,
+    is_low_price=False,
+):
+    """Gate battery-funded arrival precharge on price, time pressure or overflow risk.
+
+    Recovered rule ("prevent charging ev from battery unless leaving soon"):
+    when the next drive leaves enough time to catch tomorrow's solar surplus,
+    waiting is preferred over draining the home battery tonight.  Battery
+    funded precharge is reserved for departures under 24h out, or a nearly
+    full home battery (>90%, mirroring the surplus-start guard) that would
+    otherwise spill PV the EV cannot absorb later.
+
+    Precharge is strictly a low-price top-up: at the day rate it self-sustains
+    on wallbox feedback plus the support budget and imports for hours while
+    the high-price stop below it stays shadowed.  True urgency belongs to the
+    emergency branch, real overflow to the surplus branch.
+    """
+
+    if not is_low_price:
+        return False
+    if not able_to_charge_on_arrival:
+        return False
+    if next_drive is None or ongoing:
+        return False
+    if current_soc >= charge_limit:
+        return False
+    if hours_available_to_charge < 24:
+        return True
+    return battery_soc > 90
+
+
+@pyscript_compile
+def get_ev_charge_feedback_state(
+    controller_active,
+    action,
+    is_charging,
+    start_candidate_since,
+    stop_candidate_since,
+    last_stop,
+    started_at,
+    t_now,
+    start_confirmation_minutes=3,
+    stop_confirmation_minutes=5,
+    min_run_minutes=10,
+    restart_lockout_minutes=5,
+    force_active=False,
+):
+    """Map the EV surplus-timing state machine to dashboard feedback.
+
+    Returns ``(state, seconds_remaining)`` where ``state`` is one of
+    ``off``, ``confirming_start``, ``restart_lockout``, ``starting``,
+    ``charging`` or ``confirming_stop``.  ``seconds_remaining`` counts down
+    the active confirmation/lockout window and is ``None`` otherwise.
+    Mirrors the guards in the live controller so the dashboard shows why
+    the wallbox has not switched yet instead of looking dead.
+    """
+
+    if force_active and is_charging:
+        return ("charging", None)
+    if not controller_active:
+        return ("off", None)
+    if is_charging and stop_candidate_since is not None:
+        deficit_for = (t_now - stop_candidate_since).total_seconds()
+        run_for = (t_now - started_at).total_seconds() if started_at is not None else 0
+        remaining = max(
+            stop_confirmation_minutes * 60 - deficit_for,
+            min_run_minutes * 60 - run_for,
+            0,
+        )
+        return ("confirming_stop", remaining)
+    if is_charging:
+        return ("charging", None)
+    if start_candidate_since is not None:
+        stable_for = (t_now - start_candidate_since).total_seconds()
+        remaining = max(0, start_confirmation_minutes * 60 - stable_for)
+        return ("confirming_start", remaining)
+    if action == "on":
+        lockout_remaining = restart_lockout_minutes * 60 - (t_now - last_stop).total_seconds()
+        if lockout_remaining > 0:
+            return ("restart_lockout", lockout_remaining)
+        return ("starting", None)
+    return ("off", None)
+
+
+@pyscript_compile
 def _get_charge_action(
     next_drive,
     current_soc,
@@ -312,6 +466,8 @@ def _get_charge_action(
     wallbox_power: float = 0,
     battery_floor_soc: float = 0,
     battery_support_power: float = 0,
+    allow_battery_precharge=False,
+    precharge_energy_needed=0,
 ):
     """Calculate the action to take for EV charging based on various conditions.
 
@@ -380,6 +536,23 @@ def _get_charge_action(
             6,
             f"EV charge limit reached: {current_soc:.0f}% >= {surplus_charge_limit:.0f}%",
             ChargeMode.hard_stop,
+        )
+
+    if (
+        allow_battery_precharge
+        and precharge_energy_needed > 0
+        and battery_support_power >= minimum_charge_power
+        and available_ev_power >= minimum_charge_power
+    ):
+        min_3phase_power = 3 * Const.voltage * Const.min_current
+        phases = 3 if available_ev_power >= min_3phase_power - hysteresis else 1
+        target_current = int(available_ev_power // (Const.voltage * phases))
+        return (
+            ChargeAction.on,
+            phases,
+            clip(target_current, Const.min_current, Const.max_current),
+            f"Arrival precharge using bounded battery headroom: {precharge_energy_needed:.2f} kWh remaining",
+            ChargeMode.arrival_precharge,
         )
 
     # if no more charging needed, turn off the charger
@@ -481,6 +654,27 @@ def _get_charge_action(
     # When charging already active, need to control the charge amps to meet target excess
     elif is_charging and excess_power < control_excess_target:
         deficit = control_excess_target - excess_power
+        # A deficit covered only by home-battery discharge, with no time
+        # pressure and no overflow risk, must stop (via the normal
+        # stop-confirmation path) instead of riding the battery down: the
+        # surplus-start guard above already refuses such starts, and the
+        # stop-confirmation timer cannot accumulate while "on" is returned.
+        battery_bridged_deficit = (
+            battery_support_power > 0
+            and pv_total_power < 1500
+            and battery_soc <= 90
+            and hours_available_to_charge >= 24
+        )
+        if battery_bridged_deficit:
+            return (
+                "off",
+                1,
+                Const.min_current,
+                f"ON->OFF: deficit of {deficit:.0f} W covered only by home battery "
+                f"(PV {pv_total_power:.0f} W, battery {battery_soc:.0f}%, "
+                f"{hours_available_to_charge:.1f}h to drive); waiting for sun",
+                ChargeMode.surplus,
+            )
         # Consider phase reduction if we're at minimum current for 3-phase
         if configured_current == Const.min_current:
             if configured_phases > Const.min_phases:
@@ -546,6 +740,8 @@ def get_settled_simulated_ev_charge_action(
     battery_force_charge,
     battery_floor_soc=0,
     battery_support_power=0,
+    allow_battery_precharge=False,
+    precharge_energy_needed=0,
     max_control_steps=10,
 ):
     """Settle minute-rate EV control inside one forecast interval.
@@ -592,6 +788,8 @@ def get_settled_simulated_ev_charge_action(
             wallbox_power=wallbox_power,
             battery_floor_soc=battery_floor_soc,
             battery_support_power=battery_support_power,
+            allow_battery_precharge=allow_battery_precharge,
+            precharge_energy_needed=precharge_energy_needed,
         )
         next_is_charging = action == ChargeAction.on
         if new_phases != phases:

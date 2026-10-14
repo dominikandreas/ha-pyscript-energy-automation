@@ -65,6 +65,7 @@ def get_auto_inverter_mode(
     force_charge_switch,
     t_now,
     enforce_battery_floor=False,
+    is_low_price=False,
 ):
     min_charge_power = 6 * 230  # 6A amps minimum
 
@@ -73,7 +74,14 @@ def get_auto_inverter_mode(
     new_charge_limit = None  # in W
     new_force_charge_switch_state = None
 
-    headroom_threshold = 0.5  # kWh hysteresis to avoid toggling at the battery floor
+    headroom_threshold = 0.1  # kWh anti-flap epsilon; the battery may drain to ~empty, the BMS guards the cells
+
+    # LFP state of charge is only ever an estimate, here a pessimistic one.
+    # At high prices discharge must never be software-blocked on that guess:
+    # importing at the day rate while usable energy sits in the battery is
+    # always wrong, and only the BMS low-voltage cutoff can tell true empty.
+    # At low prices, holding back an apparently empty battery is correct.
+    allow_discharge_block = bool(is_low_price)
 
     # When ev is charging, disable inverter if no surplus energy or insufficient pv power
     if ev_is_charging:
@@ -90,14 +98,17 @@ def get_auto_inverter_mode(
         elif surplus_energy > 0 or pv_power > (min_charge_power + daily_avg_power) and battery_soc > target_soc:
             reason = f"EV is charging with surplus energy of {surplus_energy} or pv_power > (min_charge_power + daily_avg_power)  {pv_power} > ({min_charge_power} + {daily_avg_power})"
             new_mode = InverterMode.on
-        else:
+        elif allow_discharge_block:
             reason = f"EV is charging {'without' if pv_power < 10 else 'with'} PV power"
             new_mode = InverterMode.off if pv_power < 10 else InverterMode.charger_only
+        else:
+            reason = "EV is charging at high price: BMS decides when the battery is empty"
+            new_mode = InverterMode.on
     else:
         # For normal self-consumption, use physical battery headroom instead of the
         # reserve-aware surplus budget. A zero optional-load surplus does not mean the
         # battery cannot still cover house load without hitting the hard floor.
-        if electricity_price < min_discharge_price and battery_headroom_energy <= headroom_threshold:
+        if is_low_price and battery_headroom_energy <= headroom_threshold:
             if pv_power == 0:
                 reason = f"no PV, battery headroom {battery_headroom_energy:.2f} kWh <= {headroom_threshold:.2f} kWh and price is low"
                 new_mode = InverterMode.off
@@ -105,7 +116,7 @@ def get_auto_inverter_mode(
                 reason = f"battery {battery_soc}% < target {target_soc}% and price is low"
                 new_mode = InverterMode.charger_only
 
-    if enforce_battery_floor and battery_headroom_energy <= headroom_threshold:
+    if allow_discharge_block and enforce_battery_floor and battery_headroom_energy <= headroom_threshold:
         if pv_power < 0.5 * daily_avg_power:
             reason = (
                 f"planned battery floor reached with {battery_headroom_energy:.2f} kWh headroom "
@@ -132,7 +143,8 @@ def get_auto_inverter_mode(
             new_charge_limit = -1
             new_force_charge_switch_state = False
         elif (
-            pv_power < 0.5 * daily_avg_power
+            allow_discharge_block
+            and pv_power < 0.5 * daily_avg_power
             and battery_headroom_energy <= headroom_threshold
             and battery_soc < min(25, target_soc)
         ):

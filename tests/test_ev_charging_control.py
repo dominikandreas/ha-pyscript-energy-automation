@@ -50,7 +50,10 @@ def _load_energy_core_symbols():
         "get_ongoing_and_next_drive",
         "is_vehicle_present_during_active_drive",
         "is_forecast_ev_available",
+        "is_arrival_precharge_allowed",
         "_get_charge_action",
+        "get_ev_charge_feedback_state",
+        "calculate_charger_current_adjustment",
     }
     selected = []
     selected_names = set()
@@ -680,6 +683,25 @@ class EVChargingControlTests(unittest.TestCase):
         self.assertGreater(battery_energy, battery_floor)
         self.assertAlmostEqual(cumulative_grid_import_kwh, 0.0)
 
+    def _load_shared_schedule_parser(self):
+        source_path = Path(__file__).parents[1] / "modules" / "energy_core.py"
+        tree = ast.parse(source_path.read_text())
+        parser = next(
+            node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "parse_ev_schedule_entries"
+        )
+        parser.decorator_list = []
+        namespace = {
+            "datetime": datetime,
+            "timedelta": timedelta,
+            "with_timezone": lambda value: value.replace(tzinfo=timezone.utc)
+            if value.tzinfo is None
+            else value,
+            "get_drive_required_soc": self.core["get_drive_required_soc"],
+        }
+        module = ast.Module(body=[parser], type_ignores=[])
+        exec(compile(ast.fix_missing_locations(module), str(source_path), "exec"), namespace)
+        return namespace["parse_ev_schedule_entries"]
+
     def test_same_weekday_completed_drive_rolls_to_next_week(self):
         project_root = Path(__file__).parents[1]
         t_now = datetime(2026, 8, 18, 21, 0, tzinfo=timezone.utc)
@@ -692,6 +714,7 @@ class EVChargingControlTests(unittest.TestCase):
                 }
             ]
         }
+        shared_parser = self._load_shared_schedule_parser()
 
         for relative_path in ("ev_charging.py", "energy.py"):
             source_path = project_root / relative_path
@@ -699,6 +722,7 @@ class EVChargingControlTests(unittest.TestCase):
             parser = next(
                 node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "parse_full_schedule"
             )
+            self.assertIn("parse_ev_schedule_entries", ast.unparse(parser))
             parser.decorator_list = []
             namespace = {
                 "Any": Any,
@@ -709,6 +733,7 @@ class EVChargingControlTests(unittest.TestCase):
                 else value,
                 "now": lambda: t_now,
                 "get_drive_required_soc": self.core["get_drive_required_soc"],
+                "parse_ev_schedule_entries": shared_parser,
                 "EVScheduleEntry": lambda **kwargs: SimpleNamespace(**kwargs),
             }
             module = ast.Module(body=[parser], type_ignores=[])
@@ -717,6 +742,189 @@ class EVChargingControlTests(unittest.TestCase):
 
             self.assertEqual(entries[0].start, datetime(2026, 8, 25, 14, 30, tzinfo=timezone.utc))
             self.assertEqual(entries[0].end, datetime(2026, 8, 25, 18, 30, tzinfo=timezone.utc))
+
+    def test_recent_arrival_is_preserved_only_with_opt_in(self):
+        project_root = Path(__file__).parents[1]
+        t_now = datetime(2026, 8, 18, 21, 0, tzinfo=timezone.utc)
+        schedule_data = {
+            "tuesday": [
+                {
+                    "from": time(14, 30),
+                    "to": time(18, 30),
+                    "data": {"required": 85, "distance": 265.625},
+                }
+            ]
+        }
+        shared_parser = self._load_shared_schedule_parser()
+        entry_cls = lambda **kwargs: SimpleNamespace(**kwargs)
+
+        preserved = shared_parser(schedule_data, 65, t_now, entry_cls, True)
+        self.assertEqual(preserved[0].start, datetime(2026, 8, 18, 14, 30, tzinfo=timezone.utc))
+
+        rolled = shared_parser(schedule_data, 65, t_now, entry_cls, False)
+        self.assertEqual(rolled[0].start, datetime(2026, 8, 25, 14, 30, tzinfo=timezone.utc))
+
+        source_path = project_root / "energy.py"
+        tree = ast.parse(source_path.read_text())
+        parser = next(
+            node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "parse_full_schedule"
+        )
+        parser.decorator_list = []
+        namespace = {
+            "Any": Any,
+            "datetime": datetime,
+            "parse_ev_schedule_entries": shared_parser,
+            "EVScheduleEntry": entry_cls,
+        }
+        module = ast.Module(body=[parser], type_ignores=[])
+        exec(compile(ast.fix_missing_locations(module), str(source_path), "exec"), namespace)
+        forwarded = namespace["parse_full_schedule"](schedule_data, 65, t_now=t_now, preserve_recent_arrival=True)
+        self.assertEqual(forwarded[0].start, datetime(2026, 8, 18, 14, 30, tzinfo=timezone.utc))
+
+    def _sunset_deficit_inputs(self, **overrides):
+        t_now = datetime(2026, 9, 13, 17, 30, tzinfo=timezone.utc)
+        inputs = {
+            "next_drive": t_now + timedelta(hours=60),
+            "current_soc": 81,
+            "required_soc": 70,
+            "energy_needed": 0,
+            "excess_power": -2800,
+            "excess_target": 0,
+            "surplus_energy": 5.0,
+            "smart_charge_limit": 85,
+            "smart_limiter_active": True,
+            "configured_phases": 1,
+            "configured_current": 10,
+            "is_low_price": False,
+            "pv_total_power": 200,
+            "battery_soc": 53,
+            "is_charging": True,
+            "t_now": t_now,
+            "inverter_mode": "off",
+            "battery_force_charge": False,
+            "wallbox_power": 2300,
+            "battery_floor_soc": 0,
+            "battery_support_power": 2500,
+            "allow_battery_precharge": False,
+            "precharge_energy_needed": 0,
+        }
+        inputs.update(overrides)
+        return inputs
+
+    def test_battery_bridged_deficit_stops_with_time_to_spare(self):
+        # Reproduces 2026-09-13 ~17:30 UTC: sunset deficit covered only by the
+        # home battery, next drive 60h out.  Must yield to the stop
+        # confirmation path instead of riding the battery down.
+        action, phases, current, reason, charge_mode = self.core["_get_charge_action"](
+            **self._sunset_deficit_inputs()
+        )
+
+        self.assertEqual(action, "off")
+        self.assertEqual(charge_mode, self.core["ChargeMode"].surplus)
+        self.assertTrue(reason.startswith("ON->OFF"))
+
+    def test_battery_bridged_deficit_rides_through_when_drive_is_soon(self):
+        t_now = datetime(2026, 9, 13, 17, 30, tzinfo=timezone.utc)
+        action, phases, current, _reason, charge_mode = self.core["_get_charge_action"](
+            **self._sunset_deficit_inputs(next_drive=t_now + timedelta(hours=6))
+        )
+
+        self.assertEqual(action, "on")
+        self.assertEqual(charge_mode, self.core["ChargeMode"].surplus)
+
+    def test_battery_bridged_deficit_rides_through_when_battery_is_full(self):
+        # Overflow exception: a nearly full home battery may keep charging to
+        # make room for upcoming PV.
+        action, _phases, _current, _reason, _charge_mode = self.core["_get_charge_action"](
+            **self._sunset_deficit_inputs(battery_soc=95)
+        )
+
+        self.assertEqual(action, "on")
+
+    def test_arrival_precharge_allowed_prefers_tomorrow_sun(self):
+        allow = self.core["is_arrival_precharge_allowed"]
+        t_now = datetime(2026, 9, 13, 17, 0, tzinfo=timezone.utc)
+        drive = t_now + timedelta(hours=60)
+
+        # Incident shape: plenty of time, battery half full -> wait.
+        self.assertFalse(allow(True, drive, False, 80, 85, 60.0, 53, True))
+        # Leaving soon -> precharge from battery is allowed at low price.
+        self.assertTrue(allow(True, t_now + timedelta(hours=6), False, 80, 85, 6.0, 53, True))
+        # Overflow risk -> precharge to make room even with time to spare.
+        self.assertTrue(allow(True, drive, False, 80, 85, 60.0, 95, True))
+        # Already at the limit, no drive, arrival disabled, or drive ongoing.
+        self.assertFalse(allow(True, drive, False, 85, 85, 60.0, 53, True))
+        self.assertFalse(allow(True, None, False, 80, 85, 999, 53, True))
+        self.assertFalse(allow(False, drive, False, 80, 85, 6.0, 53, True))
+        self.assertFalse(allow(True, drive, True, 80, 85, 6.0, 53, True))
+
+    def test_arrival_precharge_blocked_at_high_price(self):
+        # 2026-10-01 incident: departure ~20h out, EV at 80% below the smart
+        # limit, home battery headroom available - the precharge ran 4h at
+        # the 0.2875 day rate, importing while PV declined.  True urgency is
+        # the emergency branch's job; precharge stays a low-price top-up.
+        allow = self.core["is_arrival_precharge_allowed"]
+        t_now = datetime(2026, 10, 1, 13, 30, tzinfo=timezone.utc)
+        drive = t_now + timedelta(hours=20)
+
+        self.assertFalse(allow(True, drive, False, 80, 95, 20.0, 75, False))
+        # Even leaving soon or facing overflow, high price blocks precharge:
+        # the emergency branch covers urgency, surplus covers real overflow.
+        self.assertFalse(allow(True, t_now + timedelta(hours=6), False, 80, 95, 6.0, 75, False))
+        self.assertFalse(allow(True, drive, False, 80, 95, 20.0, 95, False))
+        # Unknown price fails safe to blocked.
+        self.assertFalse(allow(True, drive, False, 80, 95, 20.0, 75))
+
+    def test_high_price_precharge_conditions_hold_charger_off(self):
+        # End to end for the incident shape: gated precharge must fall through
+        # to the high-price stop instead of self-sustaining on wallbox
+        # feedback plus battery support.
+        t_now = datetime(2026, 10, 1, 13, 30, tzinfo=timezone.utc)
+        allow = self.core["is_arrival_precharge_allowed"](
+            True, t_now + timedelta(hours=20), False, 80, 95, 20.0, 75, False
+        )
+        self.assertFalse(allow)
+        action, _phases, _current, reason, charge_mode = self.core["_get_charge_action"](
+            next_drive=t_now + timedelta(hours=20),
+            current_soc=80,
+            required_soc=90,
+            energy_needed=6.0,
+            excess_power=-3976,
+            excess_target=-617,
+            surplus_energy=0.0,
+            smart_charge_limit=95,
+            smart_limiter_active=False,
+            configured_phases=3,
+            configured_current=6,
+            is_low_price=False,
+            pv_total_power=1000,
+            battery_soc=75,
+            is_charging=False,
+            t_now=t_now,
+            wallbox_power=0,
+            battery_support_power=0,
+            allow_battery_precharge=allow,
+            precharge_energy_needed=0.0,
+        )
+
+        self.assertEqual(action, "off")
+        self.assertNotEqual(charge_mode, self.core["ChargeMode"].arrival_precharge)
+        self.assertIn("high electricity price", reason)
+
+    def test_live_charging_delegates_arrival_precharge_gate(self):
+        project_root = Path(__file__).parents[1]
+        tree = ast.parse((project_root / "ev_charging.py").read_text())
+        live_node = next(
+            node for node in tree.body if isinstance(node, ast.AsyncFunctionDef) and node.name == "auto_ev_charging"
+        )
+        gate_calls = [
+            call
+            for call in ast.walk(live_node)
+            if isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Name)
+            and call.func.id == "is_arrival_precharge_allowed"
+        ]
+        self.assertEqual(len(gate_calls), 1)
 
     def test_provider_forecast_is_extended_through_scheduled_drive_horizon(self):
         source_path = Path(__file__).parents[1] / "energy.py"
@@ -795,6 +1003,42 @@ class EVChargingControlTests(unittest.TestCase):
         ]
         self.assertLess(abs(targets[1] - targets[0]), 10)
 
+    def test_night_charging_does_not_flip_excess_target(self):
+        # 2026-10-11 incident: with no PV the reserve override forced the
+        # target to 0 while charging and back to -2500 while idle, cycling
+        # the wallbox roughly every 20 minutes all night.  With nothing to
+        # reserve, the charging state must not move the target.
+        source_path = Path(__file__).parents[1] / "energy.py"
+        tree = ast.parse(source_path.read_text())
+        node = next(
+            node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "_get_excess_target"
+        )
+        node.decorator_list = []
+        namespace = {"clip": _clip, "pi": pi, "with_timezone": lambda value: value}
+        module = ast.Module(body=[node], type_ignores=[])
+        exec(compile(ast.fix_missing_locations(module), str(source_path), "exec"), namespace)
+        target = namespace["_get_excess_target"]
+
+        t_now = datetime(2026, 10, 11, 1, 0, tzinfo=timezone.utc)
+        kwargs = dict(
+            battery_target_soc=22.49,
+            battery_soc=80,
+            ev_required_soc=80,
+            next_planned_drive=t_now + timedelta(days=6),
+            pv_power=0,
+            ev_soc=12,
+            t_now=t_now,
+            efficient_discharge=True,
+        )
+        idle = target(ev_is_charging=False, **kwargs)
+        charging = target(ev_is_charging=True, **kwargs)
+
+        self.assertEqual(idle, -2500)
+        self.assertEqual(charging, -2500)
+
+        day = target(ev_is_charging=True, pv_power=6000, **{k: v for k, v in kwargs.items() if k != "pv_power"})
+        self.assertEqual(day, 2000)
+
     def test_live_and_forecast_use_the_shared_schedule_context(self):
         project_root = Path(__file__).parents[1]
         ev_tree = ast.parse((project_root / "ev_charging.py").read_text())
@@ -864,21 +1108,29 @@ class EVChargingControlTests(unittest.TestCase):
             "forecast_surplus must avoid generator expressions unsupported by Pyscript",
         )
 
+        core_tree = ast.parse(
+            (project_root / "modules" / "energy_core.py").read_text()
+        )
+        shared_parser = next(
+            node
+            for node in core_tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "parse_ev_schedule_entries"
+        )
+        self.assertTrue(
+            any(
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "get_drive_required_soc"
+                for node in ast.walk(shared_parser)
+            )
+        )
         live_parser = next(
             node for node in ev_tree.body if isinstance(node, ast.FunctionDef) and node.name == "parse_full_schedule"
         )
         forecast_parser = next(
             node for node in energy_tree.body if isinstance(node, ast.FunctionDef) and node.name == "parse_full_schedule"
         )
-        for parser in (live_parser, forecast_parser):
-            self.assertTrue(
-                any(
-                    isinstance(node, ast.Call)
-                    and isinstance(node.func, ast.Name)
-                    and node.func.id == "get_drive_required_soc"
-                    for node in ast.walk(parser)
-                )
-            )
+        for parser in (shared_parser, live_parser, forecast_parser):
             self.assertFalse(
                 any(
                     isinstance(node, ast.Call)
@@ -887,6 +1139,16 @@ class EVChargingControlTests(unittest.TestCase):
                     for node in ast.walk(parser)
                 ),
                 "compiled schedule parsers must receive a frozen t_now from runtime code",
+            )
+        for parser in (live_parser, forecast_parser):
+            self.assertTrue(
+                any(
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id == "parse_ev_schedule_entries"
+                    for node in ast.walk(parser)
+                ),
+                "app schedule parsers must delegate to the shared energy_core implementation",
             )
 
         live_pv_assignment = next(
@@ -905,6 +1167,95 @@ class EVChargingControlTests(unittest.TestCase):
             2,
         )
         self.assertIn("EVConst.charge_efficiency", ast.unparse(forecast_node))
+
+    def test_feedback_reports_start_confirmation_countdown(self):
+        # 2026-10-10 incident: the surplus start waited out its 3-minute
+        # confirmation with no dashboard feedback, so the controller looked
+        # dead and the master switch was killed 2 minutes early.
+        t_now = datetime(2026, 10, 10, 19, 14, 11, tzinfo=timezone.utc)
+        state, remaining = self.core["get_ev_charge_feedback_state"](
+            controller_active=True,
+            action="on",
+            is_charging=False,
+            start_candidate_since=t_now - timedelta(seconds=61),
+            stop_candidate_since=None,
+            last_stop=t_now - timedelta(minutes=30),
+            started_at=None,
+            t_now=t_now,
+        )
+
+        self.assertEqual(state, "confirming_start")
+        self.assertAlmostEqual(remaining, 119)
+
+    def test_feedback_reports_restart_lockout_countdown(self):
+        t_now = datetime(2026, 10, 10, 19, 20, tzinfo=timezone.utc)
+        state, remaining = self.core["get_ev_charge_feedback_state"](
+            controller_active=True,
+            action="on",
+            is_charging=False,
+            start_candidate_since=None,
+            stop_candidate_since=None,
+            last_stop=t_now - timedelta(minutes=2),
+            started_at=None,
+            t_now=t_now,
+        )
+
+        self.assertEqual(state, "restart_lockout")
+        self.assertAlmostEqual(remaining, 180)
+
+    def test_feedback_reports_stop_confirmation_countdown(self):
+        t_now = datetime(2026, 10, 10, 21, 0, tzinfo=timezone.utc)
+        state, remaining = self.core["get_ev_charge_feedback_state"](
+            controller_active=True,
+            action="off",
+            is_charging=True,
+            start_candidate_since=None,
+            stop_candidate_since=t_now - timedelta(minutes=2),
+            last_stop=t_now - timedelta(hours=2),
+            started_at=t_now - timedelta(minutes=20),
+            t_now=t_now,
+        )
+
+        self.assertEqual(state, "confirming_stop")
+        self.assertAlmostEqual(remaining, 180)
+
+    def test_feedback_covers_charging_idle_and_disabled(self):
+        t_now = datetime(2026, 10, 10, 21, 0, tzinfo=timezone.utc)
+        base = dict(
+            action="off",
+            is_charging=False,
+            start_candidate_since=None,
+            stop_candidate_since=None,
+            last_stop=t_now - timedelta(hours=2),
+            started_at=None,
+            t_now=t_now,
+        )
+
+        state, remaining = self.core["get_ev_charge_feedback_state"](
+            controller_active=False, **base
+        )
+        self.assertEqual((state, remaining), ("off", None))
+
+        state, remaining = self.core["get_ev_charge_feedback_state"](
+            controller_active=True, **base
+        )
+        self.assertEqual((state, remaining), ("off", None))
+
+        state, remaining = self.core["get_ev_charge_feedback_state"](
+            controller_active=True, is_charging=True, action="on",
+            start_candidate_since=None, stop_candidate_since=None,
+            last_stop=t_now - timedelta(hours=2), started_at=t_now - timedelta(minutes=20),
+            t_now=t_now,
+        )
+        self.assertEqual((state, remaining), ("charging", None))
+
+        state, remaining = self.core["get_ev_charge_feedback_state"](
+            controller_active=False, is_charging=True, action="off",
+            start_candidate_since=None, stop_candidate_since=None,
+            last_stop=t_now - timedelta(hours=2), started_at=None,
+            t_now=t_now, force_active=True,
+        )
+        self.assertEqual((state, remaining), ("charging", None))
 
 
 if __name__ == "__main__":

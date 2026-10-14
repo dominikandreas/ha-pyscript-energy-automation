@@ -3,7 +3,7 @@
 
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, date
-from math import pi, exp, sqrt
+from math import pi, exp, sqrt, isfinite
 from typing import TYPE_CHECKING, Any
 
 
@@ -29,32 +29,62 @@ if TYPE_CHECKING:
         get_settled_simulated_ev_charge_action,
         is_forecast_ev_available,
         is_vehicle_present_during_active_drive,
+        parse_ev_schedule_entries,
     )
     from modules.setpoint_control import (
         FeedinCandidate,
         calculate_auto_max_setpoint,
         apply_hard_feedin_control,
+        apply_silent_mode_grid_limits,
         build_price_aware_headroom_schedule,
+        build_silent_charge_shaping_schedule,
         calculate_energy_bounded_control,
         calculate_headroom_energy_requirement,
         calculate_pv_overflow_energy,
         choose_stable_candidate,
         feedin_constraint_exceeded,
         limit_target_step,
+        resolve_economic_export_floor,
     )
     from modules.export_scheduler import (
         ExportSchedulerSlot,
         ReserveTrajectorySlot,
+        SHAPING_PV_CONFIDENCE_FACTOR,
         adapt_grid_target_to_live_power,
+        apply_horizon_ev_reservation,
+        are_battery_energy_values_valid,
+        are_power_measurement_values_valid,
+        are_power_measurements_coherent,
         build_hard_cap_storage_hold_schedule,
+        build_high_side_headroom_requirements,
         build_reserve_energy_schedule,
         build_unified_export_schedule,
+        calculate_absorbable_overflow_power,
+        calculate_export_energy_budget,
+        calculate_live_headroom_control,
+        calculate_measurement_age_seconds,
+        calculate_measurement_skew_seconds,
         calculate_net_battery_export_price,
+        calculate_time_to_full_minutes,
+        compute_room_overflow_requirement,
+        first_uncovered_departure_need,
         fit_export_schedule_to_energy_budget,
+        get_fresh_export_policy_budget,
         get_interval_price,
-        get_policy_bounded_export_budget,
+        headroom_release_factor,
+        is_battery_energy_measurement_usable,
         is_ev_available_for_charging,
+        select_finite_grid_target,
         is_ev_plan_fresh,
+        is_measurement_fresh,
+        parse_aware_datetime,
+        read_headroom_released_kwh,
+        resolve_directional_power_limit_w,
+        limit_live_export_target_to_budget,
+        select_no_battery_export_target,
+        update_headroom_release_ledger,
+        update_live_headroom_state,
+        update_monotonic_export_budget_ledger,
     )
 
     # These are provided pyscript and defined for type inference only. They do not need to
@@ -117,61 +147,152 @@ else:
         get_settled_simulated_ev_charge_action,
         is_forecast_ev_available,
         is_vehicle_present_during_active_drive,
+        parse_ev_schedule_entries,
     )  # noqa: F401
     from setpoint_control import (
         FeedinCandidate,
         calculate_auto_max_setpoint,
         apply_hard_feedin_control,
+        apply_silent_mode_grid_limits,
         build_price_aware_headroom_schedule,
+        build_silent_charge_shaping_schedule,
         calculate_energy_bounded_control,
         calculate_headroom_energy_requirement,
         calculate_pv_overflow_energy,
         choose_stable_candidate,
         feedin_constraint_exceeded,
         limit_target_step,
+        resolve_economic_export_floor,
     )
     from export_scheduler import (
         ExportSchedulerSlot,
         ReserveTrajectorySlot,
+        SHAPING_PV_CONFIDENCE_FACTOR,
         adapt_grid_target_to_live_power,
+        apply_horizon_ev_reservation,
+        are_battery_energy_values_valid,
+        are_power_measurement_values_valid,
+        are_power_measurements_coherent,
         build_hard_cap_storage_hold_schedule,
+        build_high_side_headroom_requirements,
         build_reserve_energy_schedule,
         build_unified_export_schedule,
+        calculate_absorbable_overflow_power,
+        calculate_export_energy_budget,
+        calculate_live_headroom_control,
+        calculate_measurement_age_seconds,
+        calculate_measurement_skew_seconds,
         calculate_net_battery_export_price,
+        calculate_time_to_full_minutes,
+        compute_room_overflow_requirement,
+        first_uncovered_departure_need,
         fit_export_schedule_to_energy_budget,
+        get_fresh_export_policy_budget,
         get_interval_price,
-        get_policy_bounded_export_budget,
+        headroom_release_factor,
+        is_battery_energy_measurement_usable,
         is_ev_available_for_charging,
+        select_finite_grid_target,
         is_ev_plan_fresh,
+        is_measurement_fresh,
+        parse_aware_datetime,
+        read_headroom_released_kwh,
+        resolve_directional_power_limit_w,
+        limit_live_export_target_to_budget,
+        select_no_battery_export_target,
+        update_headroom_release_ledger,
+        update_live_headroom_state,
+        update_monotonic_export_budget_ledger,
     )
     from electricity_price import is_low_price, get_price
 
 
-class Const:
-    ev_capacity = 60
-    """The capacity of the EV battery in kWh"""
-    ev_consumption_per_drive = 55
-    """How much percent of the battery is consumed per drive"""
-    ev_days_allowed_to_reach_target = 7
-    """The average days it should take to reach the target state of charge.
-
-
-    In order to get the vehicle charged, the schedule allows to define the next
-    planned drive. This variable is a fallback to be used when no schedule is defined,
-    to control how much energy shall be requested for the vehicle per day.
-    """
-
-    ev_phase_switch_delay = 20
-    """The delay in seconds between switching the number of phases of the EV charger"""
-
-
+# EV capacity and charging constants live in modules/const.EV (imported as
+# EVConst). A local duplicate used to exist here; it was removed so there is
+# a single source of truth.
 # Recorder calibration through 2026-08-26: the 90th-percentile 00:00-07:00
 # house load was about 12% above the configured nightly baseline, while the
 # 20th-percentile actual/Solcast power ratio was about 0.76.  Round outward so
 # optional export keeps a risk reserve that is released as the morning nears.
+# Pre-release shaping uses the stricter SHAPING_PV_CONFIDENCE_FACTOR from
+# modules.export_scheduler: forced discharge through the PV ramp diverts
+# rising PV to the grid too, so the hole outgrows the scheduled energy.
 EXPORT_HOUSE_LOAD_MARGIN_FRACTION = 0.15
 EXPORT_PV_CONFIDENCE_FACTOR = 0.75
-EXPORT_BASE_UNCERTAINTY_MARGIN_KWH = 1.0
+EXPORT_BASE_UNCERTAINTY_MARGIN_KWH = 0.1
+# Silent mode (input_boolean.silent_mode) keeps the inverter quiet by capping
+# battery/grid exchange at SILENT_MODE_MAX_BATTERY_POWER_W: scheduled export
+# and live battery-to-grid discharge never exceed it, while house and EV
+# coverage stay unlimited.  Charging is capped only once shareable surplus
+# exceeds the cap plus SILENT_MODE_CHARGE_SURPLUS_MARGIN_W; inside the margin
+# band the battery takes everything instead of exporting a trickle.
+SILENT_MODE_MAX_BATTERY_POWER_W = 3500.0
+SILENT_MODE_CHARGE_SURPLUS_MARGIN_W = 500.0
+# LFP cells drift unless the pack reaches full regularly.  When the last
+# 100% charge is this many days back, the scheduler withholds economic
+# export and soft-target pre-release until the battery fills again.
+BALANCE_CHASE_AFTER_DAYS = 7.0
+BALANCE_FULL_SOC_THRESHOLD = 99.5
+HIGH_SIDE_PV_ERROR_DECAY_HOURS = 2.0
+HIGH_SIDE_PV_MAX_ERROR_W = 4000.0
+HIGH_SIDE_PV_MAX_MEASUREMENT_AGE_SECONDS = 120.0
+
+# The forecast scheduler operates in half-hour buckets and cannot react safely
+# to a cloud-edge ramp once the battery reaches full charge.  The fast loop
+# therefore keeps a small, dynamically-sized energy buffer near full SOC.  It
+# derives natural export from measured grid and battery power, holds existing
+# free capacity through short PV dips, and creates additional capacity only
+# while export remains below the scheduler's planning cap.
+LIVE_HEADROOM_RISK_HORIZON_MINUTES = 10.0
+LIVE_HEADROOM_HOLD_MINUTES = 15.0
+LIVE_HEADROOM_BASE_KWH = 0.05
+LIVE_HEADROOM_MAX_KWH = 1.0
+LIVE_HEADROOM_ACTIVATION_BUFFER_KWH = 0.05
+LIVE_HEADROOM_ACTIVATION_LEAD_TIME_MINUTES = 60.0
+LIVE_HEADROOM_RELEASE_HYSTERESIS_W = 500.0
+LIVE_HEADROOM_TRACKING_MARGIN_W = 200.0
+LIVE_HEADROOM_MAX_TARGET_STEP_W = 1000.0
+LIVE_HEADROOM_PUBLISH_INTERVAL_SECONDS = 15.0
+# Grid power publishes several times per second while the battery sensor
+# publishes roughly every 10 s, so a tighter skew gate flaps between coherent
+# and skewed on healthy data.  Match both gates to the real cadence; the
+# hold hysteresis below absorbs the remaining single-sample jitter.
+LIVE_HEADROOM_MAX_MEASUREMENT_AGE_SECONDS = 20.0
+LIVE_HEADROOM_MAX_MEASUREMENT_SKEW_SECONDS = 15.0
+LIVE_PV_MAX_MEASUREMENT_AGE_SECONDS = 30.0
+LIVE_HOUSE_LOAD_MAX_MEASUREMENT_AGE_SECONDS = 10.0
+# sensor.battery_energy updates every 60-300 s (slower on quiet evenings), so a
+# tighter gate flaps between fresh and stale on healthy data and pins the
+# applied setpoint at the failsafe.  Match the gate to the real cadence.
+LIVE_BATTERY_ENERGY_MAX_MEASUREMENT_AGE_SECONDS = 300.0
+LIVE_POWER_MAX_ABSOLUTE_W = 20000.0
+# The export policy snapshot is produced on a 120-second cadence, so a
+# 120-second horizon has zero slack: normal publish jitter alone trips it
+# and slams the setpoint to PV-only for a cycle (observed). 300 seconds
+# covers two missed producer cycles; aging is safe because the live budget
+# deducts battery draw since the snapshot before authorizing export.
+LIVE_EXPORT_BUDGET_HORIZON_SECONDS = 300.0
+# Budgets below this floor the setpoint at the PV-only target instead of
+# authorizing export.  Single-digit Wh dither (planner snapshots eaten by
+# live discharge within a cycle or two) must not flap the setpoint between
+# the floor and the desired export: 0.05 kWh is far above that noise yet
+# negligible next to any real export budget.
+LIVE_EXPORT_BUDGET_RELEASE_KWH = 0.05
+# Blind fallback must never force import: hold grid at zero and let the
+# battery cover the difference. A blind import spikes grid cost to cover
+# load the battery could have ridden through, while the battery controller
+# already guards against truly unsafe discharge. (Kept historical name so
+# existing source references and tests keep resolving; value must stay 0.)
+LIVE_TELEMETRY_FAILSAFE_IMPORT_TARGET_W = 0.0
+EXPORT_POLICY_MAX_AGE_SECONDS = 180.0
+
+# When the battery is already high and PV is materially above the preferred
+# feed-in level, price ranking must not postpone the first export bucket.  The
+# scheduler otherwise preserves energy for later cheap-price windows and lets
+# today's battery fill before the forecast catches up with a cloud-edge ramp.
+PROACTIVE_EXPORT_TRIGGER_SOC_PERCENT = 90.0
+PROACTIVE_EXPORT_PV_MARGIN_W = 1000.0
+PROACTIVE_EXPORT_MAX_STEP_W = 3000.0
 
 # AC/DC conversion assumptions used consistently by forecast energy accounting
 # and economic export ranking.  Keeping these conservative is intentional: an
@@ -186,6 +307,99 @@ EXPORT_BROKER_REVENUE_MARGIN_FRACTION = 0.03
 # is energy-balanced through its actual departure rather than compared with a
 # single battery-trough timestamp.
 EV_EXPORT_RESERVATION_HORIZON_HOURS = 80.0
+
+
+state.persist(  # noqa: F821 - provided by the Pyscript runtime
+    "pyscript.export_policy_budget_ledger",
+    default_value="",
+    default_attributes={
+        "friendly_name": "Export policy remaining-budget ledger",
+    },
+)
+
+
+state.persist(  # noqa: F821 - provided by the Pyscript runtime
+    "pyscript.roof_pv_emergency_pending",
+    default_value="off",
+    default_attributes={
+        "friendly_name": "Roof PV emergency recovery pending",
+    },
+)
+
+
+state.persist(  # noqa: F821 - provided by the Pyscript runtime
+    "pyscript.battery_last_full",
+    default_value="",
+    default_attributes={
+        "friendly_name": "Battery last full charge",
+    },
+)
+
+
+@service  # noqa: F821 - provided by the Pyscript runtime
+def set_roof_pv_emergency_pending(pending=True):
+    """Persist whether this controller must reconcile curtailed roof PV."""
+
+    pending_state = "off" if pending is False else "on"
+    state.set(  # noqa: F821 - provided by the Pyscript runtime
+        "pyscript.roof_pv_emergency_pending",
+        pending_state,
+        updated_at=now().isoformat(),
+    )
+
+
+@pyscript_compile
+def get_forecast_battery_power_limits(
+    configured_charge_limit_w: float,
+    configured_discharge_limit_w: float,
+) -> tuple[float, float]:
+    """Keep forecast charge and discharge constraints direction-specific."""
+
+    return (
+        max(0.0, float(configured_charge_limit_w)),
+        max(0.0, float(configured_discharge_limit_w)),
+    )
+
+
+def limit_forecast_discharge_to_hardware_w(
+    planned_discharge_limit_w: float,
+    hardware_discharge_limit_w: float,
+) -> float:
+    """Cap the planned battery discharge at the hardware discharge limit.
+
+    The inverter (and the price automation through it) can forbid discharge
+    entirely.  A forecast that ignores the ban discharges a battery that
+    cannot discharge, then counts the stranded headroom as spendable surplus
+    while the house draws from the grid.
+    """
+    try:
+        planned = float(planned_discharge_limit_w)
+        hardware = float(hardware_discharge_limit_w)
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+    if not isfinite(planned) or not isfinite(hardware):
+        return 0.0
+    return max(0.0, min(planned, hardware))
+
+
+def get_planned_discharge_limit_w(default: float = -1):
+    """Read discharge capability for planning, ignoring the telemetry hold.
+
+    The stale-telemetry hold parks the shared discharge-limit input at 0
+    for a few seconds to freeze live actuation.  A 24-hour forecast that
+    samples that transient zero plans a battery that cannot discharge at
+    all: frozen energy, grid import all night, slashed export schedule
+    (observed 2026-09-24).  While the hold latch holds the pre-hold value,
+    plan with that instead; sustained bans (price automation, inverter)
+    set no latch and still reach the simulation unchanged.
+    """
+    held_limit = get("pyscript.telemetry_hold_discharge_limit", "")
+    if held_limit not in ("", None, "unknown", "unavailable"):
+        try:
+            return float(held_limit)
+        except (TypeError, ValueError):
+            pass
+    return get(Battery.discharge_limit, default)
 
 
 @pyscript_compile
@@ -231,27 +445,6 @@ energy_kwh_attributes = {
 }
 
 
-def update_battery_charge_discharge_times(battery_capacity, battery_energy, power):
-    required_for_full = battery_capacity - battery_energy
-
-    if power > 0:
-        hours = required_for_full / power
-        result = min(hours, 48)
-    else:
-        result = 48
-
-    set_state(Battery.time_until_charged, round(result, 2), **energy_kwh_attributes)
-
-    required_for_empty = battery_energy
-    if power < 0:
-        hours = required_for_empty / abs(power)
-        result = min(hours, 48)
-    else:
-        result = 48
-
-    set_state(Battery.time_until_discharged, round(result, 2), **energy_kwh_attributes)
-
-
 @time_trigger
 @time_trigger("cron(*/5 * * * *)")
 def upcoming_demand():
@@ -277,7 +470,7 @@ def upcoming_demand():
     a = (t_now.month - 6) / 6
     usual_consumption_rate = a * 0.20 + (1 - a) * 0.16  # kWh/km
 
-    required_charge = max(0, (ev_required_soc - ev_current_soc) / 100) * Const.ev_capacity
+    required_charge = max(0, (ev_required_soc - ev_current_soc) / 100) * EVConst.ev_capacity
 
     if ongoing_drive or planned_leave_soon:
         expected_consumption = usual_consumption_rate * planned_distance
@@ -352,13 +545,10 @@ def house_energy_until_production_meets_demand():
 
 
 @pyscript_compile
-def bilinear_interpolate(y, y1, y2, x1, x2):
-    if y1 == y2:
-        return x1
-    y_range = abs(y1 - y2)
-    a = abs((y - y1) / (y_range if y_range != 0 else 1))
-    a_clipped = min(1, max(0, a))
-    return (1 - a_clipped) * x1 + a_clipped * x2
+def _update_ewma_average(previous_average, current_value, alpha):
+    """Shared exponentially-weighted moving-average step for 1m power sensors."""
+
+    return round((1 - alpha) * previous_average + alpha * current_value, 2)
 
 
 @time_trigger
@@ -366,7 +556,7 @@ def bilinear_interpolate(y, y1, y2, x1, x2):
 def excess_power_1m_average():
     excess = get(Excess.power, default=0)  # in W
     excess_avg = get(Excess.power_1m_average, default=0)
-    excess_avg = round(0.9 * excess_avg + 0.1 * excess, 2)
+    excess_avg = _update_ewma_average(excess_avg, excess, 0.1)
     set_state(
         Excess.power_1m_average,
         f"{excess_avg:.2f}",
@@ -380,19 +570,13 @@ def excess_power_1m_average():
 def grid_1m_average():
     grid_now = get(Grid.power_ac, default=0)  # in kW
     grid_avg = get(Grid.power_1m_average, default=grid_now)
-    grid_avg = round(0.8 * grid_avg + 0.2 * grid_now, 2)
+    grid_avg = _update_ewma_average(grid_avg, grid_now, 0.2)
     set_state(
         Grid.power_1m_average,
         grid_avg,
         **power_kw_attributes,
         friendly_name="Grid 1m Average",
     )
-
-
-# @time_trigger
-# def set_input_boolean_auto_set_inverter_mode():
-#     current_mode = get(Victron.auto_set_inverter_mode, "off")
-#     set_state(Victron.auto_set_inverter_mode, current_mode, friendly_name="Auto Victron Inverter Mode")
 
 
 @time_trigger
@@ -408,6 +592,7 @@ def auto_victron_set_inverter_mode():
 
     electricity_price = float(get(ElectricityPrices.current_price, default=0))
     min_discharge_price = float(get(Automation.min_discharge_price, default=0))
+    low_price = get(ElectricityPrices.low_price, False)
     ev_is_charging = get(EV.is_charging, False)
     surplus_energy = get(House.energy_surplus, -1337)
     forecast_battery_headroom_energy = get(House.battery_headroom_until_trough, -1337)
@@ -469,6 +654,7 @@ def auto_victron_set_inverter_mode():
         force_charge_switch,
         t_now=t_now,
         enforce_battery_floor=unified_scheduler_active,
+        is_low_price=low_price,
     )
 
     # log.warning(
@@ -560,11 +746,11 @@ def battery_use_until_pv_meets_demand():
 
 
 def get_reserve_soc(t_now: datetime | None = None):
-    t_now = t_now or now()
-    min_reserve = 5
-    summer_deviation = ((6 - (t_now.month - 1 + t_now.day / 30.0)) / 6) ** 4  # ranging from 0 to 1
-
-    return max(min_reserve, round(summer_deviation * 30, 0))  # ranging from 5 to 30 (max 30% reserve during winter)
+    # No software reserve: the battery may deplete until actually empty and
+    # the BMS owns deep-discharge protection.  This replaces the former 5-30%
+    # seasonal curve, which stranded usable energy at high prices.  The
+    # argument stays so forecast callers keep passing their slot time.
+    return 0.0
 
 
 @pyscript_compile
@@ -572,7 +758,7 @@ def get_battery_export_floor(
     battery_capacity: float,
     reserve_soc: float,
     minimal_soc: float,
-    uncertainty_margin_kwh: float = 1,
+    uncertainty_margin_kwh: float = 0,
 ) -> float:
     """Energy that must remain available for house demand and battery reserve."""
     protected_soc = max(reserve_soc, minimal_soc)
@@ -602,29 +788,6 @@ def get_low_pv_reserve_soc(house_power: float, pv_power: float, battery_cells_ba
     # switch made the battery target and EV current jump under passing clouds.
     pv_coverage = max(0, pv_power) / house_power
     return 15 * clip((1 - pv_coverage) / 0.25, 0, 1)
-
-
-def get_ev_requested_energy_today():
-    t_now = now()
-
-    ev_soc = get(EV.soc, default=50)
-    ev_short_term_demand = get(EV.short_term_demand, default=5)
-    next_drive = get_attr(EV.planned_drives, "next_event")
-    required_soc = get(EV.required_soc, default=50)
-
-    required_energy_total = max(0, (required_soc - ev_soc) / 100 * Const.ev_capacity)
-
-    if next_drive is not None:
-        next_drive = with_timezone(next_drive)
-
-        leaving_soon = (next_drive - t_now) < timedelta(hours=8)
-
-        if leaving_soon:
-            return required_energy_total
-
-        return max(0, ev_short_term_demand)
-
-    return required_energy_total * 1 / Const.ev_days_allowed_to_reach_target
 
 
 @pyscript_compile
@@ -753,7 +916,12 @@ def _get_excess_target(
                 pv_charge_reserve = max(0, pv_power - 4000)
             else:
                 pv_charge_reserve = min(pv_power / 3, max(0, pv_power - 1500))
-            power = max(power, pv_charge_reserve)
+            # With no PV to reserve (notably at night) the override must not
+            # touch the target: forcing it to 0 while charging starves the EV
+            # battery support the discharge target just authorized, and the
+            # wallbox cycles on/off all night (2026-10-11 incident).
+            if pv_charge_reserve > 0:
+                power = max(power, pv_charge_reserve)
 
     return power
 
@@ -822,6 +990,16 @@ def battery_energy():
         friendly_name="Battery Energy",
     )
 
+    # Stamp every full charge so the export scheduler knows when cells last
+    # balanced.  Missing history reads as overdue, which only matters until
+    # the first observed full charge after deploy.
+    if battery_soc >= BALANCE_FULL_SOC_THRESHOLD:
+        set_state(
+            "pyscript.battery_last_full",
+            now().isoformat(),
+            friendly_name="Battery last full charge",
+        )
+
 
 def set_energy_surplus(entity, surplus, **kwargs):
     set_state(
@@ -840,6 +1018,7 @@ def get_spendable_solar_cycle_energy(
     t_now: datetime,
     period_hours: float,
     battery_discharge_efficiency: float = 1.0,
+    battery_discharge_allowed: bool = True,
 ) -> tuple[float, float, float, datetime | None]:
     """Return a conservative energy budget for the current solar cycle.
 
@@ -847,6 +1026,11 @@ def get_spendable_solar_cycle_energy(
     optional battery-to-grid export are disabled.  Energy is spendable when it
     either remains above the protected battery floor at the following overnight
     trough, or would otherwise be exported from PV before that trough.
+
+    When battery discharge is banned (``battery_discharge_allowed`` is False),
+    headroom above the floor is stranded: it can neither cover loads nor be
+    exported, so only PV spill counts as spendable.  Reporting it anyway
+    publishes a surplus while the house draws from the grid.
 
     The result is a schedulable energy budget, not an assertion that all of the
     energy can be drawn immediately; live power controls still need to align a
@@ -877,8 +1061,13 @@ def get_spendable_solar_cycle_energy(
                 break
             previous_energy = entry.battery_energy
         battery_headroom = max(0, trough_energy - battery_export_floor)
+        spendable_headroom = (
+            battery_headroom * battery_discharge_efficiency
+            if battery_discharge_allowed
+            else 0.0
+        )
         return (
-            battery_headroom * battery_discharge_efficiency,
+            spendable_headroom,
             battery_headroom,
             0,
             trough_time,
@@ -906,11 +1095,140 @@ def get_spendable_solar_cycle_energy(
 
     battery_headroom = max(0, trough_entry.battery_energy - battery_export_floor)
     pv_spill = sum(max(0, entry.pv_feedin - 20) for entry in cycle) * period_hours / 1000
-    spendable = (
+    spendable_headroom = (
         battery_headroom * battery_discharge_efficiency
-        + pv_spill
+        if battery_discharge_allowed
+        else 0.0
     )
+    spendable = spendable_headroom + pv_spill
     return spendable, battery_headroom, pv_spill, trough_entry.period_start
+
+
+@pyscript_compile
+def calculate_horizon_energy_balance(
+    detail: list["ForecastEntry"],
+    t_now: datetime,
+    horizon_hours: float,
+    battery_energy_now: float,
+    battery_export_floor: float,
+    period_hours: float,
+    battery_discharge_efficiency: float = 1.0,
+) -> tuple[float, float, float, float, float]:
+    """Return the signed net energy position over a rolling horizon.
+
+    Stock (usable battery above the protected floor) plus forecast PV
+    inflows minus forecast house and EV wall-power outflows.  Negative
+    means grid import will be needed inside the window.  Returns
+    (balance, usable_battery, pv, house, ev_wall) in kWh.
+
+    Informational/planning signal only: a positive balance assumes
+    energy can shift freely inside the window (Wednesday PV cannot
+    cover Monday night).  Never use it as a spendable control budget;
+    the solar-cycle surplus remains the control signal.
+    """
+    try:
+        horizon_hours = float(horizon_hours)
+        battery_energy_now = float(battery_energy_now)
+        battery_export_floor = float(battery_export_floor)
+        period_hours = float(period_hours)
+        battery_discharge_efficiency = float(battery_discharge_efficiency)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError("horizon inputs must be finite numbers")
+    for value in (
+        horizon_hours,
+        battery_energy_now,
+        battery_export_floor,
+        period_hours,
+        battery_discharge_efficiency,
+    ):
+        if value != value or abs(value) == float("inf"):
+            raise ValueError("horizon inputs must be finite numbers")
+    if horizon_hours <= 0 or period_hours <= 0:
+        raise ValueError("horizon_hours and period_hours must be positive")
+    if battery_discharge_efficiency <= 0 or battery_discharge_efficiency > 1:
+        raise ValueError("battery_discharge_efficiency must be in (0, 1]")
+
+    window_end = t_now + timedelta(hours=horizon_hours)
+    usable_battery = (
+        max(0.0, battery_energy_now - battery_export_floor)
+        * battery_discharge_efficiency
+    )
+    pv_kwh = 0.0
+    house_kwh = 0.0
+    ev_wall_kwh = 0.0
+    for entry in detail:
+        if not t_now <= entry.period_start < window_end:
+            continue
+        pv_kwh += max(0.0, entry.pv_estimate) * period_hours / 1000
+        house_kwh += max(0.0, entry.house_power) * period_hours / 1000
+        ev_wall_kwh += max(0.0, entry.ev_charge_power) * period_hours / 1000
+    return (
+        usable_battery + pv_kwh - house_kwh - ev_wall_kwh,
+        usable_battery,
+        pv_kwh,
+        house_kwh,
+        ev_wall_kwh,
+    )
+
+
+@pyscript_compile
+def calculate_ev_floor_reserve(
+    detail: list["ForecastEntry"],
+    t_now: datetime,
+    horizon_hours: float,
+    ev_min_energy_kwh: float,
+    ev_energy_fallback: float | None,
+    ev_charge_efficiency: float,
+) -> float:
+    """Return the wall kWh needed to keep the EV at/above ev_min_energy_kwh.
+
+    Compares the standing minimum against the EV energy at the end of
+    the window, so scheduled in-window charging (already counted in the
+    horizon balance) shrinks the reserve instead of double-counting it.
+    Falls back to ev_energy_fallback when the trajectory carries no
+    usable end state (e.g. forecasts simulated without EV charging).
+    """
+    try:
+        horizon_hours = float(horizon_hours)
+        ev_min_energy_kwh = float(ev_min_energy_kwh)
+        ev_charge_efficiency = float(ev_charge_efficiency)
+        if ev_energy_fallback is not None:
+            ev_energy_fallback = float(ev_energy_fallback)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError("reserve inputs must be finite numbers")
+    for value in (horizon_hours, ev_min_energy_kwh, ev_charge_efficiency):
+        if value != value or abs(value) == float("inf"):
+            raise ValueError("reserve inputs must be finite numbers")
+    if ev_energy_fallback is not None and (
+        ev_energy_fallback != ev_energy_fallback
+        or abs(ev_energy_fallback) == float("inf")
+    ):
+        raise ValueError("reserve inputs must be finite numbers")
+    if horizon_hours <= 0:
+        raise ValueError("horizon_hours must be positive")
+    if ev_charge_efficiency <= 0 or ev_charge_efficiency > 1:
+        raise ValueError("ev_charge_efficiency must be in (0, 1]")
+
+    window_end = t_now + timedelta(hours=horizon_hours)
+    latest: tuple[datetime, float] | None = None
+    for entry in detail:
+        if not t_now <= entry.period_start < window_end:
+            continue
+        try:
+            value = float(getattr(entry, "ev_energy", None))
+        except (TypeError, ValueError):
+            continue
+        if value != value or abs(value) == float("inf"):
+            continue
+        if latest is None or entry.period_start >= latest[0]:
+            latest = (entry.period_start, value)
+    if latest is None:
+        if ev_energy_fallback is None:
+            return 0.0
+        end_energy = ev_energy_fallback
+    else:
+        end_energy = latest[1]
+    return max(0.0, ev_min_energy_kwh - end_energy) / ev_charge_efficiency
 
 
 @pyscript_compile
@@ -919,6 +1237,7 @@ def get_spendable_solar_cycle_curve(
     battery_export_floor: float,
     period_hours: float,
     battery_discharge_efficiency: float = 1.0,
+    battery_discharge_allowed: bool = True,
 ) -> list[float]:
     """Return the non-negative spendable budget at every forecast bucket.
 
@@ -934,6 +1253,7 @@ def get_spendable_solar_cycle_curve(
             entry.period_start,
             period_hours,
             battery_discharge_efficiency,
+            battery_discharge_allowed,
         )
         curve.append(spendable)
     return curve
@@ -956,11 +1276,32 @@ def calculate_ev_adjusted_spendable_energy(
     can be sold before the charge has happened.
     """
 
+    try:
+        base_spendable_energy_kwh = float(base_spendable_energy_kwh)
+        ev_forecast_spendable_energy_kwh = float(
+            ev_forecast_spendable_energy_kwh
+        )
+        remaining_ev_energy_kwh = float(remaining_ev_energy_kwh)
+        charge_efficiency = float(charge_efficiency)
+        local_ev_wall_energy_before_departure_kwh = float(
+            local_ev_wall_energy_before_departure_kwh
+        )
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError("energy inputs must be finite and non-negative")
+
+    for value in (
+        base_spendable_energy_kwh,
+        ev_forecast_spendable_energy_kwh,
+        remaining_ev_energy_kwh,
+        charge_efficiency,
+        local_ev_wall_energy_before_departure_kwh,
+    ):
+        if value < 0.0 or value != value or abs(value) == float("inf"):
+            raise ValueError("energy inputs must be finite and non-negative")
+
     if charge_efficiency <= 0 or charge_efficiency > 1:
         raise ValueError("charge_efficiency must be in (0, 1]")
 
-    base_spendable_energy_kwh = max(0.0, base_spendable_energy_kwh)
-    ev_forecast_spendable_energy_kwh = max(0.0, ev_forecast_spendable_energy_kwh)
     conservative_forecast_budget_kwh = min(
         base_spendable_energy_kwh,
         ev_forecast_spendable_energy_kwh,
@@ -1050,6 +1391,7 @@ def get_ev_adjusted_spendable_solar_cycle_curve(
     charge_efficiency: float,
     reservation_horizon_hours: float,
     battery_discharge_efficiency: float,
+    battery_discharge_allowed: bool = True,
 ) -> list[float]:
     """Return a curve that reserves the unfinished EV charge until departure."""
 
@@ -1067,6 +1409,7 @@ def get_ev_adjusted_spendable_solar_cycle_curve(
             base_entry.period_start,
             period_hours,
             battery_discharge_efficiency,
+            battery_discharge_allowed,
         )
         ev_spendable, _, _, _ = get_spendable_solar_cycle_energy(
             ev_detail,
@@ -1074,6 +1417,7 @@ def get_ev_adjusted_spendable_solar_cycle_curve(
             ev_entry.period_start,
             period_hours,
             battery_discharge_efficiency,
+            battery_discharge_allowed,
         )
         projected_ev_charge_kwh = max(
             0.0,
@@ -1122,62 +1466,38 @@ def get_ev_adjusted_spendable_solar_cycle_curve(
 
 @pyscript_compile
 def parse_full_schedule(
-    schedule_data: dict[str, list[dict[str, Any]]], default_required_soc: float, t_now=None
+    schedule_data: dict[str, list[dict[str, Any]]],
+    default_required_soc: float,
+    t_now=None,
+    preserve_recent_arrival: bool = False,
 ) -> list["EVScheduleEntry"]:
-    # ``now`` is a Pyscript runtime helper and cannot safely be resolved from
-    # inside a ``@pyscript_compile`` function.  Callers must freeze the time
-    # before entering this deterministic parser.
-    if t_now is None:
-        raise ValueError("parse_full_schedule requires t_now")
-    t_now = with_timezone(t_now)
-    today = t_now.date()
-    today_weekday = today.weekday()
-    day_map = {
-        name: i for i, name in enumerate(["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"])
-    }
-
-    entries = []
-    for day_name, events in schedule_data.items():
-        event_weekday = day_map.get(day_name, -1)
-        if event_weekday == -1:
-            continue
-
-        day_offset = (event_weekday - today_weekday + 7) % 7
-        event_date = today + timedelta(days=day_offset)
-
-        for event in events:
-            soc = event.get("data", {}).get("required")
-            distance = event.get("data", {}).get("distance")  # km
-            soc = get_drive_required_soc(soc, distance, default_required_soc)
-
-            event_start = with_timezone(datetime.combine(event_date, event["from"]))
-            event_end = with_timezone(datetime.combine(event_date, event["to"]))
-            if event_end <= event_start:
-                event_end += timedelta(days=1)
-            if event_end <= t_now:
-                event_start += timedelta(days=7)
-                event_end += timedelta(days=7)
-
-            entries.append(
-                EVScheduleEntry(
-                    start=event_start,
-                    end=event_end,
-                    required_soc=float(soc) if soc is not None else None,
-                    distance=float(distance) if distance is not None else None,
-                )
-            )
-
-    return sorted(entries, key=lambda x: x.start)
+    # Shared implementation lives in modules.energy_core so the live EV
+    # charging app and the forecast stay in lockstep.  ``now`` is a Pyscript
+    # runtime helper and cannot safely be resolved from inside a
+    # ``@pyscript_compile`` function.  Callers must freeze the time before
+    # entering this deterministic parser.
+    return parse_ev_schedule_entries(
+        schedule_data,
+        default_required_soc,
+        t_now,
+        EVScheduleEntry,
+        preserve_recent_arrival,
+    )
 
 
-def get_ev_schedule(t_now=None):
+def get_ev_schedule(t_now=None, preserve_recent_arrival: bool = False):
     if t_now is None:
         t_now = now()
     ev_schedule = (schedule.get_schedule(entity_id="schedule.tesla_planned_drives") or {}).get(
         "schedule.tesla_planned_drives", {}
     )
     ev_required_soc = get(EV.required_soc, 80)
-    return parse_full_schedule(ev_schedule, default_required_soc=ev_required_soc, t_now=t_now)
+    return parse_full_schedule(
+        ev_schedule,
+        default_required_soc=ev_required_soc,
+        t_now=t_now,
+        preserve_recent_arrival=preserve_recent_arrival,
+    )
 
 
 @time_trigger
@@ -1187,22 +1507,62 @@ def forecast_surplus():
     task.unique("forecast_surplus", kill_me=True)
     epex_prices = get_attr(ElectricityPrices.epex_forecast_prices, "data", [])
     t_now = now()
-    ev_schedule = get_ev_schedule(t_now)
+    ev_schedule = get_ev_schedule(t_now, preserve_recent_arrival=True)
     _, next_departure = get_ongoing_and_next_drive(ev_schedule, t_now)
-    t_end = t_now + timedelta(hours=80)
+    # The simulation spans 5 days for the energy balance; the solar-cycle
+    # budget keeps its 80-hour scope via the *_80h slices below.
+    t_end = t_now + timedelta(hours=120)
     if next_departure:
         t_end = max(t_end, next_departure.end + timedelta(hours=6))
 
     setpoint = get(Grid.power_setpoint_basis, -20)
     battery_capacity = get(Battery.capacity, 1337)
     battery_energy = get(Battery.energy, 1337)
+    battery_energy_updated_at = get_attr(Battery.energy, "last_updated")
+    # Battery.power is in W; an idle battery's energy reading legitimately
+    # sits still (HA only refreshes last_updated on change).
+    battery_energy_measurement_fresh = is_battery_energy_measurement_usable(
+        t_now,
+        battery_energy_updated_at,
+        battery_energy,
+        battery_capacity,
+        get(Battery.soc, -1),
+        get(Battery.power, 1337),
+        get_attr(Battery.power, "last_updated"),
+        max_age_seconds=LIVE_BATTERY_ENERGY_MAX_MEASUREMENT_AGE_SECONDS,
+    )
     current_surplus = get(House.energy_surplus, 0)
     previous_ev_adjusted_surplus = get(House.energy_surplus_after_ev_charging, 0)
     ev_energy = get(EV.energy, 0)
+    if (
+        1337 in (battery_capacity, battery_energy)
+        or not are_battery_energy_values_valid(battery_capacity, battery_energy)
+        or not battery_energy_measurement_fresh
+    ):
+        log.warning("Battery capacity or energy invalid or stale; cannot calculate surplus")
+        return
+    if not are_battery_energy_values_valid(EVConst.ev_capacity, ev_energy):
+        log.warning("EV energy invalid; cannot calculate EV-adjusted surplus")
+        return
+    configured_battery_charge_limit_w = resolve_directional_power_limit_w(
+        get(Battery.charge_limit, -1),
+        6600.0,
+        6600.0,
+    )
+    hardware_discharge_limit_w = resolve_directional_power_limit_w(
+        get_planned_discharge_limit_w(-1),
+        8000.0,
+        8000.0,
+    )
+    battery_discharge_allowed = hardware_discharge_limit_w > 0.0
     reserve_soc = get_reserve_soc()
     minimal_soc = get(Automation.minimal_soc, reserve_soc)
     operational_battery_floor = get_battery_export_floor(battery_capacity, reserve_soc, minimal_soc)
-    max_battery_power_target = get_attr(Grid.power_setpoint_target, "max_battery_power_target", 4000)
+    max_battery_power_target = resolve_directional_power_limit_w(
+        get_attr(Grid.power_setpoint_target, "max_battery_power_target", 4000),
+        4000.0,
+        8000.0,
+    )
     unified_scheduler_active = get_attr(Grid.power_setpoint_target, "unified_scheduler_active", False)
     forecast_max_setpoint = get(Grid.max_setpoint, -20) if unified_scheduler_active else -20
     optional_export_power_schedule = (
@@ -1242,9 +1602,6 @@ def forecast_surplus():
         surplus_reserve_soc,
     )
 
-    if 1337 in (battery_capacity, battery_energy):
-        log.warning("Battery capacity or energy not available yet, cannot calculate surplus")
-        return
 
     pv_forecast = get_pv_forecast_with_prices(t_start=t_now, t_end=t_end, epex_prices=epex_prices)
     if not pv_forecast or len(pv_forecast) < 2:
@@ -1254,49 +1611,16 @@ def forecast_surplus():
 
     battery_floor_schedule = None
     if unified_scheduler_active:
-        reserve_slots = []
         daily_house_power = get(House.daily_average_power, 0)
         nightly_house_power = get(House.nightly_average_power, 0)
-        for index, forecast_entry in enumerate(pv_forecast):
-            if index + 1 < len(pv_forecast):
-                period_end = pv_forecast[index + 1].period_start
-            elif index > 0:
-                period_end = forecast_entry.period_start + (
-                    forecast_entry.period_start - pv_forecast[index - 1].period_start
-                )
-            else:
-                period_end = forecast_entry.period_start + timedelta(minutes=30)
-            effective_start = max(t_now, forecast_entry.period_start)
-            duration_hours = max(0.0, (period_end - effective_start).total_seconds() / 3600)
-            forecast_house_power = (
-                daily_house_power
-                if 7 < forecast_entry.period_start.hour < 19
-                else nightly_house_power
-            )
-            forecast_pv_power = forecast_entry.pv_estimate * 1000
-            slot_reserve_soc = max(
-                get_reserve_soc(forecast_entry.period_start),
-                get_low_pv_reserve_soc(
-                    house_power=forecast_house_power,
-                    pv_power=forecast_pv_power,
-                    battery_cells_balanced=bool(battery_cells_balanced),
-                ),
-            )
-            reserve_slots.append(
-                ReserveTrajectorySlot(
-                    period_start=forecast_entry.period_start,
-                    duration_hours=duration_hours,
-                    house_power_w=forecast_house_power,
-                    pv_power_w=forecast_pv_power,
-                    reserve_soc=slot_reserve_soc,
-                    protect_deficit=not is_low_price(
-                        get_price(
-                            hour=forecast_entry.period_start.hour,
-                            minute=forecast_entry.period_start.minute,
-                        )
-                    ),
-                )
-            )
+        reserve_slots = build_reserve_trajectory_slots(
+            pv_forecast,
+            t_now,
+            day_house_power_w=daily_house_power,
+            night_house_power_w=nightly_house_power,
+            pv_power_scale=1.0,
+            battery_cells_balanced=battery_cells_balanced,
+        )
         battery_floor_schedule = build_reserve_energy_schedule(
             reserve_slots,
             battery_capacity_kwh=battery_capacity,
@@ -1306,22 +1630,28 @@ def forecast_surplus():
             discharge_efficiency=HOME_BATTERY_DISCHARGE_EFFICIENCY,
         )
 
-    forecast_no_ev = forecast(
+    # Shared inputs for the four simulation passes below.  Each pass overrides
+    # only the dampening, EV participation, and budget knobs that define it.
+    base_forecast_kwargs = dict(
         forecast=pv_forecast,
         battery_capacity=battery_capacity,
         battery_energy=battery_energy,
         setpoint=setpoint,
+        max_battery_power_target=max_battery_power_target,
+        battery_charge_limit=configured_battery_charge_limit_w,
+        headroom_schedule=headroom_schedule,
+        grid_target_schedule=None,
+        battery_floor_schedule=battery_floor_schedule,
+        max_setpoint=forecast_max_setpoint,
+    )
+
+    forecast_no_ev = forecast(
+        **base_forecast_kwargs,
         forecast_dampening=1,
         with_ev_charging=False,
         battery_min_energy=forecast_battery_floor,
-        max_battery_power_target=max_battery_power_target,
-        headroom_schedule=headroom_schedule,
-        grid_target_schedule=None,
         optional_export_power_schedule=optional_export_power_schedule,
-        battery_floor_schedule=battery_floor_schedule,
         battery_export_budget_kwh=unified_export_budget_kwh,
-        max_setpoint=forecast_max_setpoint,
-        # logging=True,
         surplus_energy=current_surplus,
     )
 
@@ -1331,20 +1661,12 @@ def forecast_surplus():
     # again as newly available energy.  Forecast PV is reduced by 20% and only
     # PV that still spills after charging the battery is added to the budget.
     spendable_forecast = forecast(
-        forecast=pv_forecast,
-        battery_capacity=battery_capacity,
-        battery_energy=battery_energy,
-        setpoint=setpoint,
+        **base_forecast_kwargs,
         forecast_dampening=0.8,
         with_ev_charging=False,
         battery_min_energy=forecast_battery_floor,
-        max_battery_power_target=max_battery_power_target,
-        headroom_schedule=headroom_schedule,
-        grid_target_schedule=None,
         optional_export_power_schedule={},
-        battery_floor_schedule=battery_floor_schedule,
         battery_export_budget_kwh=0,
-        max_setpoint=forecast_max_setpoint,
         surplus_energy=0,
     )
 
@@ -1365,20 +1687,26 @@ def forecast_surplus():
                 break
             previous_battery_energy = el.battery_energy
 
+    cycle_scope_end = t_now + timedelta(hours=80)
+    spendable_detail_80h = [
+        entry for entry in spendable_forecast.detail if entry.period_start < cycle_scope_end
+    ]
     surplus, battery_headroom_until_trough, conservative_pv_spill, spendable_horizon = (
         get_spendable_solar_cycle_energy(
-            spendable_forecast.detail,
+            spendable_detail_80h,
             surplus_battery_floor,
             t_now,
             period_hours,
             HOME_BATTERY_DISCHARGE_EFFICIENCY,
+            battery_discharge_allowed,
         )
     )
     spendable_surplus_curve = get_spendable_solar_cycle_curve(
-        spendable_forecast.detail,
+        spendable_detail_80h,
         surplus_battery_floor,
         period_hours,
         HOME_BATTERY_DISCHARGE_EFFICIENCY,
+        battery_discharge_allowed,
     )
 
     forecast_today = [el for el in forecast_no_ev.detail if el.period_start.day == t_now.day]
@@ -1400,6 +1728,8 @@ def forecast_surplus():
         operational_battery_floor=round(operational_battery_floor, 2),
         forecast_pv_factor=0.8,
         spendable_horizon=spendable_horizon,
+        calculated_at=t_now,
+        battery_energy_at_calculation=battery_energy,
     )
     set_energy_surplus(
         House.battery_headroom_until_trough,
@@ -1413,60 +1743,118 @@ def forecast_surplus():
         detail=detail_without_ev_vectorized,
     )
 
+    def publish_5_day_balance(detail):
+        (
+            balance_5_day,
+            balance_usable_battery_kwh,
+            balance_pv_120h_kwh,
+            balance_house_120h_kwh,
+            balance_ev_wall_120h_kwh,
+        ) = calculate_horizon_energy_balance(
+            detail,
+            t_now,
+            120.0,
+            battery_energy,
+            surplus_battery_floor,
+            period_hours,
+            HOME_BATTERY_DISCHARGE_EFFICIENCY,
+        )
+        ev_floor_reserve_kwh = calculate_ev_floor_reserve(
+            detail,
+            t_now,
+            120.0,
+            get(EV.required_soc, 80) / 100 * EVConst.ev_capacity,
+            ev_energy,
+            EVConst.charge_efficiency,
+        )
+        balance_5_day -= ev_floor_reserve_kwh
+        set_energy_surplus(
+            House.energy_balance_5_day,
+            balance_5_day,
+            usable_battery_kwh=round(balance_usable_battery_kwh, 3),
+            pv_120h_kwh=round(balance_pv_120h_kwh, 3),
+            house_120h_kwh=round(balance_house_120h_kwh, 3),
+            ev_wall_120h_kwh=round(balance_ev_wall_120h_kwh, 3),
+            ev_floor_reserve_kwh=round(ev_floor_reserve_kwh, 3),
+            horizon_hours=120.0,
+            horizon_end=(t_now + timedelta(hours=120)).isoformat(),
+            calculated_at=t_now,
+            battery_energy_at_calculation=battery_energy,
+        )
+
     if ev_schedule:
         forecast_ev_charging_enabled = bool(
             get(Automation.auto_ev_charging, False)
             or get(Charger.force_charge, False)
             or get(EV.is_charging, False)
         )
+        drive_ongoing_for_precharge, _ = get_ongoing_and_next_drive(ev_schedule, t_now)
+        recent_arrival_for_precharge = None
+        if drive_ongoing_for_precharge is None:
+            completed_drives = [
+                event
+                for event in ev_schedule
+                if event.end <= t_now
+                and t_now - event.end <= timedelta(hours=EV_EXPORT_RESERVATION_HORIZON_HOURS)
+            ]
+            if completed_drives:
+                recent_arrival_for_precharge = max(completed_drives, key=lambda event: event.end)
+        arrival_precharge_enabled = bool(
+            forecast_ev_charging_enabled
+            and get(EV.able_to_charge_on_arrival, False)
+            and (
+                drive_ongoing_for_precharge is not None
+                or recent_arrival_for_precharge is not None
+            )
+        )
+        precharge_arrival_time = (
+            drive_ongoing_for_precharge.end
+            if drive_ongoing_for_precharge is not None
+            else recent_arrival_for_precharge.end
+            if recent_arrival_for_precharge is not None
+            else None
+        )
+        arrival_precharge_budget_kwh = max(
+            0.0,
+            battery_energy - surplus_battery_floor - 1.0,
+        )
         # Re-run the conservative, optional-export-free baseline with EV loads
         # included.  Start its policy accumulator at zero; a previously
         # published surplus must not authorize optional consumption here.
         spendable_forecast_with_ev = forecast(
-            forecast=pv_forecast,
-            battery_capacity=battery_capacity,
-            battery_energy=battery_energy,
-            setpoint=setpoint,
+            **base_forecast_kwargs,
             forecast_dampening=0.8,
             with_ev_charging=forecast_ev_charging_enabled,
             ev_schedule=ev_schedule,
             battery_min_energy=surplus_battery_floor,
-            max_battery_power_target=max_battery_power_target,
-            headroom_schedule=headroom_schedule,
-            grid_target_schedule=None,
             optional_export_power_schedule={},
-            battery_floor_schedule=battery_floor_schedule,
             battery_export_budget_kwh=0,
-            max_setpoint=forecast_max_setpoint,
             surplus_energy=0,
             ev_energy=ev_energy,
+            allow_battery_precharge=arrival_precharge_enabled,
+            precharge_arrival_time=precharge_arrival_time,
+            ev_battery_precharge_budget_kwh=arrival_precharge_budget_kwh,
         )
+        # Publish the same conservative PV confidence used by the spendable
+        # budget.  The dashboard must not promise an EV start that live
+        # measured headroom is unlikely to sustain.
         forecast_with_ev = forecast(
-            forecast=pv_forecast,
-            battery_capacity=battery_capacity,
-            battery_energy=battery_energy,
-            setpoint=setpoint,
-            # Publish the same conservative PV confidence used by the spendable
-            # budget.  The dashboard must not promise an EV start that live
-            # measured headroom is unlikely to sustain.
+            **base_forecast_kwargs,
             forecast_dampening=0.8,
             with_ev_charging=forecast_ev_charging_enabled,
             ev_schedule=ev_schedule,
             battery_min_energy=surplus_battery_floor,
-            max_battery_power_target=max_battery_power_target,
-            headroom_schedule=headroom_schedule,
-            grid_target_schedule=None,
             optional_export_power_schedule=optional_export_power_schedule,
-            battery_floor_schedule=battery_floor_schedule,
             battery_export_budget_kwh=unified_export_budget_kwh,
-            max_setpoint=forecast_max_setpoint,
-            # logging=True,
             surplus_energy=surplus,
             ev_energy=ev_energy,
             # Use the prior conservative publication to avoid a circular
             # forecast.  The controller applies a further 3 kWh safety reserve,
             # so a slightly old value fails gradually instead of overcommitting.
             ev_battery_support_energy_kwh=previous_ev_adjusted_surplus,
+            allow_battery_precharge=arrival_precharge_enabled,
+            precharge_arrival_time=precharge_arrival_time,
+            ev_battery_precharge_budget_kwh=arrival_precharge_budget_kwh,
         )
 
         min_battery_energy = min([el.battery_energy for el in forecast_with_ev.detail] or [0])
@@ -1529,12 +1917,36 @@ def forecast_surplus():
                     f"planned charge {planned_charge_energy:.2f} kWh, "
                     f"first charge {first_charge_time if first_charge_time else 'none'}"
                 )
+        horizon_ev_shortfall_kwh, horizon_ev_shortfall_departure = (
+            first_uncovered_departure_need(
+                forecast_with_ev.detail,
+                ev_schedule,
+                t_now,
+                EV_EXPORT_RESERVATION_HORIZON_HOURS,
+                get(EV.required_soc, 80),
+                EVConst.ev_capacity,
+            )
+        )
+        horizon_ev_shortfall_summary = (
+            "no uncovered EV departure in the reservation horizon"
+        )
+        if horizon_ev_shortfall_departure is not None:
+            horizon_ev_shortfall_summary = (
+                f"EV horizon reservation {horizon_ev_shortfall_kwh:.2f} kWh "
+                f"for departure {horizon_ev_shortfall_departure}"
+            )
+        spendable_ev_detail_80h = [
+            entry
+            for entry in spendable_forecast_with_ev.detail
+            if entry.period_start < cycle_scope_end
+        ]
         ev_forecast_spendable_energy, _, _, _ = get_spendable_solar_cycle_energy(
-            spendable_forecast_with_ev.detail,
+            spendable_ev_detail_80h,
             surplus_battery_floor,
             t_now,
             period_hours,
             HOME_BATTERY_DISCHARGE_EFFICIENCY,
+            battery_discharge_allowed,
         )
         ev_energy_needed = max(0.0, float(get(EV.energy_needed, 0)))
         ev_obligation_due_within_horizon = bool(
@@ -1571,8 +1983,8 @@ def forecast_surplus():
             ),
         )
         spendable_surplus_curve_with_ev = get_ev_adjusted_spendable_solar_cycle_curve(
-            spendable_forecast.detail,
-            spendable_forecast_with_ev.detail,
+            spendable_detail_80h,
+            spendable_ev_detail_80h,
             surplus_battery_floor,
             period_hours,
             ev_energy,
@@ -1581,9 +1993,27 @@ def forecast_surplus():
             EVConst.charge_efficiency,
             EV_EXPORT_RESERVATION_HORIZON_HOURS,
             HOME_BATTERY_DISCHARGE_EFFICIENCY,
+            battery_discharge_allowed,
+        )
+        forecast_grid_import_kwh = 0.0
+        forecast_grid_import_windows = []
+        for detail_entry in forecast_with_ev.detail:
+            import_power_w = max(0.0, detail_entry.power_from_grid)
+            if import_power_w > 100.0:
+                forecast_grid_import_kwh += import_power_w * period_hours / 1000
+                if len(forecast_grid_import_windows) < 6:
+                    forecast_grid_import_windows.append(
+                        f"{detail_entry.period_start} {import_power_w:.0f}W "
+                        f"(batt {detail_entry.battery_energy:.1f}kWh)"
+                    )
+        forecast_grid_import_summary = (
+            "; ".join(forecast_grid_import_windows)
+            if forecast_grid_import_windows
+            else "none"
         )
         log.warning(
             f"""\n#################### Forecast Surplus  #####################\n
+            Forecast grid import total: {forecast_grid_import_kwh:.2f} kWh; largest windows: {forecast_grid_import_summary}
             Reserve battery energy: {reserve_energy:.2f} kWh ({reserve_soc:.2f}% reserve SOC)
             Forecast battery floor: {forecast_battery_floor:.2f} kWh
             Protected surplus floor: {surplus_battery_floor:.2f} kWh
@@ -1602,6 +2032,7 @@ def forecast_surplus():
             EV charging controller enabled: {forecast_ev_charging_enabled}
             {active_drive_forecast_summary}
             {departure_forecast_summary}
+            {horizon_ev_shortfall_summary}
             last entry date: {forecast_no_ev.detail[-1].period_start if len(forecast_no_ev.detail) > 0 else "n/a"}
             total feedin: {feedin_today:.2f} kWh
             total pv feedin: {pv_feedin_today:.2f} kWh
@@ -1632,6 +2063,12 @@ def forecast_surplus():
             base_spendable_energy=round(surplus, 3),
             ev_forecast_spendable_energy=round(ev_forecast_spendable_energy, 3),
             ev_energy_needed=round(ev_energy_needed, 3),
+            horizon_ev_shortfall_kwh=round(horizon_ev_shortfall_kwh, 3),
+            horizon_ev_shortfall_departure=(
+                horizon_ev_shortfall_departure.isoformat()
+                if horizon_ev_shortfall_departure is not None
+                else None
+            ),
             ev_wall_energy_required=round(ev_wall_energy_required, 3),
             local_ev_wall_energy_before_departure=round(
                 local_ev_wall_energy_before_departure_kwh,
@@ -1641,7 +2078,9 @@ def forecast_surplus():
             next_departure=next_departure.start if next_departure else None,
             spendable_horizon=spendable_horizon,
             calculated_at=t_now,
+            battery_energy_at_calculation=battery_energy,
         )
+        publish_5_day_balance(spendable_forecast_with_ev.detail)
 
     else:
         set_state(
@@ -1662,7 +2101,9 @@ def forecast_surplus():
             next_departure=None,
             spendable_horizon=spendable_horizon,
             calculated_at=t_now,
+            battery_energy_at_calculation=battery_energy,
         )
+        publish_5_day_balance(spendable_forecast.detail)
 
 
 @pyscript_compile
@@ -1841,6 +2282,12 @@ def calculate_legacy_surplus_fallback(
     return max(0.0, battery_energy - required_energy_kwh)
 
 
+def _or_get(entity_id, local_value, default):
+    """Return an explicit caller value, falling back to the HA state default."""
+
+    return local_value if local_value is not None else get(entity_id, default)
+
+
 def forecast(
     forecast: list[PVForecastWithPrices],
     setpoint: float,
@@ -1865,6 +2312,9 @@ def forecast(
     ev_schedule: list[EVScheduleEntry] | None = None,
     surplus_energy: float | None = None,
     ev_battery_support_energy_kwh: float = 0,
+    ev_battery_precharge_budget_kwh: float = 0,
+    allow_battery_precharge: bool = False,
+    precharge_arrival_time: datetime | None = None,
     battery_export_budget_kwh: float | None = None,
     daily_power: float | None = None,
     nightly_power: float | None = None,
@@ -1882,41 +2332,51 @@ def forecast(
     eff_dis: bool | None = None,
     battery_cells_balanced: bool | None = None,
     t_now: datetime | None = None,
+    battery_discharge_limit_w: float | None = None,
 ):
     t_now = t_now if t_now is not None else now()
 
-    daily_power = daily_power if daily_power is not None else get(House.daily_average_power, 0)  # W
-    nightly_power = nightly_power if nightly_power is not None else get(House.nightly_average_power, 0)  # W
-
-    ev_required_soc = ev_required_soc if ev_required_soc is not None else get(EV.required_soc, 80)
-    ev_soc = ev_soc if ev_soc is not None else get(EV.soc, 100)
-    is_charging_ev = is_charging_ev if is_charging_ev is not None else get(EV.is_charging, False)
-
-    smart_limiter_active = (
-        smart_limiter_active
-        if smart_limiter_active is not None
-        else get(Automation.auto_charge_limit, False)
+    daily_power = _or_get(House.daily_average_power, daily_power, 0)  # W
+    nightly_power = _or_get(House.nightly_average_power, nightly_power, 0)  # W
+    # A sustained discharge ban (price automation, inverter) must reach
+    # the simulation: without it the forecast discharges a battery that
+    # cannot discharge.  The seconds-long stale-telemetry hold must not: it
+    # parks the shared limit input at 0, and a day-long forecast built on
+    # that transient zero freezes the battery and imports from the grid.
+    # None keeps the legacy plan-only cap, and direct callers without a
+    # caller value fall back to the hold-immune read.  The clamp happens
+    # here, in uncompiled code, so _forecast() itself stays untouched: it
+    # must not gain new cross-function calls.
+    if battery_discharge_limit_w is None:
+        battery_discharge_limit_w = get_planned_discharge_limit_w(-1)
+    max_battery_power_target = limit_forecast_discharge_to_hardware_w(
+        max_battery_power_target,
+        resolve_directional_power_limit_w(
+            battery_discharge_limit_w,
+            8000.0,
+            8000.0,
+        ),
     )
-    charge_limit = charge_limit if charge_limit is not None else get(Battery.force_charge_up_to, 0)
-    max_charge_price = max_charge_price if max_charge_price is not None else get(Battery.max_charge_price, 0)
-    force_charge_switch = (
-        force_charge_switch
-        if force_charge_switch is not None
-        else get(Battery.force_charge_switch, False)
-    )
+
+    ev_required_soc = _or_get(EV.required_soc, ev_required_soc, 80)
+    ev_soc = _or_get(EV.soc, ev_soc, 100)
+    is_charging_ev = _or_get(EV.is_charging, is_charging_ev, False)
+
+    smart_limiter_active = _or_get(Automation.auto_charge_limit, smart_limiter_active, False)
+    charge_limit = _or_get(Battery.force_charge_up_to, charge_limit, 0)
+    max_charge_price = _or_get(Battery.max_charge_price, max_charge_price, 0)
+    force_charge_switch = _or_get(Battery.force_charge_switch, force_charge_switch, False)
     min_discharge_price = (
         min_discharge_price
         if min_discharge_price is not None
         else float(get(Automation.min_discharge_price, default=0))
     )
-    charger_ready = charger_ready if charger_ready is not None else get(Charger.ready, False)
+    charger_ready = _or_get(Charger.ready, charger_ready, False)
     charger_ready_since = charger_ready_since or get_attr(Charger.ready, "last_changed")
-    ev_plugged_in = ev_plugged_in if ev_plugged_in is not None else get(EV.plugged_in, False)
-    eff_dis = eff_dis if eff_dis is not None else get(Automation.efficient_discharge, False)
-    battery_cells_balanced = (
-        battery_cells_balanced if battery_cells_balanced is not None else get(Battery.cells_balanced, False)
-    )
-    max_feedin = max_feedin if max_feedin is not None else get(Grid.max_feedin_target, 4000)
+    ev_plugged_in = _or_get(EV.plugged_in, ev_plugged_in, False)
+    eff_dis = _or_get(Automation.efficient_discharge, eff_dis, False)
+    battery_cells_balanced = _or_get(Battery.cells_balanced, battery_cells_balanced, False)
+    max_feedin = _or_get(Grid.max_feedin_target, max_feedin, 4000)
     return _forecast(
         forecast=forecast,
         setpoint=setpoint,
@@ -1941,6 +2401,9 @@ def forecast(
         ev_schedule=ev_schedule,
         surplus_energy=surplus_energy,
         ev_battery_support_energy_kwh=ev_battery_support_energy_kwh,
+        ev_battery_precharge_budget_kwh=ev_battery_precharge_budget_kwh,
+        allow_battery_precharge=allow_battery_precharge,
+        precharge_arrival_time=precharge_arrival_time,
         battery_export_budget_kwh=battery_export_budget_kwh,
         daily_power=daily_power,
         nightly_power=nightly_power,
@@ -1986,6 +2449,9 @@ def _forecast(
     ev_schedule: list[EVScheduleEntry] | None = None,
     surplus_energy: float | None = None,
     ev_battery_support_energy_kwh: float = 0,
+    ev_battery_precharge_budget_kwh: float = 0,
+    allow_battery_precharge: bool = False,
+    precharge_arrival_time: datetime | None = None,
     battery_export_budget_kwh: float | None = None,
     daily_power: float | None = None,
     nightly_power: float | None = None,
@@ -2007,6 +2473,13 @@ def _forecast(
     if not len(forecast) > 1:
         return None
 
+    forecast_charge_limit_w, forecast_discharge_limit_w = (
+        get_forecast_battery_power_limits(
+            battery_charge_limit,
+            max_battery_power_target,
+        )
+    )
+
     prices = [el.price_per_kwh for el in forecast]
     prices_mean = sum(prices) / len(prices) if len(prices) > 0 else 0
     prices_std = sqrt(sum([(p - prices_mean) ** 2 for p in prices]) / len(prices)) if len(prices) > 0 else 0
@@ -2021,7 +2494,11 @@ def _forecast(
         )
 
     surplus = surplus_energy
-    ev_battery_support_budget_remaining_kwh = max(0, ev_battery_support_energy_kwh)
+    ev_battery_support_budget_remaining_kwh = max(
+        0,
+        ev_battery_support_energy_kwh,
+        ev_battery_precharge_budget_kwh if allow_battery_precharge else 0,
+    )
     battery_export_budget_remaining_kwh = battery_export_budget_kwh
     orig_setpoint = setpoint
 
@@ -2048,19 +2525,15 @@ def _forecast(
             live_ongoing_drive,
             returned_during_current_drive,
         )
-        return (
-            with_ev_charging
-            and is_forecast_ev_available(
-                ev_schedule,
-                t_now,
-                dt,
-                ongoing_drive,
-                vehicle_present_now,
-            )
-            and ev_energy < EVConst.ev_capacity * (smart_charge_limit or 101) / 100
-        )
+        return is_forecast_ev_available(
+            ev_schedule,
+            t_now,
+            dt,
+            ongoing_drive,
+            vehicle_present_now,
+        ) and ev_energy < EVConst.ev_capacity * (smart_charge_limit or 101) / 100
 
-    def get_inverter_mode(
+    def resolve_period_inverter_mode(
         pv_power, target_soc, current_soc, electricity_price, surplus, battery_headroom_energy, _t_now
     ):
         assert surplus is not None
@@ -2079,6 +2552,7 @@ def _forecast(
             force_charge_switch,
             t_now=_t_now,
             enforce_battery_floor=battery_floor_schedule is not None,
+            is_low_price=is_low_price(electricity_price),
         )
         return new_mode, new_charge_power_limit, new_force_charge_switch_state, reason
 
@@ -2138,6 +2612,30 @@ def _forecast(
 
         ev_energy_needed = _get_ev_energy_needed(ev_required_soc, ev_soc, smart_charge_limit, smart_limiter_active)
 
+        ev_battery_support_power = 0.0
+        arrival_precharge_active = bool(
+            allow_battery_precharge
+            and precharge_arrival_time is not None
+            and start >= precharge_arrival_time
+            and next_drive_event is not None
+            and start < next_drive_event.start
+        )
+        precharge_energy_needed = 0.0
+        if arrival_precharge_active:
+            precharge_target_soc = max(ev_required_soc, smart_charge_limit)
+            precharge_energy_needed = max(
+                0.0,
+                (precharge_target_soc - ev_soc) / 100 * EVConst.ev_capacity,
+            )
+            precharge_power_budget = min(
+                3000.0,
+                ev_battery_support_budget_remaining_kwh * 1000 / max(period_hours, 1 / 60),
+            )
+            ev_battery_support_power = max(
+                ev_battery_support_power,
+                precharge_power_budget,
+            )
+
         could_charge_ev = with_ev_charging and (
             ev_energy_needed > 0 or ev_energy < EVConst.ev_capacity * smart_charge_limit / 100
         )
@@ -2165,7 +2663,7 @@ def _forecast(
         )
 
         battery_headroom_energy = max(0, tentative_batt_energy - period_battery_min_energy)
-        inverter_mode, charge_power_limit, is_force_charging, inverter_mode_reason = get_inverter_mode(
+        inverter_mode, charge_power_limit, is_force_charging, inverter_mode_reason = resolve_period_inverter_mode(
             power_production,
             battery_target_soc,
             tentative_batt_soc,
@@ -2178,7 +2676,6 @@ def _forecast(
         # --- EV Charging Action ---
         ev_charge_power = 0.0
         ev_charge_start_delay_minutes = 0.0
-        ev_battery_support_power = 0.0
         charge_mode = ChargeMode.idle
         was_charging_ev = is_charging_ev
 
@@ -2209,6 +2706,8 @@ def _forecast(
                     battery_force_charge=is_force_charging,
                     battery_floor_soc=period_battery_min_energy / battery_capacity * 100,
                     battery_support_power=ev_battery_support_power,
+                    allow_battery_precharge=arrival_precharge_active,
+                    precharge_energy_needed=precharge_energy_needed,
                 )
             )
 
@@ -2344,7 +2843,10 @@ def _forecast(
         # --- BRANCH A: Force Charging ---
         if inverter_mode in (InverterMode.on, InverterMode.charger_only) and is_force_charging:
             # We enforce charging at the limit
-            target_charge_power = charge_power_limit
+            target_charge_power = min(
+                charge_power_limit,
+                forecast_charge_limit_w,
+            )
 
             # Physical limit check (Capacity)
             max_intake_wh = (battery_capacity - current_bat_kwh) * 1000
@@ -2404,7 +2906,7 @@ def _forecast(
                     actual_discharge_watts = 0
                 else:
                     # Physical Constraints: Limit and Available Energy
-                    max_discharge_rate = min(battery_charge_limit, max_battery_power_target)
+                    max_discharge_rate = forecast_discharge_limit_w
                     available_energy_kwh = current_bat_kwh - period_battery_min_energy
                     max_discharge_by_energy = (
                         available_energy_kwh
@@ -2441,7 +2943,7 @@ def _forecast(
                 target_charge_watts = -target_battery_discharge_watts
 
                 # Physical Constraints: Limit and Free Capacity
-                max_charge_rate = min(battery_charge_limit, max_battery_power_target)
+                max_charge_rate = forecast_charge_limit_w
                 free_capacity_kwh = battery_capacity - current_bat_kwh
                 max_charge_by_capacity = (
                     free_capacity_kwh
@@ -2599,11 +3101,11 @@ def merge_forecast_results(a: ForecastResult, b: ForecastResult, t_split: dateti
     merged_setpoint = replace(
         a,
         min_bat=min(a.min_bat, b.min_bat),
-        t_min_bat=a.t_min_bat if a.t_min_bat < b.t_min_bat else b.t_min_bat,
+        t_min_bat=min(a.t_min_bat, b.t_min_bat),
         max_bat=max(a.max_bat, b.max_bat),
-        t_max_bat=a.t_max_bat if a.t_max_bat > b.t_max_bat else b.t_max_bat,
+        t_max_bat=max(a.t_max_bat, b.t_max_bat),
         max_feedin=max(a.max_feedin, b.max_feedin),
-        t_max_feedin=a.t_max_feedin if a.t_max_feedin > b.t_max_feedin else b.t_max_feedin,
+        t_max_feedin=max(a.t_max_feedin, b.t_max_feedin),
         detail=a_detail + b_detail,
     )
     return merged_setpoint
@@ -2686,7 +3188,8 @@ def get_pv_forecast_with_prices(t_start: datetime, t_end: datetime, epex_prices:
         prices[get_date_tuple(start_time + timedelta(hours=period_hours))] = entry["price_per_kwh"]
 
     source_forecast_end = forecast[-1]["period_start"]
-    for idx, forecast_entry in enumerate(list(forecast)):
+    priced_forecast = []
+    for forecast_entry in forecast:
         # insert price
         start_time = forecast_entry["period_start"]
 
@@ -2701,11 +3204,14 @@ def get_pv_forecast_with_prices(t_start: datetime, t_end: datetime, epex_prices:
                 f"using fallback price {period_price:.4f}"
             )
 
-        forecast[idx] = PVForecastWithPrices(
-            start_time,
-            pv_estimate=forecast_entry["pv_estimate"],
-            price_per_kwh=period_price,
+        priced_forecast.append(
+            PVForecastWithPrices(
+                start_time,
+                pv_estimate=forecast_entry["pv_estimate"],
+                price_per_kwh=period_price,
+            )
         )
+    forecast = priced_forecast
 
     forecast = extend_pv_forecast_to_horizon(forecast, t_end, prices)
     if forecast[-1].period_start > source_forecast_end:
@@ -2761,6 +3267,431 @@ def update_auto_max_setpoint():
     )
 
 
+# Time-discount table for ranking PV feed-in peaks: near-term peaks count in
+# full, peaks 20+ hours out count for nothing.
+_FEEDIN_PEAK_DISCOUNT_POINTS = ((0.0, 1.0), (6.0, 1.0), (9.0, 0.75), (12.0, 0.5), (16.0, 0.25), (20.0, 0.0))
+
+
+def _feedin_peak_discount(hours_ahead):
+    if hours_ahead <= _FEEDIN_PEAK_DISCOUNT_POINTS[0][0]:
+        return _FEEDIN_PEAK_DISCOUNT_POINTS[0][1]
+
+    for (left_hours, left_discount), (right_hours, right_discount) in zip(
+        _FEEDIN_PEAK_DISCOUNT_POINTS, _FEEDIN_PEAK_DISCOUNT_POINTS[1:]
+    ):
+        if hours_ahead <= right_hours:
+            span = right_hours - left_hours
+            if span <= 0:
+                return right_discount
+            ratio = (hours_ahead - left_hours) / span
+            return left_discount + ratio * (right_discount - left_discount)
+
+    return 0.0
+
+
+def get_discounted_pv_feedin_peak(forecast_result, t_now):
+    if not forecast_result or not forecast_result.detail:
+        return 0, t_now, 0
+
+    best_weighted_peak = 0.0
+    best_peak_time = t_now
+    best_raw_peak = 0.0
+
+    for entry in forecast_result.detail:
+        if entry.period_start <= t_now or entry.pv_feedin <= 0:
+            continue
+
+        hours_ahead = max(0, (entry.period_start - t_now).total_seconds() / 3600)
+        discount = _feedin_peak_discount(hours_ahead)
+
+        weighted_peak = entry.pv_feedin * discount
+        if weighted_peak > best_weighted_peak:
+            best_weighted_peak = weighted_peak
+            best_peak_time = entry.period_start
+            best_raw_peak = entry.pv_feedin
+
+    return best_weighted_peak, best_peak_time, best_raw_peak
+
+
+def format_setpoint_results(search_results, title, t_now):
+    # Print setpoint results in tablular format (without forecast details)
+    if search_results is None:
+        return None
+
+    def ft(t):
+        return t.strftime("%d %H:%M")
+
+    def fi(k):
+        return f"{k:.0f}"
+
+    lines = []
+    for r in search_results:
+        discounted_peak, discounted_time, raw_peak = get_discounted_pv_feedin_peak(r, t_now)
+        lines.append(
+            f"{r.setpoint:2.0f} {' ' * 4}  {r.setpoint_spread:8.6f}{r.min_bat:9.1f}{'':6s}{ft(r.t_min_bat):10s}{r.max_bat:5.1f}{'':6s}{ft(r.t_max_bat):12s}{fi(raw_peak):12s}{fi(discounted_peak):18s}{ft(discounted_time):10s}"
+        )
+    return (
+        f"Setpoint results {title}:\n{'setpoint':<11s}{'spread':<13s}{'min_bat':<10s}{'t_min_bat':<11s}{'max_bat':<11s}{'t_max_bat':<11s}{'max_pv_feedin':<12s}{'discounted_pv':<18s}{'t_discounted':<10s}\n"
+        + "\n".join(lines)
+    )
+
+
+def validate_pv_power_measurement(pv_power_w, updated_at, current_time, max_age_seconds):
+    """Shared PV validation: range-check the reading, then check its age."""
+
+    value_valid = are_power_measurement_values_valid(
+        pv_power_w,
+        0.0,
+        max_absolute_power_w=LIVE_POWER_MAX_ABSOLUTE_W,
+    )
+    measurement_fresh = value_valid and is_measurement_fresh(
+        current_time,
+        updated_at,
+        max_age_seconds=max_age_seconds,
+    )
+    return value_valid, measurement_fresh
+
+
+def build_reserve_trajectory_slots(
+    pv_forecast,
+    t_now,
+    day_house_power_w,
+    night_house_power_w,
+    pv_power_scale,
+    battery_cells_balanced,
+):
+    """Shared reserve-trajectory slot construction for both forecast passes.
+
+    ``forecast_surplus`` uses an unscaled PV estimate while
+    ``auto_setpoint_target`` applies its forecast dampening; both share the
+    period-boundary, house-power, reserve-SOC, and deficit-protection logic.
+    """
+
+    reserve_slots = []
+    for index, forecast_entry in enumerate(pv_forecast):
+        if index + 1 < len(pv_forecast):
+            period_end = pv_forecast[index + 1].period_start
+        elif index > 0:
+            period_end = forecast_entry.period_start + (
+                forecast_entry.period_start - pv_forecast[index - 1].period_start
+            )
+        else:
+            period_end = forecast_entry.period_start + timedelta(minutes=30)
+        effective_start = max(t_now, forecast_entry.period_start)
+        duration_hours = max(0.0, (period_end - effective_start).total_seconds() / 3600)
+        forecast_house_power = (
+            day_house_power_w
+            if 7 < forecast_entry.period_start.hour < 19
+            else night_house_power_w
+        )
+        forecast_pv_power = forecast_entry.pv_estimate * pv_power_scale * 1000
+        slot_reserve_soc = max(
+            get_reserve_soc(forecast_entry.period_start),
+            get_low_pv_reserve_soc(
+                house_power=forecast_house_power,
+                pv_power=forecast_pv_power,
+                battery_cells_balanced=bool(battery_cells_balanced),
+            ),
+        )
+        reserve_slots.append(
+            ReserveTrajectorySlot(
+                period_start=forecast_entry.period_start,
+                duration_hours=duration_hours,
+                house_power_w=forecast_house_power,
+                pv_power_w=forecast_pv_power,
+                reserve_soc=slot_reserve_soc,
+                protect_deficit=not is_low_price(
+                    get_price(
+                        hour=forecast_entry.period_start.hour,
+                        minute=forecast_entry.period_start.minute,
+                    )
+                ),
+            )
+        )
+    return reserve_slots
+
+
+class SetpointForecastContext:
+    """Loop-invariant optimizer inputs for the hoisted setpoint search helpers.
+
+    ``auto_setpoint_target`` builds this once per run.  The hoisted
+    ``forecast_setpoint_local`` / ``setpoint_binary_search`` /
+    ``get_feedin_candidate`` helpers take it explicitly instead of closing
+    over the optimizer locals, so the search logic is testable in isolation.
+
+    ``frozen_forecast_inputs`` carries the live HA inputs that ``forecast()``
+    would otherwise re-read on every replay (discharge limit, EV state,
+    charge policy, ...).  The neutral baseline and the unified replay run
+    seconds apart with task yields between them; without frozen inputs a
+    mid-run entity flip (e.g. the telemetry hold setting the discharge
+    limit to 0) makes the safety comparison compare two different worlds
+    and discard a valid schedule.
+    """
+
+    def __init__(
+        self,
+        battery_capacity,
+        min_feedin_price,
+        forecast_dampening,
+        battery_min_energy,
+        max_pv_feedin,
+        max_setpoint,
+        battery_charge_limit,
+        max_feedin_limit,
+        ev_schedule,
+        t_now,
+        frozen_forecast_inputs=None,
+    ):
+        self.battery_capacity = battery_capacity
+        self.min_feedin_price = min_feedin_price
+        self.forecast_dampening = forecast_dampening
+        self.battery_min_energy = battery_min_energy
+        self.max_pv_feedin = max_pv_feedin
+        self.max_setpoint = max_setpoint
+        self.battery_charge_limit = battery_charge_limit
+        self.max_feedin_limit = max_feedin_limit
+        self.ev_schedule = ev_schedule
+        self.t_now = t_now
+        self.frozen_forecast_inputs = frozen_forecast_inputs or {}
+
+
+def forecast_setpoint_local(
+    ctx,
+    pv_forecast,
+    setpoint,
+    with_ev_charging,
+    ev_energy,
+    configured_max_feedin,
+    setpoint_spread=0.1,
+    current_battery_energy=0,
+    t_start: datetime | None = None,
+    t_end: datetime | None = None,
+    max_battery_power_target: float = 4000,
+    logging=False,
+    grid_target_schedule=None,
+    optional_export_power_schedule=None,
+    battery_floor_schedule=None,
+    surplus_energy=None,
+    battery_export_budget_kwh=None,
+):
+    if t_start is not None:
+        pv_forecast = [entry for entry in pv_forecast if t_start < entry.period_start]
+    if t_end is not None:
+        pv_forecast = [entry for entry in pv_forecast if entry.period_start < t_end]
+    result = forecast(
+        pv_forecast,
+        setpoint=setpoint,
+        battery_capacity=ctx.battery_capacity,
+        min_feedin_price=ctx.min_feedin_price,
+        forecast_dampening=ctx.forecast_dampening,
+        battery_energy=current_battery_energy,
+        setpoint_spread=setpoint_spread,
+        battery_min_energy=ctx.battery_min_energy,
+        with_ev_charging=with_ev_charging and ev_energy is not None,
+        ev_energy=ev_energy,
+        max_battery_power_target=max_battery_power_target,
+        battery_charge_limit=ctx.battery_charge_limit,
+        max_pv_feedin_target=ctx.max_pv_feedin,
+        max_feedin=configured_max_feedin,
+        grid_target_schedule=grid_target_schedule,
+        optional_export_power_schedule=optional_export_power_schedule,
+        battery_floor_schedule=battery_floor_schedule,
+        max_setpoint=ctx.max_setpoint,
+        logging=logging,
+        ev_schedule=ctx.ev_schedule,
+        surplus_energy=surplus_energy,
+        battery_export_budget_kwh=battery_export_budget_kwh,
+        t_now=ctx.t_now,
+        **ctx.frozen_forecast_inputs,
+    )
+    task.sleep(0.01)  # sleep to allow other tasks to run
+    return result
+
+
+def get_feedin_candidate(forecast_result, control_value, ctx, samples=None):
+    discounted_peak, _peak_time, _raw_peak = get_discounted_pv_feedin_peak(forecast_result, ctx.t_now)
+    if samples is None:
+        samples = [(entry.period_start, entry.pv_feedin) for entry in forecast_result.detail]
+    overflow_energy = calculate_pv_overflow_energy(samples, ctx.max_pv_feedin, ctx.t_now)
+    return FeedinCandidate(
+        control_value=control_value,
+        predicted_peak_w=discounted_peak,
+        overflow_energy_kwh=overflow_energy,
+    )
+
+
+def setpoint_binary_search(
+    ctx,
+    pv_forecast,
+    min_setpoint,
+    max_setpoint,
+    with_ev_charging,
+    battery_energy,
+    ev_energy,
+    logging,
+    max_iters=5,
+    max_battery_power_target: float = 8000,
+    log_setpoint=False,
+    current_setpoint=None,
+    current_spread=None,
+    min_spread=1e-5,
+    max_spread=50,
+    update_setpoint=True,
+    update_spread=False,
+):
+    msg = ""
+    if not len(pv_forecast) > 1:
+        return None
+    search_results = []
+    assert update_setpoint or update_spread
+    control_min_setpoint = min_setpoint
+    control_max_setpoint = max_setpoint
+
+    log.warning(
+        f"Starting binary search for setpoint with parameters: ev_energy={ev_energy} min_setpoint={min_setpoint}, max_setpoint={max_setpoint}, min_spread={min_spread}, max_spread={max_spread}, update_setpoint={update_setpoint}, update_spread={update_spread}, max_iters={max_iters}, log_setpoint={log_setpoint}"
+    )
+    if not update_spread:
+        assert current_spread is not None
+    if not update_setpoint:
+        assert current_setpoint is not None
+
+    candidate_metrics = []
+
+    def evaluate_candidate(candidate_setpoint, candidate_spread):
+        result = forecast_setpoint_local(
+            ctx,
+            pv_forecast,
+            candidate_setpoint,
+            with_ev_charging=with_ev_charging,
+            ev_energy=ev_energy,
+            configured_max_feedin=ctx.max_feedin_limit,
+            setpoint_spread=candidate_spread,
+            current_battery_energy=battery_energy,
+            max_battery_power_target=max_battery_power_target,
+        )
+        control_value = candidate_setpoint if update_setpoint else candidate_spread
+        candidate = get_feedin_candidate(result, control_value, ctx)
+        search_results.append(result)
+        candidate_metrics.append(candidate)
+        return result, candidate
+
+    # Always evaluate the least aggressive boundary. The previous search
+    # never sampled it, so an insensitive forecast could only terminate at
+    # the opposite, full-export boundary.
+    baseline_setpoint = max_setpoint if update_setpoint else current_setpoint
+    baseline_spread = current_spread if update_setpoint else min_spread
+    evaluate_candidate(baseline_setpoint, baseline_spread)
+
+    for itr in range(max_iters):
+        if update_setpoint:
+            current_setpoint = (min_setpoint + max_setpoint) // 2
+        if update_spread:
+            current_spread = (min_spread + max_spread) / 2
+
+        r, feedin_candidate = evaluate_candidate(current_setpoint, current_spread)
+        update_reason = ""
+        discounted_pv_feedin, discounted_peak_time, raw_pv_feedin = get_discounted_pv_feedin_peak(r, ctx.t_now)
+        constraint_exceeded = feedin_constraint_exceeded(feedin_candidate, ctx.max_pv_feedin)
+
+        if (
+            constraint_exceeded
+            and discounted_peak_time.day != ctx.t_now.day
+            and (
+                r.min_bat < ctx.battery_min_energy
+                or min(
+                    [d.surplus for d in r.detail if d.period_start.day == ctx.t_now.day and d.period_start > ctx.t_now]
+                    or [float("inf")]
+                )
+                < 1
+            )
+        ):
+            update_reason = "pv peak tomorrow, battery too low"
+            # If we have a feedin peak tomorrow but battery is too low, we need to be more conservative (lower setpoint, higher spread)
+            if update_setpoint:
+                min_setpoint = current_setpoint
+            if update_spread:
+                max_spread = current_spread
+
+        elif constraint_exceeded:
+            update_reason = "max feedin too large"
+            # If feed-in limit is exceeded, we need a more negative setpoint, higher spread
+            if update_setpoint:
+                max_setpoint = current_setpoint
+            if update_spread:
+                min_spread = current_spread
+
+        else:
+            update_reason = "default"
+            if update_setpoint:
+                min_setpoint = current_setpoint
+            if update_spread:
+                max_spread = current_spread
+
+        if logging:
+            msg += (
+                f"Iteration {itr + 1}: reason  {update_reason} setpoint {r.setpoint:0f} spread {r.setpoint_spread:.1f} "
+                f"min_setpoint={min_setpoint:.0f} max_setpoint={max_setpoint:.0f} pv feedin {raw_pv_feedin:.0f} "
+                f"discounted {discounted_pv_feedin:.0f} overflow {feedin_candidate.overflow_energy_kwh:.3f} kWh "
+                f"at {discounted_peak_time.strftime('%d %H:%M')} min_bat {r.min_bat:.1f} max_bat {r.max_bat:.1f} t_max_bat {r.t_max_bat}\n"
+            )
+
+        if (update_spread and abs(max_spread - min_spread) < 1e-3) or (
+            update_setpoint and abs(max_setpoint - min_setpoint) < 50
+        ):
+            break
+
+    selected_candidate = choose_stable_candidate(
+        candidate_metrics,
+        ctx.max_pv_feedin,
+        prefer_larger_control=update_setpoint,
+    )
+    selected_index = candidate_metrics.index(selected_candidate)
+    selected_result = search_results[selected_index]
+
+    # Some forecast paths do not model the setpoint's effect on PV
+    # overflow. If every candidate is effectively identical, the stable
+    # selector correctly refuses to saturate at maximum export. For a real
+    # remaining violation, derive the least export needed to create useful
+    # battery headroom before the predicted peak.
+    baseline_candidate = candidate_metrics[0]
+    if (
+        update_setpoint
+        and selected_index == 0
+        and feedin_constraint_exceeded(baseline_candidate, ctx.max_pv_feedin)
+    ):
+        _discounted_peak, peak_time, _raw_peak = get_discounted_pv_feedin_peak(selected_result, ctx.t_now)
+        hours_to_peak = max(0.0, (peak_time - ctx.t_now).total_seconds() / 3600)
+        available_energy_kwh = max(0.0, battery_energy - ctx.battery_min_energy)
+        fallback_setpoint = calculate_energy_bounded_control(
+            overflow_energy_kwh=baseline_candidate.overflow_energy_kwh,
+            available_energy_kwh=available_energy_kwh,
+            hours_to_peak=hours_to_peak,
+            min_control_w=control_min_setpoint,
+            max_control_w=control_max_setpoint,
+        )
+        if fallback_setpoint < baseline_candidate.control_value:
+            selected_result, selected_candidate = evaluate_candidate(
+                fallback_setpoint,
+                current_spread,
+            )
+            log.warning(
+                f"Using energy-bounded fallback setpoint {fallback_setpoint:.0f} W for "
+                f"{available_energy_kwh:.2f} kWh available, "
+                f"{baseline_candidate.overflow_energy_kwh:.2f} kWh overflow, "
+                f"{hours_to_peak:.2f} h to peak"
+            )
+    if selected_result is not search_results[-1]:
+        log.warning(
+            f"Selected stable control {selected_candidate.control_value:.2f}; "
+            f"peak {selected_candidate.predicted_peak_w:.0f} W, "
+            f"overflow {selected_candidate.overflow_energy_kwh:.3f} kWh"
+        )
+        search_results.append(selected_result)
+    if logging:
+        log.warning(f"Binary search completed in {itr + 1} iterations: \n" + msg)
+    return search_results
+
+
 @time_trigger("period(now, 120sec)")
 @state_trigger(
     f"{Grid.max_feedin_target} or {Grid.max_pv_feedin_target} or {Automation.auto_setpoint} "
@@ -2772,6 +3703,8 @@ def update_auto_max_setpoint():
 @state_trigger(EV.energy_needed)
 @state_trigger(Charger.ready)
 @state_trigger(Charger.control_switch)
+@state_trigger(PVForecast.power_now)
+@state_trigger(PVProduction.total_power)
 def auto_setpoint_target():
     task.unique("auto setpoint target", kill_me=True)
     t_now = now()
@@ -2807,15 +3740,39 @@ def auto_setpoint_target():
 
     forecast_dampening = 1.0  # dampen the forecast to account for inaccuracies
     battery_energy = get(Battery.energy, 0)
+    battery_energy_updated_at = get_attr(Battery.energy, "last_updated")
+    # Battery.power is in W; an idle battery's energy reading legitimately
+    # sits still (HA only refreshes last_updated on change).
+    battery_energy_measurement_fresh = is_battery_energy_measurement_usable(
+        t_now,
+        battery_energy_updated_at,
+        battery_energy,
+        get(Battery.capacity, 1337),
+        get(Battery.soc, -1),
+        get(Battery.power, 1337),
+        get_attr(Battery.power, "last_updated"),
+        max_age_seconds=LIVE_BATTERY_ENERGY_MAX_MEASUREMENT_AGE_SECONDS,
+    )
     min_feedin_price = 0
 
     house_avg_power: float = get(House.daily_average_power, 0)  # W
 
     battery_capacity = get(Battery.capacity, 1337)
 
-    if battery_capacity == 1337:
-        log.error("Battery capacity not available yet, cannot calculate setpoint")
+    if (
+        battery_capacity == 1337
+        or not are_battery_energy_values_valid(battery_capacity, battery_energy)
+        or not battery_energy_measurement_fresh
+    ):
+        log.error(
+            "Battery capacity or energy is unavailable, invalid, or stale; cannot calculate setpoint"
+        )
         return
+    configured_battery_charge_limit_w = resolve_directional_power_limit_w(
+        get(Battery.charge_limit, -1),
+        6600.0,
+        6600.0,
+    )
 
     minimal_soc = get(Automation.minimal_soc, reserve_soc)
     operational_battery_min_energy = get_battery_export_floor(
@@ -2858,109 +3815,56 @@ def auto_setpoint_target():
     )
     assume_able_to_charge_on_arrival = get(EV.able_to_charge_on_arrival, False)
 
+    # An active drive ending soon is an EV-arrival reservation, even when the
+    # wallbox is not connected yet.  Do not spend battery inventory on
+    # optional export for a future PV peak while the car is still away: the
+    # arrival is the next physical opportunity to satisfy the EV obligation.
+    ev_arrival_reservation_active = bool(
+        drive_ongoing
+        and drive_ongoing.end > t_now
+        and drive_ongoing.end <= t_now + timedelta(hours=EV_EXPORT_RESERVATION_HORIZON_HOURS)
+    )
+
     with_ev_charging = wallbox_connected or (
         drive_ongoing and assume_able_to_charge_on_arrival
     )
 
-    def forecast_setpoint_local(
-        pv_forecast,
-        setpoint,
-        setpoint_spread=0.1,
-        current_battery_energy=0,
-        t_start: datetime | None = None,
-        t_end: datetime | None = None,
-        with_ev_charging=with_ev_charging,
-        ev_energy: float | None = ev_energy,
-        max_battery_power_target: float = 4000,
-        configured_max_feedin: float = max_feedin_limit,
-        logging=False,
+    # Freeze every live input that forecast() would otherwise re-read per
+    # replay.  The optimizer runs neutral, candidate, and unified replays
+    # seconds apart; a mid-run entity flip must not make the safety
+    # comparison compare two different worlds.  Defaults match forecast().
+    frozen_forecast_inputs = {
+        "daily_power": house_avg_power,
+        "nightly_power": get(House.nightly_average_power, 0),
+        "battery_discharge_limit_w": get_planned_discharge_limit_w(-1),
+        "ev_required_soc": ev_required_soc,
+        "ev_soc": get(EV.soc, 100),
+        "is_charging_ev": ev_is_charging,
+        "smart_limiter_active": get(Automation.auto_charge_limit, False),
+        "charge_limit": get(Battery.force_charge_up_to, 0),
+        "max_charge_price": get(Battery.max_charge_price, 0),
+        "force_charge_switch": get(Battery.force_charge_switch, False),
+        "min_discharge_price": float(get(Automation.min_discharge_price, default=0)),
+        "charger_ready": get(Charger.ready, False),
+        "charger_ready_since": get_attr(Charger.ready, "last_changed"),
+        "ev_plugged_in": get(EV.plugged_in, False),
+        "eff_dis": get(Automation.efficient_discharge, False),
+        "battery_cells_balanced": get(Battery.cells_balanced, False),
+    }
+
+    forecast_ctx = SetpointForecastContext(
+        battery_capacity=battery_capacity,
+        min_feedin_price=min_feedin_price,
+        forecast_dampening=forecast_dampening,
+        battery_min_energy=battery_min_energy,
+        max_pv_feedin=max_pv_feedin,
+        max_setpoint=max_setpoint,
+        battery_charge_limit=configured_battery_charge_limit_w,
+        max_feedin_limit=max_feedin_limit,
         ev_schedule=ev_schedule,
-        grid_target_schedule=None,
-        optional_export_power_schedule=None,
-        battery_floor_schedule=None,
-        surplus_energy=None,
-        battery_export_budget_kwh=None,
-    ):
-        if t_start is not None:
-            pv_forecast = [entry for entry in pv_forecast if t_start < entry.period_start]
-        if t_end is not None:
-            pv_forecast = [entry for entry in pv_forecast if entry.period_start < t_end]
-        result = forecast(
-            pv_forecast,
-            setpoint=setpoint,
-            battery_capacity=battery_capacity,
-            min_feedin_price=min_feedin_price,
-            forecast_dampening=forecast_dampening,
-            battery_energy=current_battery_energy,
-            setpoint_spread=setpoint_spread,
-            battery_min_energy=battery_min_energy,
-            with_ev_charging=with_ev_charging and ev_energy is not None,
-            ev_energy=ev_energy,
-            max_battery_power_target=max_battery_power_target,
-            max_pv_feedin_target=max_pv_feedin,
-            max_feedin=configured_max_feedin,
-            grid_target_schedule=grid_target_schedule,
-            optional_export_power_schedule=optional_export_power_schedule,
-            battery_floor_schedule=battery_floor_schedule,
-            max_setpoint=max_setpoint,
-            logging=logging,
-            ev_schedule=ev_schedule,
-            surplus_energy=surplus_energy,
-            battery_export_budget_kwh=battery_export_budget_kwh,
-            t_now=t_now,
-        )
-        task.sleep(0.01)  # sleep to allow other tasks to run
-        return result
-
-    def get_discounted_pv_feedin_peak(forecast_result):
-        if not forecast_result or not forecast_result.detail:
-            return 0, t_now, 0
-
-        discount_points = ((0.0, 1.0), (6.0, 1.0), (9.0, 0.75), (12.0, 0.5), (16.0, 0.25), (20.0, 0.0))
-
-        def get_discount(hours_ahead):
-            if hours_ahead <= discount_points[0][0]:
-                return discount_points[0][1]
-
-            for (left_hours, left_discount), (right_hours, right_discount) in zip(discount_points, discount_points[1:]):
-                if hours_ahead <= right_hours:
-                    span = right_hours - left_hours
-                    if span <= 0:
-                        return right_discount
-                    ratio = (hours_ahead - left_hours) / span
-                    return left_discount + ratio * (right_discount - left_discount)
-
-            return 0.0
-
-        best_weighted_peak = 0.0
-        best_peak_time = t_now
-        best_raw_peak = 0.0
-
-        for entry in forecast_result.detail:
-            if entry.period_start <= t_now or entry.pv_feedin <= 0:
-                continue
-
-            hours_ahead = max(0, (entry.period_start - t_now).total_seconds() / 3600)
-            discount = get_discount(hours_ahead)
-
-            weighted_peak = entry.pv_feedin * discount
-            if weighted_peak > best_weighted_peak:
-                best_weighted_peak = weighted_peak
-                best_peak_time = entry.period_start
-                best_raw_peak = entry.pv_feedin
-
-        return best_weighted_peak, best_peak_time, best_raw_peak
-
-    def get_feedin_candidate(forecast_result, control_value, samples=None):
-        discounted_peak, _peak_time, _raw_peak = get_discounted_pv_feedin_peak(forecast_result)
-        if samples is None:
-            samples = [(entry.period_start, entry.pv_feedin) for entry in forecast_result.detail]
-        overflow_energy = calculate_pv_overflow_energy(samples, max_pv_feedin, t_now)
-        return FeedinCandidate(
-            control_value=control_value,
-            predicted_peak_w=discounted_peak,
-            overflow_energy_kwh=overflow_energy,
-        )
+        t_now=t_now,
+        frozen_forecast_inputs=frozen_forecast_inputs,
+    )
 
     # Binary search for optimal setpoint
     current_battery_energy = battery_energy
@@ -2976,6 +3880,13 @@ def auto_setpoint_target():
         return
 
     pv_power_total = get(PVProduction.total_power, 0)
+    pv_power_updated_at = get_attr(PVProduction.total_power, "last_updated")
+    pv_power_value_valid, pv_power_measurement_fresh = validate_pv_power_measurement(
+        pv_power_total,
+        pv_power_updated_at,
+        t_now,
+        HIGH_SIDE_PV_MAX_MEASUREMENT_AGE_SECONDS,
+    )
 
     epex_pv_forecast = get_pv_forecast_with_prices(
         t_start=t_now, t_end=t_now + timedelta(hours=forecast_hours), epex_prices=epex_prices
@@ -2993,36 +3904,64 @@ def auto_setpoint_target():
             0.0,
             hard_max_grid_export_w - export_cap_margin_w,
         )
-        configured_discharge_limit_w = get(Battery.discharge_limit, -1)
-        max_battery_discharge_w = min(
+        configured_discharge_limit_w = get_planned_discharge_limit_w(-1)
+        max_battery_discharge_w = resolve_directional_power_limit_w(
+            configured_discharge_limit_w,
             8000.0,
-            configured_discharge_limit_w if configured_discharge_limit_w > 0 else 8000.0,
+            8000.0,
+        )
+        # Silent mode caps scheduled battery-to-grid export (the deltas are
+        # purely grid-bound, so house and EV coverage in the replay stay
+        # unlimited); the live safety supervisor remains uncapped for true
+        # cap emergencies.
+        silent_mode_active = get(Automation.silent_mode, False)
+        scheduler_max_discharge_w = (
+            min(max_battery_discharge_w, SILENT_MODE_MAX_BATTERY_POWER_W)
+            if silent_mode_active
+            else max_battery_discharge_w
         )
         efficient_discharge_w = get(Automation.efficient_export_power, 3500)
         quiet_price_tolerance = get(Automation.quiet_export_price_tolerance, 5) / 100
         min_discharge_price = float(get(Automation.min_discharge_price, default=0))
-        published_policy_surplus_energy_kwh = get(
+        raw_published_policy_surplus_energy_kwh = get(
             House.energy_surplus_after_ev_charging,
             0,
         )
-        published_surplus_calculated_at = with_timezone(
+        published_surplus_calculated_at = parse_aware_datetime(
             get_attr(
                 House.energy_surplus_after_ev_charging,
                 "calculated_at",
             )
         )
-        published_surplus_age_seconds = None
-        if published_surplus_calculated_at is not None:
-            published_surplus_age_seconds = max(
-                0.0,
-                (t_now - published_surplus_calculated_at).total_seconds(),
+        published_surplus_battery_energy_kwh = get_attr(
+            House.energy_surplus_after_ev_charging,
+            "battery_energy_at_calculation",
+        )
+        raw_base_spendable_energy_kwh = get(House.energy_surplus, 0)
+        export_policy_budget = get_fresh_export_policy_budget(
+            base_spendable_energy_kwh=raw_base_spendable_energy_kwh,
+            ev_adjusted_spendable_energy_kwh=raw_published_policy_surplus_energy_kwh,
+            source_battery_energy_kwh=published_surplus_battery_energy_kwh,
+            current_battery_energy_kwh=battery_energy,
+            calculated_at=published_surplus_calculated_at,
+            current_time=t_now,
+            max_age_seconds=EXPORT_POLICY_MAX_AGE_SECONDS,
+            discharge_efficiency=HOME_BATTERY_DISCHARGE_EFFICIENCY,
+        )
+        base_spendable_energy_kwh = (
+            export_policy_budget.base_spendable_energy_kwh
+        )
+        published_policy_surplus_energy_kwh = (
+            export_policy_budget.ev_adjusted_spendable_energy_kwh
+        )
+        published_surplus_age_seconds = export_policy_budget.source_age_seconds
+        export_policy_valid = export_policy_budget.valid
+        export_policy_reason = export_policy_budget.reason
+        if not export_policy_valid:
+            log.warning(
+                "Holding optional battery export: EV-adjusted surplus policy "
+                f"snapshot is {export_policy_reason}"
             )
-            if published_surplus_age_seconds > 300:
-                log.warning(
-                    f"Using {published_surplus_age_seconds / 60:.1f}-minute-old surplus "
-                    "under current physical battery floors and safety margins"
-                )
-        base_spendable_energy_kwh = get(House.energy_surplus, 0)
         published_local_ev_wall_energy_kwh = max(
             0.0,
             float(
@@ -3059,51 +3998,49 @@ def auto_setpoint_target():
                 f"Live EV obligation reduced the published export budget from "
                 f"{published_policy_surplus_energy_kwh:.2f} to {policy_surplus_energy_kwh:.2f} kWh"
             )
+        # Never export energy the forecast cannot prove spendable: reserve
+        # the nearest uncovered departure in the reservation horizon, through
+        # charger losses. The reservation self-releases as live charging
+        # shrinks the shortfall on later cycles.
+        horizon_ev_shortfall_kwh = 0.0
+        try:
+            horizon_ev_shortfall_kwh = max(
+                0.0,
+                float(
+                    get_attr(
+                        House.energy_surplus_after_ev_charging,
+                        "horizon_ev_shortfall_kwh",
+                        0,
+                    )
+                    or 0
+                ),
+            )
+        except (TypeError, ValueError, OverflowError):
+            horizon_ev_shortfall_kwh = 0.0
+        if horizon_ev_shortfall_kwh > 0:
+            reserved_policy_surplus_kwh = apply_horizon_ev_reservation(
+                policy_surplus_energy_kwh,
+                horizon_ev_shortfall_kwh,
+                EVConst.charge_efficiency,
+            )
+            if reserved_policy_surplus_kwh + 0.01 < policy_surplus_energy_kwh:
+                log.warning(
+                    f"Horizon EV reservation reduced the export budget from "
+                    f"{policy_surplus_energy_kwh:.2f} to {reserved_policy_surplus_kwh:.2f} kWh "
+                    f"for {horizon_ev_shortfall_kwh:.2f} kWh uncovered departure need"
+                )
+            policy_surplus_energy_kwh = reserved_policy_surplus_kwh
 
         battery_cells_balanced = get(Battery.cells_balanced, False)
         nightly_house_power = get(House.nightly_average_power, 0)
-        reserve_slots = []
-        for index, forecast_entry in enumerate(epex_pv_forecast):
-            if index + 1 < len(epex_pv_forecast):
-                period_end = epex_pv_forecast[index + 1].period_start
-            elif index > 0:
-                period_end = forecast_entry.period_start + (
-                    forecast_entry.period_start - epex_pv_forecast[index - 1].period_start
-                )
-            else:
-                period_end = forecast_entry.period_start + timedelta(minutes=30)
-
-            effective_start = max(t_now, forecast_entry.period_start)
-            duration_hours = max(0.0, (period_end - effective_start).total_seconds() / 3600)
-            forecast_house_power = (
-                house_avg_power
-                if 7 < forecast_entry.period_start.hour < 19
-                else nightly_house_power
-            )
-            forecast_pv_power = forecast_entry.pv_estimate * forecast_dampening * 1000
-            slot_reserve_soc = max(
-                get_reserve_soc(forecast_entry.period_start),
-                get_low_pv_reserve_soc(
-                    house_power=forecast_house_power,
-                    pv_power=forecast_pv_power,
-                    battery_cells_balanced=bool(battery_cells_balanced),
-                ),
-            )
-            reserve_slots.append(
-                ReserveTrajectorySlot(
-                    period_start=forecast_entry.period_start,
-                    duration_hours=duration_hours,
-                    house_power_w=forecast_house_power,
-                    pv_power_w=forecast_pv_power,
-                    reserve_soc=slot_reserve_soc,
-                    protect_deficit=not is_low_price(
-                        get_price(
-                            hour=forecast_entry.period_start.hour,
-                            minute=forecast_entry.period_start.minute,
-                        )
-                    ),
-                )
-            )
+        reserve_slots = build_reserve_trajectory_slots(
+            epex_pv_forecast,
+            t_now,
+            day_house_power_w=house_avg_power,
+            night_house_power_w=nightly_house_power,
+            pv_power_scale=forecast_dampening,
+            battery_cells_balanced=battery_cells_balanced,
+        )
 
         battery_floor_schedule = build_reserve_energy_schedule(
             reserve_slots,
@@ -3119,6 +4056,7 @@ def auto_setpoint_target():
         # always recomputes charging and self-consumption from its evolving
         # battery state instead of preserving this trajectory's grid targets.
         neutral_forecast = forecast_setpoint_local(
+            forecast_ctx,
             pv_forecast=epex_pv_forecast,
             setpoint=max_setpoint,
             setpoint_spread=0.01,
@@ -3165,15 +4103,57 @@ def auto_setpoint_target():
             safe_stored_energy_kwh
             * HOME_BATTERY_DISCHARGE_EFFICIENCY
         )
-        safe_export_energy_kwh = get_policy_bounded_export_budget(
+        export_energy_budget = calculate_export_energy_budget(
             physically_available_energy_kwh=physical_safe_export_energy_kwh,
+            spendable_energy_before_ev_kwh=base_spendable_energy_kwh,
             spendable_energy_after_ev_kwh=policy_surplus_energy_kwh,
         )
+        safe_export_energy_kwh = export_energy_budget.safe_export_energy_kwh
+        export_policy_snapshot_id = (
+            published_surplus_calculated_at.isoformat()
+            if published_surplus_calculated_at is not None
+            else ""
+        )
+        export_budget_ledger = update_monotonic_export_budget_ledger(
+            snapshot_id=export_policy_snapshot_id,
+            candidate_remaining_kwh=safe_export_energy_kwh,
+            previous_state=get("pyscript.export_policy_budget_ledger", ""),
+            current_time=t_now,
+            accounting_enabled=False,
+        )
+        if export_budget_ledger.valid and export_policy_valid:
+            safe_export_energy_kwh = min(
+                safe_export_energy_kwh,
+                export_budget_ledger.remaining_kwh,
+            )
+            state.set(  # noqa: F821 - provided by the Pyscript runtime
+                "pyscript.export_policy_budget_ledger",
+                export_budget_ledger.state_value,
+            )
+        else:
+            safe_export_energy_kwh = 0.0
+        ev_arrival_reserved_kwh = export_energy_budget.ev_reservation_energy_kwh
+        if ev_arrival_reservation_active:
+            log.warning(
+                f"EV arrival reservation active until {drive_ongoing.end}; "
+                f"{ev_arrival_reserved_kwh:.2f} kWh retained quantitatively, "
+                f"{safe_export_energy_kwh:.2f} kWh remains safe for optional export"
+            )
         ev_export_hold_active = bool(
             ev_obligation_due_within_horizon
             and ev_energy_needed > 0.1
             and policy_surplus_energy_kwh <= 0.1
         )
+        export_block_reason = "none"
+        if safe_export_energy_kwh <= 0.01:
+            if not export_policy_valid:
+                export_block_reason = "stale_policy"
+            elif ev_export_hold_active:
+                export_block_reason = "ev_obligation"
+            elif physical_safe_export_energy_kwh <= 0.01:
+                export_block_reason = "battery_floor"
+            else:
+                export_block_reason = "policy_reserve"
         if safe_export_energy_kwh + 0.01 < physical_safe_export_energy_kwh:
             log.warning(
                 f"Policy budget capped optional battery export from "
@@ -3245,18 +4225,41 @@ def auto_setpoint_target():
         headroom_reference_energy_kwh = 0.0
         for detail_entry, scheduler_slot in zip(neutral_forecast.detail, scheduler_slots):
             pv_feedin_samples.append((detail_entry.period_start, detail_entry.pv_feedin))
-            if detail_entry.pv_feedin > raw_peak_w:
-                raw_peak_w = detail_entry.pv_feedin
+            # The replayed pv_feedin is capped by the neutral setpoint (the
+            # simulated battery absorbs the rest), so it cannot see the real
+            # PV peak.  Size the peak from natural surplus instead; the same
+            # capped samples stay correct for overflow math below, which asks
+            # what still spills after absorption.
+            natural_surplus_w = max(
+                0.0,
+                detail_entry.pv_estimate - detail_entry.house_power,
+            )
+            if natural_surplus_w > raw_peak_w:
+                raw_peak_w = natural_surplus_w
                 raw_peak_time = detail_entry.period_start
+            preferred_overflow_w = calculate_absorbable_overflow_power(
+                overflow_power_w=max(0.0, detail_entry.pv_feedin - max_pv_feedin),
+                planned_battery_charge_power_w=detail_entry.battery_power,
+                max_battery_charge_power_w=configured_battery_charge_limit_w,
+            )
+            hard_overflow_w = calculate_absorbable_overflow_power(
+                overflow_power_w=max(
+                    0.0,
+                    detail_entry.feedin - planned_max_grid_export_w,
+                ),
+                planned_battery_charge_power_w=detail_entry.battery_power,
+                max_battery_charge_power_w=configured_battery_charge_limit_w,
+            )
+            # Discount future PV before sizing pre-release: the release
+            # must stay at or below the real spill.
             preferred_overflow_kwh = (
-                max(0.0, detail_entry.pv_feedin - max_pv_feedin)
+                preferred_overflow_w
                 * scheduler_slot.duration_hours
                 / 1000
+                * SHAPING_PV_CONFIDENCE_FACTOR
             )
             hard_overflow_kwh = (
-                max(0.0, detail_entry.feedin - planned_max_grid_export_w)
-                * scheduler_slot.duration_hours
-                / 1000
+                hard_overflow_w * scheduler_slot.duration_hours / 1000
             )
             cumulative_preferred_overflow_kwh += preferred_overflow_kwh
             cumulative_hard_overflow_kwh += hard_overflow_kwh
@@ -3279,6 +4282,73 @@ def auto_setpoint_target():
             headroom_reference_value += (
                 preferred_overflow_kwh * scheduler_slot.price_per_kwh
             )
+
+        current_neutral_detail = neutral_forecast.detail[0]
+        for detail_entry in neutral_forecast.detail:
+            if (
+                detail_entry.period_start <= t_now
+                and detail_entry.period_start >= current_neutral_detail.period_start
+            ):
+                current_neutral_detail = detail_entry
+        live_pv_power_for_planning = (
+            max(0.0, pv_power_total)
+            if pv_power_measurement_fresh
+            else max(0.0, current_neutral_detail.pv_estimate)
+        )
+        try:
+            free_battery_capacity_kwh = max(
+                0.0, float(battery_capacity) - float(current_battery_energy)
+            )
+        except (TypeError, ValueError, OverflowError):
+            free_battery_capacity_kwh = None
+        high_side_headroom = build_high_side_headroom_requirements(
+            slots=scheduler_slots,
+            period_ends=scheduler_period_ends,
+            current_time=t_now,
+            live_pv_power_w=live_pv_power_for_planning,
+            forecast_pv_power_w=current_neutral_detail.pv_estimate,
+            max_grid_export_w=planned_max_grid_export_w,
+            error_decay_hours=HIGH_SIDE_PV_ERROR_DECAY_HOURS,
+            maximum_error_w=HIGH_SIDE_PV_MAX_ERROR_W,
+            max_battery_charge_w=configured_battery_charge_limit_w,
+            maximum_live_pv_power_w=LIVE_POWER_MAX_ABSOLUTE_W,
+            battery_free_capacity_kwh=free_battery_capacity_kwh,
+        )
+        # Soft requirements price-rank into early windows by design: when
+        # the battery is going to fill, releasing the spill above the
+        # feed-in target early ends the day just as full.  Hard grid-cap
+        # requirements and live-measured high-side surplus stay on the
+        # fast path.
+        # Room-overflow fuel: discounted future PV above the feed-in
+        # target after the fill.  Releasing it early needs no rebuy: the
+        # same sun refills what was sold.  The stricter shaping discount
+        # (SHAPING_PV_CONFIDENCE_FACTOR) is what prevents over-release.
+        room_entries = []
+        for detail_entry, scheduler_slot in zip(
+            neutral_forecast.detail, scheduler_slots
+        ):
+            room_entries.append(
+                (
+                    detail_entry.period_start,
+                    detail_entry.battery_energy,
+                    detail_entry.pv_feedin,
+                    scheduler_slot.duration_hours,
+                )
+            )
+        room_requirement = compute_room_overflow_requirement(
+            room_entries,
+            battery_capacity,
+            max_pv_feedin,
+            SHAPING_PV_CONFIDENCE_FACTOR,
+            t_now.date(),
+        )
+        if room_requirement is not None:
+            preferred_headroom_requirements.append(room_requirement)
+        preferred_headroom_requirements.extend(high_side_headroom.requirements)
+        high_side_headroom_energy_kwh = max(
+            [requirement for _deadline, requirement in high_side_headroom.requirements]
+            or [0.0]
+        )
         overflow_energy_kwh = calculate_pv_overflow_energy(
             pv_feedin_samples,
             max_pv_feedin,
@@ -3294,10 +4364,9 @@ def auto_setpoint_target():
             else 0.0
         )
         headroom_min_price_spread = 0.01
-        hard_headroom_energy_kwh = (
-            hard_headroom_requirements[-1][1]
-            if hard_headroom_requirements
-            else 0.0
+        hard_headroom_energy_kwh = max(
+            [requirement for _deadline, requirement in hard_headroom_requirements]
+            or [0.0]
         )
         next_headroom_deadline = (
             preferred_headroom_requirements[0][0]
@@ -3305,20 +4374,123 @@ def auto_setpoint_target():
             else raw_peak_time
         )
 
+        # Cell-balancing chase: withhold economic export and soft-target
+        # pre-release once the last full charge is a week back, so the next
+        # fill-capable day ends at 100%.  Hard-cap headroom and true-spill
+        # holds stay active, and fill-incapable days are unaffected anyway
+        # (no economic eligibility, preferred requirements dropped there).
+        last_full_charge_at = parse_aware_datetime(
+            get("pyscript.battery_last_full", "")
+        )
+        if last_full_charge_at is None:
+            days_since_full_charge = None
+        else:
+            days_since_full_charge = (
+                t_now - last_full_charge_at
+            ).total_seconds() / 86400
+        balance_chase_active = (
+            days_since_full_charge is None
+            or days_since_full_charge >= BALANCE_CHASE_AFTER_DAYS
+        )
+
+        # Profitability gate: the market price ranks spill-driven pre-release
+        # slots, but realized feed-in compensation is capped at a fixed tariff
+        # until the dynamic export contract switch.  Selling stored energy
+        # only pays when it beats the cheapest future rebuy, so economic
+        # export stays blocked while the cap cannot beat night-low import.
+        feedin_compensation_cap = get(
+            ElectricityPrices.feedin_compensation_cap, 0.08
+        )
+        future_import_prices = [
+            get_price(slot.period_start.hour, slot.period_start.minute)
+            for slot in scheduler_slots
+        ]
+        economic_export_floor = resolve_economic_export_floor(
+            min_discharge_price,
+            feedin_compensation_cap,
+            future_import_prices,
+        )
+        if economic_export_floor is None:
+            log.warning(
+                f"Economic battery export blocked at feed-in cap "
+                f"{feedin_compensation_cap}: realized revenue cannot beat the "
+                "cheapest future import; only spill pre-release is scheduled"
+            )
+
+        # Headroom release ledger: the spill requirement does not shrink as
+        # the battery drains on strong-PV days (it fills by late morning
+        # from any evening level), so repeated runs re-allocate the same
+        # energy.  Net already-released energy per spill event so the
+        # pre-release converges (2026-10-02: 4.5 kWh executed vs 1.7
+        # required).  Hard cap requirements stay unscaled: compliance first.
+        headroom_release_event_key = (
+            raw_peak_time.date().isoformat()
+            if raw_peak_time is not None
+            else t_now.date().isoformat()
+        )
+        headroom_released_kwh = read_headroom_released_kwh(
+            headroom_release_event_key,
+            get("pyscript.headroom_release_ledger", ""),
+        )
+        preferred_headroom_total_kwh = max(
+            [headroom_energy_kwh]
+            + [
+                requirement
+                for _deadline, requirement in preferred_headroom_requirements
+            ]
+        )
+        headroom_release_scaling_active = hard_headroom_energy_kwh <= 0
+        headroom_factor = (
+            headroom_release_factor(
+                preferred_headroom_total_kwh, headroom_released_kwh
+            )
+            if headroom_release_scaling_active
+            else 1.0
+        )
+        scaled_headroom_energy_kwh = headroom_energy_kwh * headroom_factor
+        scaled_preferred_headroom_requirements = [
+            (deadline, target_kwh * headroom_factor)
+            for deadline, target_kwh in preferred_headroom_requirements
+        ]
+
         schedule_plan = build_unified_export_schedule(
             slots=scheduler_slots,
             available_export_energy_kwh=safe_export_energy_kwh,
-            required_headroom_energy_kwh=headroom_energy_kwh,
+            required_headroom_energy_kwh=scaled_headroom_energy_kwh,
             headroom_deadline=raw_peak_time,
-            min_discharge_price=min_discharge_price,
+            min_discharge_price=(
+                min_discharge_price
+                if economic_export_floor is None
+                else economic_export_floor
+            ),
             max_grid_export_w=planned_max_grid_export_w,
-            max_battery_discharge_w=max_battery_discharge_w,
+            max_battery_discharge_w=scheduler_max_discharge_w,
             efficient_discharge_w=efficient_discharge_w,
             quiet_boost_penalty_fraction=quiet_price_tolerance,
             headroom_reference_price=headroom_reference_price,
             headroom_min_price_spread=headroom_min_price_spread,
-            headroom_requirements=preferred_headroom_requirements,
+            headroom_requirements=(
+                []
+                if balance_chase_active
+                else scaled_preferred_headroom_requirements
+            ),
             hard_headroom_requirements=hard_headroom_requirements,
+            neutral_grid_target_w=max_setpoint,
+            # Storage absorbs first: the hold routes only surplus beyond
+            # charge power, never chargeable energy.
+            max_battery_charge_w=configured_battery_charge_limit_w,
+            # End-of-day top-up: trim late arbitrage until the simulated
+            # day ends at 100% again.  Refill charging is discounted with
+            # the same PV haircut as the reserve trajectory so the top-up
+            # survives forecast shortfall instead of trusting it exactly.
+            current_battery_energy_kwh=current_battery_energy,
+            battery_capacity_kwh=battery_capacity,
+            battery_charge_efficiency=HOME_BATTERY_CHARGE_EFFICIENCY,
+            battery_discharge_efficiency=HOME_BATTERY_DISCHARGE_EFFICIENCY,
+            top_up_pv_confidence_factor=EXPORT_PV_CONFIDENCE_FACTOR,
+            allow_economic_export=(
+                not balance_chase_active and economic_export_floor is not None
+            ),
         )
         optional_export_power_schedule = dict(schedule_plan.battery_power_delta_schedule)
 
@@ -3332,12 +4504,35 @@ def auto_setpoint_target():
             current_period_start = neutral_forecast.detail[0].period_start
         current_period_key = current_period_start.isoformat()
 
-        # Make switching modes and bucket transitions gentle.  Ramp only the
-        # current optional request; future buckets remain the scheduler output.
         desired_current_optional_export_w = optional_export_power_schedule.get(
             current_period_key,
             0.0,
         )
+        battery_soc_percent = (
+            100.0 * current_battery_energy / battery_capacity
+            if battery_capacity > 0
+            else 0.0
+        )
+        live_pv_power_w = live_pv_power_for_planning
+        forecast_or_live_pv_peak_w = max(raw_peak_w, live_pv_power_w)
+        proactive_export_power_w = max(0.0, desired_current_optional_export_w)
+        proactive_export_active = (
+            battery_soc_percent >= PROACTIVE_EXPORT_TRIGGER_SOC_PERCENT
+            and forecast_or_live_pv_peak_w
+            >= max_pv_feedin + PROACTIVE_EXPORT_PV_MARGIN_W
+            and schedule_plan.headroom_energy_kwh > 0.01
+            and proactive_export_power_w > 0.0
+        )
+        if proactive_export_active:
+            log.warning(
+                f"Price-ranked proactive PV-ramp reserve active: SOC "
+                f"{battery_soc_percent:.1f}%, PV peak "
+                f"{forecast_or_live_pv_peak_w:.0f} W, current scheduled export "
+                f"{proactive_export_power_w:.0f} W"
+            )
+
+        # Make switching modes and bucket transitions gentle.  Ramp only the
+        # current optional request; future buckets remain the scheduler output.
         desired_current_target = max(
             -planned_max_grid_export_w,
             min(
@@ -3349,7 +4544,11 @@ def auto_setpoint_target():
         applied_current_target = limit_target_step(
             desired_current_target,
             previous_target,
-            max_step_w=1500,
+            max_step_w=(
+                PROACTIVE_EXPORT_MAX_STEP_W
+                if proactive_export_active
+                else 1500
+            ),
         )
         optional_export_power_schedule[current_period_key] = max(
             0.0,
@@ -3362,6 +4561,13 @@ def auto_setpoint_target():
             locked_keys={current_period_key},
         )
 
+        headroom_hold_schedule = dict(schedule_plan.headroom_hold_schedule)
+        for key, hold_power_w in headroom_hold_schedule.items():
+            optional_export_power_schedule[key] = max(
+                optional_export_power_schedule.get(key, 0.0),
+                hold_power_w,
+            )
+
         # Once hard headroom has been created, keep it available through the
         # critical solar window. These controls route PV to the grid without
         # authorizing extra battery discharge, so they are applied after the
@@ -3370,12 +4576,49 @@ def auto_setpoint_target():
             scheduler_slots,
             max_grid_export_w=planned_max_grid_export_w,
             neutral_grid_target_w=max_setpoint,
+            min_export_price_per_kwh=min_discharge_price,
         )
         for key, hold_power_w in hard_cap_hold_schedule.items():
             optional_export_power_schedule[key] = max(
                 optional_export_power_schedule.get(key, 0.0),
                 hold_power_w,
             )
+
+        # Silent-mode charge shaping: export neutral surplus above the silent
+        # power (past the margin band) so the replay charges at most
+        # 3.5 kW, matching what the live loop enforces.  Merged with max()
+        # like the holds, before the replay and the energy accounting.
+        silent_shaping_energy_kwh = 0.0
+        if silent_mode_active:
+            silent_shaping_schedule = build_silent_charge_shaping_schedule(
+                [
+                    (
+                        detail_entry.period_start.isoformat(),
+                        detail_entry.pv_estimate,
+                        detail_entry.house_power,
+                        detail_entry.ev_charge_power,
+                    )
+                    for detail_entry in neutral_forecast.detail
+                ],
+                silent_power_w=SILENT_MODE_MAX_BATTERY_POWER_W,
+                surplus_margin_w=SILENT_MODE_CHARGE_SURPLUS_MARGIN_W,
+            )
+            slot_hours_by_key = {
+                scheduler_slot.period_start.isoformat(): max(
+                    0.0, scheduler_slot.duration_hours
+                )
+                for scheduler_slot in scheduler_slots
+            }
+            for key, shaping_power_w in silent_shaping_schedule.items():
+                previous_power_w = optional_export_power_schedule.get(key, 0.0)
+                optional_export_power_schedule[key] = max(
+                    previous_power_w,
+                    shaping_power_w,
+                )
+                if shaping_power_w > previous_power_w:
+                    silent_shaping_energy_kwh += (
+                        shaping_power_w * slot_hours_by_key.get(key, 0.0) / 1000
+                    )
 
         scheduled_control_energy_kwh = 0.0
         for scheduler_slot in scheduler_slots:
@@ -3390,6 +4633,7 @@ def auto_setpoint_target():
         scheduled_export_energy_kwh = schedule_plan.allocated_energy_kwh
 
         unified_forecast = forecast_setpoint_local(
+            forecast_ctx,
             pv_forecast=epex_pv_forecast,
             setpoint=max_setpoint,
             setpoint_spread=0.01,
@@ -3426,6 +4670,7 @@ def auto_setpoint_target():
                 "falling back to the neutral trajectory"
             )
             optional_export_power_schedule = {}
+            headroom_hold_schedule = {}
             hard_cap_hold_schedule = {}
             unified_forecast = neutral_forecast
             scheduled_export_energy_kwh = 0.0
@@ -3437,6 +4682,36 @@ def auto_setpoint_target():
             allocated_headroom_energy_kwh = schedule_plan.headroom_energy_kwh
             unallocated_headroom_energy_kwh = schedule_plan.unallocated_headroom_kwh
             hard_headroom_shortfall_kwh = schedule_plan.hard_headroom_shortfall_kwh
+
+        # Attribute this run's commanded headroom power to the spill event so
+        # the next run nets it (see above).  The unsafe-import fallback
+        # clears the schedule, so nothing is released then; hard-cap runs
+        # rebase the clock without accumulating (unscaled, see above).
+        scheduled_headroom_power_by_key = (
+            schedule_plan.headroom_power_schedule or {}
+        )
+        headroom_ledger_update = update_headroom_release_ledger(
+            headroom_release_event_key,
+            (
+                0.0
+                if unsafe_import_increase_w > 50
+                or not headroom_release_scaling_active
+                else scheduled_headroom_power_by_key.get(current_period_key, 0.0)
+            ),
+            t_now,
+            get("pyscript.headroom_release_ledger", ""),
+        )
+        if headroom_ledger_update.valid:
+            state.set(
+                "pyscript.headroom_release_ledger",
+                headroom_ledger_update.state_value,
+            )
+            headroom_released_kwh = headroom_ledger_update.released_kwh
+        else:
+            log.warning(
+                "Headroom release ledger invalid "
+                f"({headroom_ledger_update.reason}); pre-release unscaled this run"
+            )
 
         current_detail = unified_forecast.detail[0]
         for detail_entry in unified_forecast.detail:
@@ -3460,9 +4735,32 @@ def auto_setpoint_target():
                 f"Unified schedule forecasts unavoidable feed-in {max_forecast_feedin_w:.0f} W "
                 f"above hard combined target {hard_max_grid_export_w:.0f} W"
             )
+        if balance_chase_active:
+            if days_since_full_charge is None:
+                chase_detail = "no full-charge history"
+            else:
+                chase_detail = f"{days_since_full_charge:.1f} days since full"
+            chase_suffix = (
+                f", BALANCE CHASE ({chase_detail}, "
+                "economic + preferred export withheld)"
+            )
+        else:
+            chase_suffix = ""
+        silent_suffix = (
+            f", SILENT ({silent_shaping_energy_kwh:.2f} kWh shaped, "
+            f"export capped at {SILENT_MODE_MAX_BATTERY_POWER_W:.0f} W)"
+            if silent_mode_active
+            else ""
+        )
+        blocked_suffix = (
+            f", ECONOMIC BLOCKED (feed-in cap {feedin_compensation_cap})"
+            if economic_export_floor is None
+            else ""
+        )
         log.warning(
             f"Unified optional export schedule: {scheduled_export_energy_kwh:.2f} kWh requested "
             f"({allocated_headroom_energy_kwh:.2f}/{headroom_energy_kwh:.2f} kWh preferred PV headroom, "
+            f"{headroom_released_kwh:.2f} kWh already released, "
             f"hard cap {hard_headroom_energy_kwh:.2f} kWh with "
             f"{hard_headroom_shortfall_kwh:.2f} kWh deadline shortfall, "
             f"reference {headroom_reference_price:.3f}/kWh), "
@@ -3471,6 +4769,9 @@ def auto_setpoint_target():
             f"optional export {current_optional_export_w:.0f} W, "
             f"planned battery {current_detail.battery_power:.0f} W, "
             f"floor {current_planned_floor_kwh:.2f} kWh"
+            f"{chase_suffix}"
+            f"{silent_suffix}"
+            f"{blocked_suffix}"
         )
 
         detail_vectorized = {
@@ -3500,6 +4801,40 @@ def auto_setpoint_target():
             ev_is_charging=bool(ev_is_charging),
             ev_energy_needed_kwh=round(ev_energy_needed, 2),
             ev_export_hold_active=ev_export_hold_active,
+            economic_export_blocked=economic_export_floor is None,
+            economic_export_floor=(
+                round(economic_export_floor, 4)
+                if economic_export_floor is not None
+                else None
+            ),
+            ev_arrival_reservation_active=ev_arrival_reservation_active,
+            ev_arrival_reserved_kwh=round(ev_arrival_reserved_kwh, 3),
+            export_block_reason=export_block_reason,
+            balance_chase_active=balance_chase_active,
+            days_since_full_charge=(
+                round(days_since_full_charge, 2)
+                if days_since_full_charge is not None
+                else None
+            ),
+            top_up_pv_confidence_factor=EXPORT_PV_CONFIDENCE_FACTOR,
+            export_policy_valid=export_policy_valid,
+            export_policy_reason=export_policy_reason,
+            export_policy_calculated_at=(
+                published_surplus_calculated_at.isoformat()
+                if published_surplus_calculated_at is not None
+                else None
+            ),
+            export_policy_source_battery_kwh=(
+                round(float(published_surplus_battery_energy_kwh), 3)
+                if export_policy_valid
+                else None
+            ),
+            export_policy_battery_draw_kwh=round(
+                export_policy_budget.battery_draw_since_calculation_kwh,
+                3,
+            ),
+            safe_export_source_battery_kwh=round(battery_energy, 3),
+            safe_export_calculated_at=t_now.isoformat(),
             plan_calculated_at=t_now.isoformat(),
             max_battery_power_target=max_battery_discharge_w,
             max_grid_export_w=hard_max_grid_export_w,
@@ -3547,10 +4882,23 @@ def auto_setpoint_target():
                 for key, value in hard_cap_hold_schedule.items()
                 if value > 0.1
             },
-            headroom_constraint_active=headroom_energy_kwh > 0,
+            headroom_hold_schedule={
+                key: round(value, 1)
+                for key, value in headroom_hold_schedule.items()
+                if value > 0.1
+            },
+            headroom_constraint_active=(
+                headroom_energy_kwh > 0 or hard_headroom_energy_kwh > 0
+            ),
+            proactive_export_active=proactive_export_active,
+            proactive_export_power_w=round(proactive_export_power_w, 1),
+            silent_mode_active=silent_mode_active,
+            silent_max_battery_power_w=round(SILENT_MODE_MAX_BATTERY_POWER_W, 1),
+            silent_shaping_energy_kwh=round(silent_shaping_energy_kwh, 3),
             headroom_control_w=current_target,
             headroom_energy_kwh=round(headroom_energy_kwh, 3),
             headroom_allocated_kwh=round(allocated_headroom_energy_kwh, 3),
+            headroom_released_kwh=round(headroom_released_kwh, 3),
             headroom_reference_price=round(headroom_reference_price, 5),
             headroom_min_price_spread=round(headroom_min_price_spread, 5),
             headroom_is_soft=False,
@@ -3564,19 +4912,42 @@ def auto_setpoint_target():
             ),
             headroom_schedule={},
             raw_pv_feedin_peak_w=round(raw_peak_w, 1),
+            observed_pv_forecast_error_w=round(
+                high_side_headroom.observed_pv_error_w,
+                1,
+            ),
+            pv_power_measurement_fresh=pv_power_measurement_fresh,
+            high_side_headroom_energy_kwh=round(
+                high_side_headroom_energy_kwh,
+                3,
+            ),
+            high_side_natural_export_peak_w=round(
+                high_side_headroom.peak_high_side_natural_export_w,
+                1,
+            ),
             quiet_efficient_power_w=round(efficient_discharge_w, 1),
             quiet_price_tolerance_percent=round(quiet_price_tolerance * 100, 1),
+            scheduled_export_net_prices={
+                slot.period_start.isoformat(): round(slot.price_per_kwh, 4)
+                for slot in scheduler_slots
+                if optional_export_power_schedule.get(
+                    slot.period_start.isoformat(), 0.0
+                )
+                > 0.0
+            },
             detail=detail_vectorized,
         )
         return
 
     initial_forecast = forecast_setpoint_local(
+        forecast_ctx,
         pv_forecast=epex_pv_forecast,
         setpoint=current_setpoint if automation_disabled else max_setpoint,
-        setpoint_spread=0.01,
-        current_battery_energy=current_battery_energy,
         with_ev_charging=with_ev_charging,
         ev_energy=ev_energy,
+        configured_max_feedin=max_feedin_limit,
+        setpoint_spread=0.01,
+        current_battery_energy=current_battery_energy,
         max_battery_power_target=8000,  # TODO: make this configurable
     )
 
@@ -3621,231 +4992,51 @@ def auto_setpoint_target():
         )
         return
 
-    def setpoint_binary_search(
-        pv_forecast,
+    search_results = setpoint_binary_search(
+        forecast_ctx,
+        epex_pv_forecast,
         min_setpoint=min_setpoint,
         max_setpoint=max_setpoint,
         with_ev_charging=with_ev_charging,
         battery_energy=current_battery_energy,
         ev_energy=ev_energy,
-        max_iters=5,
-        max_battery_power_target: float = 8000,
-        log_setpoint=False,
-        current_setpoint=None,
-        current_spread=None,
-        min_spread=1e-5,
-        max_spread=50,
-        update_setpoint=True,
-        update_spread=False,
-    ):
-        msg = ""
-        if not len(pv_forecast) > 1:
-            return None
-        search_results = []
-        assert update_setpoint or update_spread
-        control_min_setpoint = min_setpoint
-        control_max_setpoint = max_setpoint
-
-        log.warning(
-            f"Starting binary search for setpoint with parameters: ev_energy={ev_energy} min_setpoint={min_setpoint}, max_setpoint={max_setpoint}, min_spread={min_spread}, max_spread={max_spread}, update_setpoint={update_setpoint}, update_spread={update_spread}, max_iters={max_iters}, log_setpoint={log_setpoint}"
-        )
-        if not update_spread:
-            assert current_spread is not None
-        if not update_setpoint:
-            assert current_setpoint is not None
-
-        candidate_metrics = []
-
-        def evaluate_candidate(candidate_setpoint, candidate_spread):
-            result = forecast_setpoint_local(
-                pv_forecast,
-                candidate_setpoint,
-                candidate_spread,
-                battery_energy,
-                with_ev_charging=with_ev_charging,
-                ev_energy=ev_energy,
-                max_battery_power_target=max_battery_power_target,
-            )
-            control_value = candidate_setpoint if update_setpoint else candidate_spread
-            candidate = get_feedin_candidate(result, control_value)
-            search_results.append(result)
-            candidate_metrics.append(candidate)
-            return result, candidate
-
-        # Always evaluate the least aggressive boundary. The previous search
-        # never sampled it, so an insensitive forecast could only terminate at
-        # the opposite, full-export boundary.
-        baseline_setpoint = max_setpoint if update_setpoint else current_setpoint
-        baseline_spread = current_spread if update_setpoint else min_spread
-        evaluate_candidate(baseline_setpoint, baseline_spread)
-
-        for itr in range(max_iters):
-            if update_setpoint:
-                current_setpoint = (min_setpoint + max_setpoint) // 2
-            if update_spread:
-                current_spread = (min_spread + max_spread) / 2
-
-            r, feedin_candidate = evaluate_candidate(current_setpoint, current_spread)
-            update_reason = ""
-            discounted_pv_feedin, discounted_peak_time, raw_pv_feedin = get_discounted_pv_feedin_peak(r)
-            constraint_exceeded = feedin_constraint_exceeded(feedin_candidate, max_pv_feedin)
-
-            if (
-                constraint_exceeded
-                and discounted_peak_time.day != t_now.day
-                and (
-                    r.min_bat < battery_min_energy
-                    or min(
-                        [d.surplus for d in r.detail if d.period_start.day == t_now.day and d.period_start > t_now]
-                        or [float("inf")]
-                    )
-                    < 1
-                )
-            ):
-                update_reason = "pv peak tomorrow, battery too low"
-                # If we have a feedin peak tomorrow but battery is too low, we need to be more conservative (lower setpoint, higher spread)
-                if update_setpoint:
-                    min_setpoint = current_setpoint
-                if update_spread:
-                    max_spread = current_spread
-
-            elif constraint_exceeded:
-                update_reason = "max feedin too large"
-                # If feed-in limit is exceeded, we need a more negative setpoint, higher spread
-                if update_setpoint:
-                    max_setpoint = current_setpoint
-                if update_spread:
-                    min_spread = current_spread
-
-            else:
-                update_reason = "default"
-                if update_setpoint:
-                    min_setpoint = current_setpoint
-                if update_spread:
-                    max_spread = current_spread
-
-            if logging:
-                msg += (
-                    f"Iteration {itr + 1}: reason  {update_reason} setpoint {r.setpoint:0f} spread {r.setpoint_spread:.1f} "
-                    f"min_setpoint={min_setpoint:.0f} max_setpoint={max_setpoint:.0f} pv feedin {raw_pv_feedin:.0f} "
-                    f"discounted {discounted_pv_feedin:.0f} overflow {feedin_candidate.overflow_energy_kwh:.3f} kWh "
-                    f"at {discounted_peak_time.strftime('%d %H:%M')} min_bat {r.min_bat:.1f} max_bat {r.max_bat:.1f} t_max_bat {r.t_max_bat}\n"
-                )
-
-            if (update_spread and abs(max_spread - min_spread) < 1e-3) or (
-                update_setpoint and abs(max_setpoint - min_setpoint) < 50
-            ):
-                break
-
-        selected_candidate = choose_stable_candidate(
-            candidate_metrics,
-            max_pv_feedin,
-            prefer_larger_control=update_setpoint,
-        )
-        selected_index = candidate_metrics.index(selected_candidate)
-        selected_result = search_results[selected_index]
-
-        # Some forecast paths do not model the setpoint's effect on PV
-        # overflow. If every candidate is effectively identical, the stable
-        # selector correctly refuses to saturate at maximum export. For a real
-        # remaining violation, derive the least export needed to create useful
-        # battery headroom before the predicted peak.
-        baseline_candidate = candidate_metrics[0]
-        if (
-            update_setpoint
-            and selected_index == 0
-            and feedin_constraint_exceeded(baseline_candidate, max_pv_feedin)
-        ):
-            _discounted_peak, peak_time, _raw_peak = get_discounted_pv_feedin_peak(selected_result)
-            hours_to_peak = max(0.0, (peak_time - t_now).total_seconds() / 3600)
-            available_energy_kwh = max(0.0, battery_energy - battery_min_energy)
-            fallback_setpoint = calculate_energy_bounded_control(
-                overflow_energy_kwh=baseline_candidate.overflow_energy_kwh,
-                available_energy_kwh=available_energy_kwh,
-                hours_to_peak=hours_to_peak,
-                min_control_w=control_min_setpoint,
-                max_control_w=control_max_setpoint,
-            )
-            if fallback_setpoint < baseline_candidate.control_value:
-                selected_result, selected_candidate = evaluate_candidate(
-                    fallback_setpoint,
-                    current_spread,
-                )
-                log.warning(
-                    f"Using energy-bounded fallback setpoint {fallback_setpoint:.0f} W for "
-                    f"{available_energy_kwh:.2f} kWh available, "
-                    f"{baseline_candidate.overflow_energy_kwh:.2f} kWh overflow, "
-                    f"{hours_to_peak:.2f} h to peak"
-                )
-        if selected_result is not search_results[-1]:
-            log.warning(
-                f"Selected stable control {selected_candidate.control_value:.2f}; "
-                f"peak {selected_candidate.predicted_peak_w:.0f} W, "
-                f"overflow {selected_candidate.overflow_energy_kwh:.3f} kWh"
-            )
-            search_results.append(selected_result)
-        if logging:
-            log.warning(f"Binary search completed in {itr + 1} iterations: \n" + msg)
-        return search_results
-
-    def format_setpoint_results(search_results, title):
-        # Print setpoint results in tablular format (without forecast details)
-        if search_results is None:
-            return None
-        lines = []
-
-        def ft(t):
-            return t.strftime("%d %H:%M")
-
-        def fi(k):
-            return f"{k:.0f}"
-
-        lines = []
-        for r in search_results:
-            discounted_peak, discounted_time, raw_peak = get_discounted_pv_feedin_peak(r)
-            lines.append(
-                f"{r.setpoint:2.0f} {' ' * 4}  {r.setpoint_spread:8.6f}{r.min_bat:9.1f}{'':6s}{ft(r.t_min_bat):10s}{r.max_bat:5.1f}{'':6s}{ft(r.t_max_bat):12s}{fi(raw_peak):12s}{fi(discounted_peak):18s}{ft(discounted_time):10s}"
-            )
-        return (
-            f"Setpoint results {title}:\n{'setpoint':<11s}{'spread':<13s}{'min_bat':<10s}{'t_min_bat':<11s}{'max_bat':<11s}{'t_max_bat':<11s}{'max_pv_feedin':<12s}{'discounted_pv':<18s}{'t_discounted':<10s}\n"
-            + "\n".join(lines)
-        )
-
-    search_results = setpoint_binary_search(
-        epex_pv_forecast,
-        min_setpoint=min_setpoint,
-        max_setpoint=max_setpoint,
+        logging=logging,
         current_spread=0.01,
-        ev_energy=ev_energy,
     )
 
     if logging:
-        log.warning(format_setpoint_results(search_results, "initial search"))
+        log.warning(format_setpoint_results(search_results, "initial search", t_now))
 
     assert search_results[-1].setpoint_spread is not None
 
     search_results += setpoint_binary_search(
+        forecast_ctx,
         epex_pv_forecast,
-        current_setpoint=search_results[-1].setpoint,
         min_setpoint=search_results[-1].setpoint - 200,
         max_setpoint=search_results[-1].setpoint + 200,
+        with_ev_charging=with_ev_charging,
+        battery_energy=current_battery_energy,
+        ev_energy=ev_energy,
+        logging=logging,
+        current_setpoint=search_results[-1].setpoint,
         min_spread=1e-5,
         update_spread=True,
         update_setpoint=False,
         # log_setpoint=True,
-        ev_energy=ev_energy,
     )
 
     initial_result = search_results[-1]
 
     assert initial_result.setpoint_spread is not None
     forecast_setpoint_local(
+        forecast_ctx,
         epex_pv_forecast,
         setpoint=initial_result.setpoint,
-        setpoint_spread=initial_result.setpoint_spread,
-        current_battery_energy=battery_energy,
         with_ev_charging=with_ev_charging,
         ev_energy=ev_energy,
+        configured_max_feedin=max_feedin_limit,
+        setpoint_spread=initial_result.setpoint_spread,
+        current_battery_energy=battery_energy,
         max_battery_power_target=8000,
         logging=False,
     )
@@ -3865,7 +5056,7 @@ def auto_setpoint_target():
         overflow_energy_kwh=calculate_pv_overflow_energy(today_samples, max_pv_feedin, t_now),
     )
     today_constraint_exceeded = feedin_constraint_exceeded(today_candidate, max_pv_feedin)
-    discounted_pv_feedin, discounted_peak_time, raw_pv_feedin = get_discounted_pv_feedin_peak(initial_result)
+    discounted_pv_feedin, discounted_peak_time, raw_pv_feedin = get_discounted_pv_feedin_peak(initial_result, t_now)
     log.warning(
         f" \n\ninitial_result.max_pv_feedin {raw_pv_feedin:.0f} W, discounted {discounted_pv_feedin:.0f} W at {discounted_peak_time.strftime('%d %H:%M')}\n"
         f" max pv feedin today {max_pv_feedin_today:.0f} W, overflow {today_candidate.overflow_energy_kwh:.3f} kWh, "
@@ -3899,44 +5090,29 @@ def auto_setpoint_target():
         else:
             price_forecast = new_price_forecast
             search_results = setpoint_binary_search(
+                forecast_ctx,
                 price_forecast,
+                min_setpoint=min_setpoint,
+                max_setpoint=max_setpoint,
                 with_ev_charging=with_ev_charging,
                 battery_energy=start_detail.battery_energy,
                 ev_energy=start_detail.ev_energy,
+                logging=logging,
                 current_setpoint=initial_result.setpoint,
                 update_spread=True,
                 update_setpoint=False,
                 log_setpoint=True,
             )
 
-        log.warning(msg + "\n" + format_setpoint_results(search_results, "update spread"))
+        log.warning(msg + "\n" + format_setpoint_results(search_results, "update spread", t_now))
         new_result = search_results[-1]
         assert new_result is not None
 
         if logging:
             log.warning(
-                f" \n\nnew_result.discounted_pv_feedin {get_discounted_pv_feedin_peak(new_result)[0]:0f} > max_pv_feedin {max_pv_feedin:0f}: {get_discounted_pv_feedin_peak(new_result)[0] > max_pv_feedin}\n\n!!"
+                f" \n\nnew_result.discounted_pv_feedin {get_discounted_pv_feedin_peak(new_result, t_now)[0]:0f} > max_pv_feedin {max_pv_feedin:0f}: {get_discounted_pv_feedin_peak(new_result, t_now)[0] > max_pv_feedin}\n\n!!"
             )
         msg = ""
-        # while new_result.max_pv_feedin > max_pv_feedin and new_result.max_battery_power_target > 100:
-        #     new_result = forecast_setpoint_local(
-        #         price_forecast,
-        #         setpoint=new_result.setpoint,
-        #         setpoint_spread=new_result.setpoint_spread,
-        #         current_battery_energy=start_detail.battery_energy,
-        #         t_start=t_start,
-        #         ev_energy=start_detail.ev_energy,
-        #         with_ev_charging=with_ev_charging,
-        #         max_battery_power_target=round(new_result.max_battery_power_target * 0.7),
-        #     )
-
-        #     msg += (
-        #         f"\nupdated max battery power target: {new_result.max_battery_power_target:.1f} W, "
-        #         f"setpoint: {new_result.setpoint:.1f} W, max_pv_feedin: {new_result.max_pv_feedin:.1f} W"
-        #     )
-
-        # if logging:
-        #     log.warning(msg)
 
         # if the end time is before the time limit, need to forecast again for the remaining time
         rest_forecast = [el for el in epex_pv_forecast if el.period_start > t_end]
@@ -3944,12 +5120,14 @@ def auto_setpoint_target():
         if rest_forecast:
             log.warning("starting rest forecast")
             rest_result = setpoint_binary_search(
+                forecast_ctx,
                 rest_forecast,
                 min_setpoint=-max_feedin_limit,
                 max_setpoint=max_setpoint,
                 with_ev_charging=True,
                 battery_energy=new_result.detail[-1].battery_energy,
                 ev_energy=new_result.detail[-1].ev_energy,
+                logging=logging,
                 current_spread=new_result.setpoint_spread,
                 log_setpoint=True,
             )[-1]
@@ -3970,7 +5148,7 @@ def auto_setpoint_target():
         #     )
         #     final_result.max_battery_power_target = new_result.max_battery_power_target
 
-    log.warning(format_setpoint_results(search_results, "final result"))
+    log.warning(format_setpoint_results(search_results, "final result", t_now))
 
     setpoint_result = search_results[-1]
 
@@ -3997,12 +5175,13 @@ def auto_setpoint_target():
     final_feedin_candidate = get_feedin_candidate(
         setpoint_result,
         setpoint_result.setpoint,
+        forecast_ctx,
     )
     hard_feedin_constraint_active = feedin_constraint_exceeded(
         final_feedin_candidate,
         max_pv_feedin,
     )
-    _discounted_peak, headroom_deadline, _raw_peak = get_discounted_pv_feedin_peak(setpoint_result)
+    _discounted_peak, headroom_deadline, _raw_peak = get_discounted_pv_feedin_peak(setpoint_result, t_now)
     available_headroom_energy_kwh = max(0.0, battery_energy - battery_min_energy)
     headroom_energy_kwh = (
         calculate_headroom_energy_requirement(
@@ -4101,6 +5280,17 @@ def auto_setpoint_target():
 
 prev_house_loads = None
 prev_optional_export_ev_plan_hold = None
+live_headroom_active = False
+live_headroom_target_kwh = 0.0
+live_headroom_hold_until = None
+prev_live_headroom_mode = None
+last_live_headroom_publish = None
+prev_applied_grid_target_w = None
+prev_telemetry_hold_active = False
+prev_discharge_limit_before_hold = None
+prev_telemetry_good_streak = 0
+prev_telemetry_bad_streak = 0
+prev_telemetry_hold_boot_checked = False
 
 
 @time_trigger
@@ -4114,21 +5304,103 @@ def auto_apply_setpoint():
 
     global prev_house_loads
     global prev_optional_export_ev_plan_hold
-    if prev_house_loads is None:
-        prev_house_loads = get(House.loads, 500)
+    global live_headroom_active
+    global live_headroom_target_kwh
+    global live_headroom_hold_until
+    global prev_live_headroom_mode
+    global last_live_headroom_publish
+    global prev_applied_grid_target_w
+    global prev_telemetry_hold_active
+    global prev_discharge_limit_before_hold
+    global prev_telemetry_good_streak
+    global prev_telemetry_bad_streak
+    global prev_telemetry_hold_boot_checked
+    current_control_time = now()
 
-    max_setpoint = get(Grid.max_setpoint, -20)
-    msg += f" max setpont {max_setpoint}"
-    house_power_long_term_average = get(House.daily_average_power, 0)  # W
-    house_loads = get(House.loads, prev_house_loads)
-    # when true PV power changes rapidly, house_loads can be negative due to the house loads are often calculated
-    house_loads = max(house_loads, house_power_long_term_average * 0.5)
-
-    house_loads = prev_house_loads * 0.5 + 0.5 * house_loads  # prevent oscillations, outliers
-    prev_house_loads = house_loads
-    setpoint_target = get(Grid.power_setpoint_target, 0)
-    max_setpoint_target = get(Grid.max_feedin_target, 0)
+    max_setpoint = select_finite_grid_target(
+        candidate_grid_target_w=get(Grid.max_setpoint, -20),
+        fallback_grid_target_w=-20.0,
+    )
+    if max_setpoint is None:
+        return
+    msg += f" max setpoint {max_setpoint}"
+    raw_house_power_long_term_average = get(House.daily_average_power, 0)  # W
+    house_power_long_term_average_valid = are_power_measurement_values_valid(
+        raw_house_power_long_term_average,
+        0.0,
+        max_absolute_power_w=LIVE_POWER_MAX_ABSOLUTE_W,
+    ) and float(raw_house_power_long_term_average) >= 0.0
+    house_power_long_term_average = (
+        float(raw_house_power_long_term_average)
+        if house_power_long_term_average_valid
+        else 500.0
+    )
+    raw_house_loads = get(House.loads, None)
+    house_load_updated_at = get_attr(House.loads, "last_updated")
+    house_load_measurement_age_seconds = calculate_measurement_age_seconds(
+        current_control_time,
+        house_load_updated_at,
+    )
+    house_load_value_valid = (
+        raw_house_loads is not None
+        and are_power_measurement_values_valid(
+            raw_house_loads,
+            0.0,
+            max_absolute_power_w=LIVE_POWER_MAX_ABSOLUTE_W,
+        )
+        and float(raw_house_loads) >= 0.0
+    )
+    house_load_measurement_fresh = house_load_value_valid and is_measurement_fresh(
+        current_control_time,
+        house_load_updated_at,
+        max_age_seconds=LIVE_HOUSE_LOAD_MAX_MEASUREMENT_AGE_SECONDS,
+    )
+    previous_house_load_valid = (
+        prev_house_loads is not None
+        and are_power_measurement_values_valid(
+            prev_house_loads,
+            0.0,
+            max_absolute_power_w=LIVE_POWER_MAX_ABSOLUTE_W,
+        )
+        and float(prev_house_loads) >= 0.0
+    )
+    if not previous_house_load_valid:
+        prev_house_loads = house_power_long_term_average
+    if house_load_measurement_fresh:
+        bounded_house_loads = max(
+            float(raw_house_loads),
+            house_power_long_term_average * 0.5,
+        )
+        house_loads = prev_house_loads * 0.5 + bounded_house_loads * 0.5
+        prev_house_loads = house_loads
+    else:
+        house_loads = prev_house_loads
+    setpoint_target = select_finite_grid_target(
+        candidate_grid_target_w=get(Grid.power_setpoint_target, 0),
+        fallback_grid_target_w=max_setpoint,
+    )
+    max_setpoint_target = select_finite_grid_target(
+        candidate_grid_target_w=get(Grid.max_feedin_target, 0),
+        fallback_grid_target_w=0.0,
+    )
+    if setpoint_target is None or max_setpoint_target is None:
+        return
     unified_scheduler_active = get_attr(Grid.power_setpoint_target, "unified_scheduler_active", False)
+    live_pv_power_w = get(PVProduction.total_power, 0)
+    pv_power_updated_at = get_attr(PVProduction.total_power, "last_updated")
+    pv_measurement_age_seconds = calculate_measurement_age_seconds(
+        current_control_time,
+        pv_power_updated_at,
+    )
+    pv_power_value_valid, pv_power_measurement_fresh = validate_pv_power_measurement(
+        live_pv_power_w,
+        pv_power_updated_at,
+        current_control_time,
+        LIVE_PV_MAX_MEASUREMENT_AGE_SECONDS,
+    )
+    pv_power_for_control_w = (
+        live_pv_power_w if pv_power_measurement_fresh else 0.0
+    )
     ev_is_charging = get(EV.is_charging, False)
     ev_available_for_charging = is_ev_available_for_charging(
         charger_ready=get(Charger.ready, False),
@@ -4155,6 +5427,20 @@ def auto_apply_setpoint():
         Grid.power_setpoint_target,
         "plan_calculated_at",
         None,
+    )
+    export_policy_calculated_at = parse_aware_datetime(
+        get_attr(
+            Grid.power_setpoint_target,
+            "export_policy_calculated_at",
+            None,
+        )
+    )
+    export_policy_fresh = bool(
+        get_attr(Grid.power_setpoint_target, "export_policy_valid", False)
+    ) and is_measurement_fresh(
+        current_control_time,
+        export_policy_calculated_at,
+        max_age_seconds=LIVE_EXPORT_BUDGET_HORIZON_SECONDS,
     )
     optional_export_ev_plan_hold = unified_scheduler_active and not is_ev_plan_fresh(
         planned_ev_available=planned_ev_available,
@@ -4191,26 +5477,36 @@ def auto_apply_setpoint():
             "planned_battery_power_w",
             0,
         )
-        planned_max_grid_export_w = get_attr(
-            Grid.power_setpoint_target,
-            "planned_max_grid_export_w",
-            min(5500, max_setpoint_target),
+        planned_max_grid_export_w = select_finite_grid_target(
+            candidate_grid_target_w=get_attr(
+                Grid.power_setpoint_target,
+                "planned_max_grid_export_w",
+                min(5500, max_setpoint_target),
+            ),
+            fallback_grid_target_w=0.0,
         )
-        live_pv_power_w = get(PVProduction.total_power, 0)
+        if planned_max_grid_export_w is None:
+            return
         setpoint = adapt_grid_target_to_live_power(
             planned_battery_power_w=planned_battery_power_w,
             planned_optional_export_power_w=planned_optional_export_power_w,
             house_load_w=house_loads,
-            pv_power_w=live_pv_power_w,
+            pv_power_w=pv_power_for_control_w,
             max_grid_export_w=min(planned_max_grid_export_w, max_setpoint_target),
             neutral_grid_target_w=max_setpoint,
             ev_is_charging=ev_is_charging,
             hold_optional_export=optional_export_ev_plan_hold,
         )
+        setpoint = select_finite_grid_target(
+            candidate_grid_target_w=setpoint,
+            fallback_grid_target_w=LIVE_TELEMETRY_FAILSAFE_IMPORT_TARGET_W,
+        )
+        if setpoint is None:
+            return
         msg += (
             f" unified live target {setpoint:.0f} W from planned battery "
-            f"{planned_battery_power_w:.0f} W, optional export "
-            f"{planned_optional_export_power_w:.0f} W, live loads "
+            f"{planned_battery_power_w} W, optional export "
+            f"{planned_optional_export_power_w} W, live loads "
             f"{house_loads:.0f} W and PV {live_pv_power_w:.0f} W"
         )
     elif setpoint_target < (max_setpoint - 30):
@@ -4225,47 +5521,691 @@ def auto_apply_setpoint():
         msg = f"setpoint adjusted to {max_setpoint} since EV is charging"
         setpoint = max_setpoint
 
+    # Silent mode quiets battery/grid exchange ahead of the safety
+    # supervisor, so true cap emergencies can still push past it.  House
+    # and EV coverage stay unlimited; only grid-bound flows are capped.
+    if get(Automation.silent_mode, False):
+        try:
+            live_wallbox_power_w = max(0.0, get(Charger.power, 0))
+        except (TypeError, ValueError, OverflowError):
+            live_wallbox_power_w = 0.0
+        silent_cap_w = (
+            min(planned_max_grid_export_w, max_setpoint_target)
+            if unified_scheduler_active
+            else max_setpoint_target
+        )
+        silent_target_w = apply_silent_mode_grid_limits(
+            setpoint,
+            pv_power_for_control_w,
+            house_loads,
+            live_wallbox_power_w,
+            silent_cap_w,
+            silent_power_w=SILENT_MODE_MAX_BATTERY_POWER_W,
+            surplus_margin_w=SILENT_MODE_CHARGE_SURPLUS_MARGIN_W,
+        )
+        if silent_target_w != setpoint:
+            msg += (
+                f" silent-clamped setpoint from {setpoint:.0f} to "
+                f"{silent_target_w:.0f} (PV {pv_power_for_control_w:.0f} W, "
+                f"loads {house_loads:.0f} W, EV {live_wallbox_power_w:.0f} W)"
+            )
+            setpoint = silent_target_w
+
+    setpoint = select_finite_grid_target(
+        candidate_grid_target_w=setpoint,
+        fallback_grid_target_w=LIVE_TELEMETRY_FAILSAFE_IMPORT_TARGET_W,
+    )
+    if setpoint is None:
+        return
+
     surplus_energy = get(House.energy_surplus, 0)
     battery_capacity = get(Battery.capacity, 0)
     battery_energy = get(Battery.energy, 0)
+    battery_energy_updated_at = get_attr(Battery.energy, "last_updated")
+    battery_energy_measurement_age_seconds = calculate_measurement_age_seconds(
+        current_control_time,
+        battery_energy_updated_at,
+    )
+    # Battery.power is in W; an idle battery's energy reading legitimately
+    # sits still (HA only refreshes last_updated on change).
+    battery_energy_measurement_fresh = is_battery_energy_measurement_usable(
+        current_control_time,
+        battery_energy_updated_at,
+        battery_energy,
+        battery_capacity,
+        get(Battery.soc, -1),
+        get(Battery.power, 1337),
+        get_attr(Battery.power, "last_updated"),
+        max_age_seconds=LIVE_BATTERY_ENERGY_MAX_MEASUREMENT_AGE_SECONDS,
+    )
+    battery_energy_values_valid = are_battery_energy_values_valid(
+        battery_capacity,
+        battery_energy,
+    )
     reserve_soc = get_reserve_soc()
     minimal_soc = get(Automation.minimal_soc, reserve_soc)
-    battery_export_floor = get_battery_export_floor(battery_capacity, reserve_soc, minimal_soc)
-    if unified_scheduler_active:
-        battery_export_floor = get_attr(
-            Grid.power_setpoint_target,
-            "planned_battery_floor_kwh",
-            battery_export_floor,
+    if battery_energy_values_valid:
+        battery_export_floor = get_battery_export_floor(
+            battery_capacity,
+            reserve_soc,
+            minimal_soc,
         )
-    pv_power = get(PVProduction.total_power, 0)
-    max_battery_power_target = get_attr(Grid.power_setpoint_target, "max_battery_power_target", 4000)
-    pv_only_setpoint = get_pv_only_setpoint(
+        if unified_scheduler_active:
+            planned_battery_floor_kwh = get_attr(
+                Grid.power_setpoint_target,
+                "planned_battery_floor_kwh",
+                battery_export_floor,
+            )
+            if are_battery_energy_values_valid(
+                battery_capacity,
+                planned_battery_floor_kwh,
+            ):
+                battery_export_floor = planned_battery_floor_kwh
+            else:
+                battery_energy_values_valid = False
+    else:
+        battery_export_floor = 0.0
+    pv_power = pv_power_for_control_w
+    max_battery_charge_power_w = resolve_directional_power_limit_w(
+        get(Battery.charge_limit, -1),
+        6600.0,
+        6600.0,
+    )
+    max_battery_discharge_power_w = resolve_directional_power_limit_w(
+        get(Battery.discharge_limit, -1),
+        8000.0,
+        8000.0,
+    )
+    raw_pv_only_setpoint = get_pv_only_setpoint(
         pv_power,
         house_loads,
-        max_battery_power_target,
+        max_battery_charge_power_w,
+    )
+    pv_only_setpoint = select_no_battery_export_target(
+        pv_only_grid_target_w=raw_pv_only_setpoint,
+        neutral_grid_target_w=max_setpoint,
+        pv_measurement_fresh=pv_power_measurement_fresh,
     )
 
-    min_ev_charge_power = EVConst.voltage * EVConst.min_current
-    ev_has_pv_headroom = pv_power > house_loads + min_ev_charge_power
-    protect_opportunistic_ev_from_battery = ev_is_charging and ev_energy_needed <= 0 and ev_has_pv_headroom
-
-    if protect_opportunistic_ev_from_battery and setpoint < pv_only_setpoint:
-        msg += (
-            f" capped EV setpoint from {setpoint:.0f} to {pv_only_setpoint:.0f}; "
-            f"PV {pv_power:.0f} W, loads {house_loads:.0f} W, energy_needed {ev_energy_needed:.2f} kWh"
+    live_headroom_mode = "disabled"
+    live_headroom_decision = None
+    time_to_full_minutes = None
+    measurement_skew_seconds = None
+    grid_measurement_age_seconds = None
+    battery_measurement_age_seconds = None
+    measurement_rejection_reason = (
+        "invalid_battery_energy"
+        if unified_scheduler_active and not battery_energy_values_valid
+        else (
+            "stale_battery_energy"
+            if unified_scheduler_active and not battery_energy_measurement_fresh
+            else (
+                "battery_capacity_unavailable"
+                if unified_scheduler_active
+                else "not_applicable"
+            )
         )
-        setpoint = pv_only_setpoint
+    )
+    measurements_available = not unified_scheduler_active
+    battery_free_capacity_kwh = (
+        max(0.0, battery_capacity - battery_energy)
+        if battery_energy_values_valid and battery_energy_measurement_fresh
+        else 0.0
+    )
+    if (
+        unified_scheduler_active
+        and battery_energy_values_valid
+        and battery_energy_measurement_fresh
+    ):
+        current_time = now()
+        unavailable_power_kw = 1337.0
+        measured_grid_power_kw = get(Grid.power_ac, unavailable_power_kw)
+        measured_battery_power_kw = get(Battery.power, unavailable_power_kw)
+        grid_power_updated_at = get_attr(Grid.power_ac, "last_updated")
+        battery_power_updated_at = get_attr(Battery.power, "last_updated")
+        grid_measurement_age_seconds = calculate_measurement_age_seconds(
+            current_time,
+            grid_power_updated_at,
+        )
+        battery_measurement_age_seconds = calculate_measurement_age_seconds(
+            current_time,
+            battery_power_updated_at,
+        )
+        measurement_skew_seconds = calculate_measurement_skew_seconds(
+            grid_power_updated_at,
+            battery_power_updated_at,
+        )
+        power_measurements_present = (
+            measured_grid_power_kw != unavailable_power_kw
+            and measured_battery_power_kw != unavailable_power_kw
+        )
+        power_measurement_values_valid = (
+            power_measurements_present
+            and are_power_measurement_values_valid(
+                measured_grid_power_kw,
+                measured_battery_power_kw,
+                max_absolute_power_w=LIVE_POWER_MAX_ABSOLUTE_W / 1000.0,
+            )
+        )
+        measurements_available = (
+            power_measurements_present and power_measurement_values_valid
+        )
+        if not power_measurements_present:
+            measurement_rejection_reason = "missing_power"
+        elif not power_measurement_values_valid:
+            measurement_rejection_reason = "invalid_power"
+        else:
+            measurements_available = are_power_measurements_coherent(
+                current_time=current_time,
+                grid_updated_at=grid_power_updated_at,
+                battery_updated_at=battery_power_updated_at,
+                max_age_seconds=LIVE_HEADROOM_MAX_MEASUREMENT_AGE_SECONDS,
+                max_skew_seconds=LIVE_HEADROOM_MAX_MEASUREMENT_SKEW_SECONDS,
+            )
+            if measurements_available:
+                measurement_rejection_reason = (
+                    "none"
+                    if house_load_measurement_fresh
+                    else "stale_or_invalid_house_load"
+                )
+            elif (
+                grid_measurement_age_seconds is None
+                or battery_measurement_age_seconds is None
+                or measurement_skew_seconds is None
+            ):
+                measurement_rejection_reason = "invalid_timestamp"
+            elif (
+                grid_measurement_age_seconds < -2.0
+                or battery_measurement_age_seconds < -2.0
+                or grid_measurement_age_seconds
+                > LIVE_HEADROOM_MAX_MEASUREMENT_AGE_SECONDS
+                or battery_measurement_age_seconds
+                > LIVE_HEADROOM_MAX_MEASUREMENT_AGE_SECONDS
+            ):
+                measurement_rejection_reason = "stale_or_future"
+            elif (
+                measurement_skew_seconds
+                > LIVE_HEADROOM_MAX_MEASUREMENT_SKEW_SECONDS
+            ):
+                measurement_rejection_reason = "timestamp_skew"
+            else:
+                measurement_rejection_reason = "incoherent"
 
-    if surplus_energy <= 0 or battery_energy <= battery_export_floor:
+        # Debounce the health signal before anything actuates on it.  A single
+        # skewed sample is normal sensor jitter (see the gate comment above),
+        # so the hold engages after two consecutive bad cycles and releases
+        # after two consecutive good ones.  Everything downstream, including
+        # the headroom mode and the tail hold, uses the debounced signal.
+        # A missing persisted entity makes get() log an error line, so check
+        # at most once per load; a reload resets the flag and re-checks.
+        if not prev_telemetry_hold_active and not prev_telemetry_hold_boot_checked:
+            prev_telemetry_hold_boot_checked = True
+            persisted_hold_limit = get(
+                "pyscript.telemetry_hold_discharge_limit", ""
+            )
+            if persisted_hold_limit not in ("", None, "unknown", "unavailable"):
+                try:
+                    prev_discharge_limit_before_hold = float(persisted_hold_limit)
+                except (TypeError, ValueError):
+                    prev_discharge_limit_before_hold = None
+                    state.set(  # noqa: F821 - provided by the Pyscript runtime
+                        "pyscript.telemetry_hold_discharge_limit",
+                        "",
+                    )
+                else:
+                    prev_telemetry_hold_active = True
+                    log.warning(
+                        "Resuming telemetry hold after restart; battery "
+                        "discharge stays disabled until fresh measurements arrive"
+                    )
+        if measurements_available:
+            prev_telemetry_good_streak += 1
+            prev_telemetry_bad_streak = 0
+        else:
+            prev_telemetry_bad_streak += 1
+            prev_telemetry_good_streak = 0
+        if not prev_telemetry_hold_active and prev_telemetry_bad_streak >= 2:
+            held_setpoint = (
+                f"{prev_applied_grid_target_w} W"
+                if prev_applied_grid_target_w is not None
+                else "unknown"
+            )
+            prev_discharge_limit_before_hold = get(Battery.discharge_limit, -1)
+            # Persist the pre-hold limit outside volatile globals: a reload
+            # between entry and recovery must not strand a 0 limit with no
+            # owner left to restore it.
+            state.set(  # noqa: F821 - provided by the Pyscript runtime
+                "pyscript.telemetry_hold_discharge_limit",
+                str(prev_discharge_limit_before_hold),
+            )
+            if prev_discharge_limit_before_hold != 0:
+                set_state(Battery.discharge_limit, 0)
+            log.warning(
+                f"Power telemetry {measurement_rejection_reason}: holding last "
+                f"grid setpoint ({held_setpoint}), battery discharge disabled"
+            )
+            prev_telemetry_hold_active = True
+        elif prev_telemetry_hold_active and prev_telemetry_good_streak >= 2:
+            restored_limit = prev_discharge_limit_before_hold
+            prev_telemetry_hold_active = False
+            prev_discharge_limit_before_hold = None
+            # Restore the input before clearing the latch (engage does the
+            # reverse: latch first, then park at 0).  Either order leaves no
+            # window where the planner sees a hold-owned 0 with no latch to
+            # explain it, so get_planned_discharge_limit_w stays race-free.
+            current_limit = get(Battery.discharge_limit, -1)
+            if current_limit == 0 and restored_limit not in (None, 0):
+                set_state(Battery.discharge_limit, restored_limit)
+                log.warning(
+                    "Power telemetry recovered, "
+                    f"battery discharge limit restored to {restored_limit}"
+                )
+            elif current_limit == 0:
+                log.warning(
+                    "Power telemetry recovered, discharge limit already "
+                    "disabled before hold, nothing to restore"
+                )
+            else:
+                log.warning(
+                    "Power telemetry recovered, discharge limit changed "
+                    "externally during hold, leaving as-is"
+                )
+            state.set(  # noqa: F821 - provided by the Pyscript runtime
+                "pyscript.telemetry_hold_discharge_limit",
+                "",
+            )
+        measurements_available = not prev_telemetry_hold_active
+
+        if not measurements_available:
+            live_headroom_mode = "measurements_unavailable"
+        else:
+            measured_grid_power_w = float(measured_grid_power_kw) * 1000.0
+            measured_battery_power_w = float(measured_battery_power_kw) * 1000.0
+            time_to_full_minutes = calculate_time_to_full_minutes(
+                battery_free_capacity_kwh=battery_free_capacity_kwh,
+                battery_charge_power_w=measured_battery_power_w,
+                charge_efficiency=HOME_BATTERY_CHARGE_EFFICIENCY,
+            )
+        preferred_pv_export_w = get(
+            Grid.max_pv_feedin_target,
+            planned_max_grid_export_w,
+        )
+
+        # First calculate the instantaneous request without an existing hold,
+        # then update the latch and apply its retained target.  Separating the
+        # two prevents the held value from masquerading as fresh PV risk.
+        if measurements_available:
+            live_headroom_probe = calculate_live_headroom_control(
+                measured_grid_power_w=measured_grid_power_w,
+                measured_battery_power_w=measured_battery_power_w,
+                battery_free_capacity_kwh=battery_free_capacity_kwh,
+                held_headroom_target_kwh=0.0,
+                preferred_pv_export_w=preferred_pv_export_w,
+                planned_grid_export_cap_w=planned_max_grid_export_w,
+                neutral_grid_target_w=max_setpoint,
+                max_battery_charge_w=max_battery_charge_power_w,
+                max_battery_discharge_w=max_battery_discharge_power_w,
+                risk_horizon_minutes=LIVE_HEADROOM_RISK_HORIZON_MINUTES,
+                base_headroom_kwh=LIVE_HEADROOM_BASE_KWH,
+                maximum_headroom_kwh=LIVE_HEADROOM_MAX_KWH,
+                tracking_margin_w=LIVE_HEADROOM_TRACKING_MARGIN_W,
+                discharge_efficiency=HOME_BATTERY_DISCHARGE_EFFICIENCY,
+            )
+            live_headroom_state = update_live_headroom_state(
+                current_time=current_time,
+                previous_active=live_headroom_active,
+                previous_target_headroom_kwh=live_headroom_target_kwh,
+                previous_hold_until=live_headroom_hold_until,
+                requested_headroom_kwh=live_headroom_probe.requested_headroom_kwh,
+                battery_free_capacity_kwh=battery_free_capacity_kwh,
+                natural_export_w=live_headroom_probe.natural_export_w,
+                preferred_pv_export_w=preferred_pv_export_w,
+                hold_minutes=LIVE_HEADROOM_HOLD_MINUTES,
+                activation_buffer_kwh=LIVE_HEADROOM_ACTIVATION_BUFFER_KWH,
+                release_hysteresis_w=LIVE_HEADROOM_RELEASE_HYSTERESIS_W,
+                time_to_full_minutes=time_to_full_minutes,
+                activation_lead_time_minutes=LIVE_HEADROOM_ACTIVATION_LEAD_TIME_MINUTES,
+            )
+            live_headroom_active = live_headroom_state.active
+            live_headroom_target_kwh = live_headroom_state.target_headroom_kwh
+            live_headroom_hold_until = live_headroom_state.hold_until
+
+            live_headroom_decision = calculate_live_headroom_control(
+                measured_grid_power_w=measured_grid_power_w,
+                measured_battery_power_w=measured_battery_power_w,
+                battery_free_capacity_kwh=battery_free_capacity_kwh,
+                held_headroom_target_kwh=live_headroom_target_kwh,
+                preferred_pv_export_w=preferred_pv_export_w,
+                planned_grid_export_cap_w=planned_max_grid_export_w,
+                neutral_grid_target_w=max_setpoint,
+                max_battery_charge_w=max_battery_charge_power_w,
+                max_battery_discharge_w=max_battery_discharge_power_w,
+                risk_horizon_minutes=LIVE_HEADROOM_RISK_HORIZON_MINUTES,
+                base_headroom_kwh=LIVE_HEADROOM_BASE_KWH,
+                maximum_headroom_kwh=LIVE_HEADROOM_MAX_KWH,
+                tracking_margin_w=LIVE_HEADROOM_TRACKING_MARGIN_W,
+                discharge_efficiency=HOME_BATTERY_DISCHARGE_EFFICIENCY,
+            )
+
+            if live_headroom_active:
+                if live_headroom_decision.headroom_deficit_kwh <= 0.01:
+                    live_headroom_mode = "hold_headroom"
+                elif live_headroom_decision.can_create_headroom:
+                    live_headroom_mode = "create_headroom"
+                else:
+                    live_headroom_mode = "hold_only_at_cap"
+                current_applied_setpoint_w = get(
+                    Grid.power_setpoint,
+                    setpoint,
+                )
+                limited_safety_target_w = limit_target_step(
+                    live_headroom_decision.desired_grid_target_w,
+                    current_applied_setpoint_w,
+                    max_step_w=LIVE_HEADROOM_MAX_TARGET_STEP_W,
+                )
+                setpoint = min(
+                    setpoint,
+                    limited_safety_target_w,
+                )
+                msg += (
+                    f" live safety {live_headroom_mode}: target "
+                    f"{live_headroom_target_kwh:.3f} kWh, free "
+                    f"{battery_free_capacity_kwh:.3f} kWh, natural export "
+                    f"{live_headroom_decision.natural_export_w:.0f} W, grid target "
+                    f"{live_headroom_decision.desired_grid_target_w:.0f} W"
+                )
+            else:
+                live_headroom_mode = "normal"
+    else:
+        live_headroom_active = False
+        live_headroom_target_kwh = 0.0
+        live_headroom_hold_until = None
+
+    setpoint = select_finite_grid_target(
+        candidate_grid_target_w=setpoint,
+        fallback_grid_target_w=LIVE_TELEMETRY_FAILSAFE_IMPORT_TARGET_W,
+    )
+    if setpoint is None:
+        return
+
+    export_budget_energy_kwh = surplus_energy
+    live_export_budget = None
+    export_budget_ledger = None
+    if unified_scheduler_active:
+        published_safe_export_energy_kwh = get_attr(
+            Grid.power_setpoint_target,
+            "safe_export_energy_kwh",
+            0.0,
+        )
+        safe_export_source_battery_kwh = get_attr(
+            Grid.power_setpoint_target,
+            "safe_export_source_battery_kwh",
+            None,
+        )
+        safe_export_calculated_at = parse_aware_datetime(
+            get_attr(
+                Grid.power_setpoint_target,
+                "safe_export_calculated_at",
+                None,
+            )
+        )
+        live_export_budget = get_fresh_export_policy_budget(
+            base_spendable_energy_kwh=published_safe_export_energy_kwh,
+            ev_adjusted_spendable_energy_kwh=published_safe_export_energy_kwh,
+            source_battery_energy_kwh=safe_export_source_battery_kwh,
+            current_battery_energy_kwh=battery_energy,
+            calculated_at=safe_export_calculated_at,
+            current_time=current_control_time,
+            max_age_seconds=LIVE_EXPORT_BUDGET_HORIZON_SECONDS,
+            discharge_efficiency=HOME_BATTERY_DISCHARGE_EFFICIENCY,
+        )
+        export_budget_energy_kwh = (
+            live_export_budget.ev_adjusted_spendable_energy_kwh
+        )
+        export_policy_snapshot_id = (
+            export_policy_calculated_at.isoformat()
+            if export_policy_calculated_at is not None
+            else ""
+        )
+        export_budget_ledger = update_monotonic_export_budget_ledger(
+            snapshot_id=export_policy_snapshot_id,
+            candidate_remaining_kwh=export_budget_energy_kwh,
+            previous_state=get("pyscript.export_policy_budget_ledger", ""),
+            current_time=current_control_time,
+            battery_discharge_power_w=(
+                max(0.0, -measured_battery_power_w)
+                if measurements_available
+                else 0.0
+            ),
+            measurements_available=measurements_available,
+        )
+        if export_budget_ledger.state_value:
+            state.set(  # noqa: F821 - provided by the Pyscript runtime
+                "pyscript.export_policy_budget_ledger",
+                export_budget_ledger.state_value,
+            )
+        if (
+            export_budget_ledger.valid
+            and export_policy_fresh
+            and live_export_budget.valid
+        ):
+            export_budget_energy_kwh = min(
+                export_budget_energy_kwh,
+                export_budget_ledger.remaining_kwh,
+            )
+        else:
+            export_budget_energy_kwh = 0.0
+        # Stale house-loads or PV readings must not veto the export budget.
+        # Loads are an unsynchronized residual that swings negative on fast
+        # grid ramps; PV sleeps for minutes at night on a flat zero. Vetoing
+        # on either turns benign sensor naps into a self-sustaining limit
+        # cycle (full export -> stale/invalid sample -> slam to PV-only ->
+        # repeat). Both inputs already fail safe in the value path above
+        # (loads ride on the last good value, PV falls back to zero), so the
+        # veto adds no safety, only oscillation. Export safety rests on
+        # grid/battery coherence plus the live battery floor below, both
+        # still enforced.
+        if (
+            optional_export_ev_plan_hold
+            or not measurements_available
+            or not battery_energy_values_valid
+            or not battery_energy_measurement_fresh
+            or not export_policy_fresh
+            or not live_export_budget.valid
+            or not export_budget_ledger.valid
+        ):
+            export_budget_energy_kwh = 0.0
+        budget_limited_setpoint = limit_live_export_target_to_budget(
+            desired_grid_target_w=setpoint,
+            pv_only_grid_target_w=pv_only_setpoint,
+            safe_export_energy_kwh=export_budget_energy_kwh,
+            budget_horizon_seconds=LIVE_EXPORT_BUDGET_HORIZON_SECONDS,
+            max_battery_discharge_w=max_battery_discharge_power_w,
+        )
+        if budget_limited_setpoint > setpoint:
+            msg += (
+                f" budget-capped setpoint from {setpoint:.0f} to "
+                f"{budget_limited_setpoint:.0f}; safe export budget "
+                f"{export_budget_energy_kwh:.3f} kWh, measurements "
+                f"coherent={measurements_available}"
+            )
+            setpoint = budget_limited_setpoint
+
+    if (
+        export_budget_energy_kwh < LIVE_EXPORT_BUDGET_RELEASE_KWH
+        or not battery_energy_values_valid
+        or not battery_energy_measurement_fresh
+        or battery_energy <= battery_export_floor
+    ):
         if setpoint < pv_only_setpoint:
             msg += (
-                f" capped setpoint from {setpoint:.0f} to {pv_only_setpoint:.0f}; "
-                f"surplus {surplus_energy:.2f} kWh, battery {battery_energy:.2f} kWh, "
+                f" capped setpoint from {setpoint:.0f} to "
+                f"{pv_only_setpoint:.0f}; "
+                f"export budget {export_budget_energy_kwh:.2f} kWh, "
+                f"battery {battery_energy:.2f} kWh, "
                 f"protected floor {battery_export_floor:.2f} kWh"
             )
             setpoint = pv_only_setpoint
 
+    publish_live_headroom = live_headroom_mode != prev_live_headroom_mode
+    if last_live_headroom_publish is None:
+        publish_live_headroom = True
+    elif (now() - last_live_headroom_publish).total_seconds() >= LIVE_HEADROOM_PUBLISH_INTERVAL_SECONDS:
+        publish_live_headroom = True
+    if publish_live_headroom:
+        natural_export_w = 0.0
+        requested_headroom_kwh = 0.0
+        headroom_deficit_kwh = 0.0
+        available_export_margin_w = 0.0
+        safety_grid_target_w = None
+        can_create_headroom = False
+        if live_headroom_decision is not None:
+            natural_export_w = live_headroom_decision.natural_export_w
+            requested_headroom_kwh = live_headroom_decision.requested_headroom_kwh
+            headroom_deficit_kwh = live_headroom_decision.headroom_deficit_kwh
+            available_export_margin_w = live_headroom_decision.available_export_margin_w
+            safety_grid_target_w = live_headroom_decision.desired_grid_target_w
+            can_create_headroom = live_headroom_decision.can_create_headroom
+        set_state(
+            "sensor.grid_export_safety",
+            live_headroom_mode,
+            friendly_name="Grid Export Safety",
+            active=live_headroom_active,
+            target_headroom_kwh=round(live_headroom_target_kwh, 3),
+            requested_headroom_kwh=round(requested_headroom_kwh, 3),
+            battery_free_capacity_kwh=round(battery_free_capacity_kwh, 3),
+            headroom_deficit_kwh=round(headroom_deficit_kwh, 3),
+            natural_export_w=round(natural_export_w),
+            available_export_margin_w=round(available_export_margin_w),
+            time_to_full_minutes=(
+                round(time_to_full_minutes, 1)
+                if time_to_full_minutes is not None
+                else None
+            ),
+            measurement_skew_seconds=(
+                round(measurement_skew_seconds, 2)
+                if measurement_skew_seconds is not None
+                else None
+            ),
+            grid_measurement_age_seconds=(
+                round(grid_measurement_age_seconds, 2)
+                if grid_measurement_age_seconds is not None
+                else None
+            ),
+            battery_measurement_age_seconds=(
+                round(battery_measurement_age_seconds, 2)
+                if battery_measurement_age_seconds is not None
+                else None
+            ),
+            battery_energy_measurement_age_seconds=(
+                round(battery_energy_measurement_age_seconds, 2)
+                if battery_energy_measurement_age_seconds is not None
+                else None
+            ),
+            battery_energy_measurement_fresh=battery_energy_measurement_fresh,
+            house_load_measurement_age_seconds=(
+                round(house_load_measurement_age_seconds, 2)
+                if house_load_measurement_age_seconds is not None
+                else None
+            ),
+            house_load_measurement_fresh=house_load_measurement_fresh,
+            pv_measurement_age_seconds=(
+                round(pv_measurement_age_seconds, 2)
+                if pv_measurement_age_seconds is not None
+                else None
+            ),
+            pv_measurement_fresh=pv_power_measurement_fresh,
+            max_battery_charge_power_w=round(max_battery_charge_power_w),
+            max_battery_discharge_power_w=round(max_battery_discharge_power_w),
+            remaining_export_budget_kwh=round(export_budget_energy_kwh, 3),
+            live_export_budget_valid=(
+                live_export_budget.valid
+                if live_export_budget is not None
+                else False
+            ),
+            live_export_budget_reason=(
+                live_export_budget.reason
+                if live_export_budget is not None
+                else "not_applicable"
+            ),
+            live_export_budget_age_seconds=(
+                round(live_export_budget.source_age_seconds, 2)
+                if live_export_budget is not None
+                and live_export_budget.source_age_seconds is not None
+                else None
+            ),
+            live_export_budget_battery_draw_kwh=(
+                round(live_export_budget.battery_draw_since_calculation_kwh, 3)
+                if live_export_budget is not None
+                else 0.0
+            ),
+            export_budget_ledger_valid=(
+                export_budget_ledger.valid
+                if export_budget_ledger is not None
+                else False
+            ),
+            export_budget_ledger_reason=(
+                export_budget_ledger.reason
+                if export_budget_ledger is not None
+                else "not_applicable"
+            ),
+            export_budget_ledger_remaining_kwh=(
+                round(export_budget_ledger.remaining_kwh, 3)
+                if export_budget_ledger is not None
+                else 0.0
+            ),
+            measurement_rejection_reason=measurement_rejection_reason,
+            safety_grid_target_w=(
+                round(safety_grid_target_w)
+                if safety_grid_target_w is not None
+                else None
+            ),
+            applied_grid_target_w=round(setpoint),
+            can_create_headroom=can_create_headroom,
+            hold_until=(
+                live_headroom_hold_until.isoformat()
+                if live_headroom_hold_until is not None
+                else None
+            ),
+        )
+        if live_headroom_mode != prev_live_headroom_mode:
+            log.warning(
+                f"Grid export safety changed from {prev_live_headroom_mode} "
+                f"to {live_headroom_mode}: active={live_headroom_active}, "
+                f"target={live_headroom_target_kwh:.3f} kWh, "
+                f"free={battery_free_capacity_kwh:.3f} kWh, "
+                f"natural export={natural_export_w:.0f} W, "
+                f"applied target={setpoint:.0f} W"
+            )
+        prev_live_headroom_mode = live_headroom_mode
+        last_live_headroom_publish = now()
+
+    # Debounced stale-telemetry hold (see above): leave the last applied
+    # setpoint untouched instead of pinning a blind fallback.  Discharge
+    # handling already ran with the debounce transition.
+    if not measurements_available:
+        return
+
     if logging:
         log.warning(msg)
 
-    set_state(Grid.power_setpoint, round(setpoint))
+    setpoint = select_finite_grid_target(
+        candidate_grid_target_w=setpoint,
+        fallback_grid_target_w=LIVE_TELEMETRY_FAILSAFE_IMPORT_TARGET_W,
+    )
+    if setpoint is None:
+        return
+    applied_setpoint_w = round(setpoint)
+    if applied_setpoint_w != prev_applied_grid_target_w:
+        previous_setpoint = (
+            f"{prev_applied_grid_target_w} W"
+            if prev_applied_grid_target_w is not None
+            else "unknown"
+        )
+        log.warning(
+            f"Applied grid setpoint {applied_setpoint_w} W (was {previous_setpoint}); "
+            f"rejection={measurement_rejection_reason}"
+            + (f"; {msg}" if msg else "")
+        )
+        prev_applied_grid_target_w = applied_setpoint_w
+    set_state(Grid.power_setpoint, applied_setpoint_w)

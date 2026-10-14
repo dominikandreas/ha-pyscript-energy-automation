@@ -61,6 +61,22 @@ class OutputStateRegistryTests(unittest.TestCase):
         self.assertEqual(definition["max"], 5500)
         self.assertEqual(definition["step"], 1)
 
+    def test_write_output_states_strips_mode_from_template_sensors(self):
+        write_fn = next(
+            node
+            for node in self.utils_tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "write_output_states"
+        )
+        popped_keys = {
+            elt.value
+            for node in ast.walk(write_fn)
+            if isinstance(node, ast.Tuple)
+            for elt in node.elts
+            if isinstance(elt, ast.Constant)
+        }
+
+        self.assertIn("mode", popped_keys)
+
     def test_new_input_number_without_bounds_is_rejected(self):
         registry_class = self._load_registry_schema_methods()
         registry = registry_class.__new__(registry_class)

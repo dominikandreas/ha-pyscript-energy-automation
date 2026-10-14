@@ -15,15 +15,6 @@ else:
 
     from victron import Victron
 
-# Mapping between mode names and MQTT payloads
-# MODE_TO_PAYLOAD = {
-#     "Off": "4",
-#     "Inverter only": "2",
-#     "Charger only": "1",
-#     "On": "3",
-# }
-
-
 power_kw_attributes = {
     "unit_of_measurement": "kW",
     "device_class": "power",

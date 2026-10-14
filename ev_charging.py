@@ -16,6 +16,8 @@ if TYPE_CHECKING:
         calculate_ev_battery_support_power,
         get_drive_required_soc,
         get_ongoing_and_next_drive,
+        is_arrival_precharge_allowed,
+        parse_ev_schedule_entries,
     )
 
     # These are provided by typescript and do not need to be imported in the actual script
@@ -32,7 +34,12 @@ if TYPE_CHECKING:
         set_state,
         pyscript_compile,
     )
-    from modules.energy_core import _get_ev_smart_charge_limit, _get_ev_energy_needed, _get_charge_action  # noqa: F401
+    from modules.energy_core import (  # noqa: F401
+        _get_ev_smart_charge_limit,
+        _get_ev_energy_needed,
+        _get_charge_action,
+        get_ev_charge_feedback_state,
+    )
 
     from modules.states import Automation, Charger, ElectricityPrices, EV, Excess, Battery, House, PVProduction
     from modules.victron import Victron
@@ -50,7 +57,10 @@ else:
         _get_ev_smart_charge_limit,
         calculate_ev_battery_support_power,
         get_drive_required_soc,
+        get_ev_charge_feedback_state,
         get_ongoing_and_next_drive,
+        is_arrival_precharge_allowed,
+        parse_ev_schedule_entries,
     )  # noqa: F401
     from victron import Victron
 
@@ -86,6 +96,9 @@ pv_surplus_started_at = now() if pv_surplus_active else None
 pv_surplus_start_candidate_since = None
 pv_surplus_stop_candidate_since = None
 last_pv_surplus_stop = now() - PV_SURPLUS_RESTART_LOCKOUT
+last_ev_action = None
+last_ev_mode = None
+last_ev_reason = ""
 
 
 def set_pv_surplus_marker(active: bool):
@@ -321,51 +334,17 @@ EVScheduleEntry = define_interfaces()
 def parse_full_schedule(
     schedule_data: dict[str, list[dict[str, Any]]], default_required_soc: float, t_now=None
 ) -> list["EVScheduleEntry"]:
-    from datetime import datetime
-
-    # Freeze runtime time outside this compiled helper.  Pyscript runtime
-    # helpers such as ``now`` are not safe to resolve from compiled code.
-    if t_now is None:
-        raise ValueError("parse_full_schedule requires t_now")
-    t_now = with_timezone(t_now)
-    today = t_now.date()
-    today_weekday = today.weekday()
-    day_map = {
-        name: i for i, name in enumerate(["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"])
-    }
-
-    entries = []
-    for day_name, events in schedule_data.items():
-        event_weekday = day_map.get(day_name, -1)
-        if event_weekday == -1:
-            continue
-
-        day_offset = (event_weekday - today_weekday + 7) % 7
-        event_date = today + timedelta(days=day_offset)
-
-        for event in events:
-            soc = event.get("data", {}).get("required")
-            distance = event.get("data", {}).get("distance")  # km
-            soc = get_drive_required_soc(soc, distance, default_required_soc)
-
-            event_start = with_timezone(datetime.combine(event_date, event["from"]))
-            event_end = with_timezone(datetime.combine(event_date, event["to"]))
-            if event_end <= event_start:
-                event_end += timedelta(days=1)
-            if event_end <= t_now:
-                event_start += timedelta(days=7)
-                event_end += timedelta(days=7)
-
-            entries.append(
-                EVScheduleEntry(
-                    start=event_start,
-                    end=event_end,
-                    required_soc=float(soc) if soc is not None else None,
-                    distance=float(distance) if distance is not None else None,
-                )
-            )
-
-    return sorted(entries, key=lambda x: x.start)
+    # Shared implementation lives in modules.energy_core so the live EV
+    # charging app and the forecast stay in lockstep.  Freeze runtime time
+    # outside this compiled helper: ``now`` is not safe to resolve from
+    # compiled code.
+    return parse_ev_schedule_entries(
+        schedule_data,
+        default_required_soc,
+        t_now,
+        EVScheduleEntry,
+        False,
+    )
 
 
 def get_ev_schedule(t_now=None):
@@ -502,12 +481,49 @@ async def auto_ev_charging():
     if next_drive:
         next_drive = with_timezone(next_drive)
 
-    # Calculate minimum time needed to charge the vehicle, we subtract 1 to account for charging inefficiencies
-    min_hours_needed = energy_needed / (3 * Const.voltage * (Const.max_current - 1) / 1000)  # in hours
+    hours_available_to_charge = ((next_drive - t_now).total_seconds() / 3600) if next_drive else 999
 
     # these are binary sensors defined separately that indicate whether the price is relatively low or high
     low_price = get(ElectricityPrices.low_price, False)
     high_price = get(ElectricityPrices.high_price, False)
+    # Recovered rule: don't fund precharge from the home battery when the
+    # next drive leaves enough time to catch tomorrow's solar surplus.
+    # Precharge is a low-price top-up only: at the day rate it self-sustains
+    # on wallbox feedback and imports for hours (2026-10-01 incident).
+    arrival_precharge_allowed = is_arrival_precharge_allowed(
+        get(EV.able_to_charge_on_arrival, False),
+        next_drive,
+        ongoing,
+        current_soc,
+        ev_charge_limit,
+        hours_available_to_charge,
+        battery_soc,
+        low_price,
+    )
+    precharge_energy_needed = (
+        max(0.0, (ev_charge_limit - current_soc) / 100 * Const.ev_capacity)
+        if arrival_precharge_allowed
+        else 0.0
+    )
+    precharge_battery_energy = get(Battery.energy, 0)
+    precharge_battery_capacity = get(Battery.capacity, 0)
+    precharge_available_kwh = max(
+        0.0,
+        precharge_battery_energy
+        - protected_battery_floor_kwh
+        - 1.0,
+    )
+    precharge_battery_support_power = (
+        min(3000.0, precharge_available_kwh * 1000.0)
+        if arrival_precharge_allowed and precharge_battery_capacity > 0
+        else 0.0
+    )
+    if precharge_battery_support_power > battery_support_power:
+        battery_support_power = precharge_battery_support_power
+
+    # Calculate minimum time needed to charge the vehicle, we subtract 1 to account for charging inefficiencies
+    min_hours_needed = energy_needed / (3 * Const.voltage * (Const.max_current - 1) / 1000)  # in hours
+
     t_now = now()
 
     log.warning(
@@ -550,9 +566,12 @@ async def auto_ev_charging():
         wallbox_power=wallbox_power,
         battery_floor_soc=battery_floor_soc,
         battery_support_power=battery_support_power,
+        allow_battery_precharge=arrival_precharge_allowed,
+        precharge_energy_needed=precharge_energy_needed,
     )
 
-    hours_available_to_charge = ((next_drive - t_now).total_seconds() / 3600) if next_drive else 999
+    global last_ev_action, last_ev_mode, last_ev_reason
+    last_ev_action, last_ev_mode, last_ev_reason = action, charge_mode, reason
 
     log.warning(f"Got charge action: {action} mode {charge_mode} phases {phases} current {current}: {reason}")
 
@@ -657,3 +676,51 @@ async def auto_ev_charging():
         pv_surplus_stop_candidate_since = None
     else:
         log.warning(f"Skipping unknown action: {action}")
+
+
+@time_trigger
+@time_trigger("period(now, 30sec)")
+def publish_ev_charge_feedback():
+    """Publish dashboard feedback for the EV surplus-timing state machine.
+
+    Runs independently of the charge controller so the dashboard also shows
+    "off" (with a cleared reason) while the controller gate is inactive.
+    """
+
+    force_active = get(Charger.force_charge, False)
+    is_charging = get(Charger.control_switch, False)
+    controller_active = (
+        not force_active
+        and get(Automation.auto_ev_charging, False)
+        and (get(Charger.ready, False) or is_charging)
+    )
+    state, remaining = get_ev_charge_feedback_state(
+        controller_active,
+        last_ev_action,
+        is_charging,
+        pv_surplus_start_candidate_since,
+        pv_surplus_stop_candidate_since,
+        last_pv_surplus_stop,
+        pv_surplus_started_at,
+        now(),
+        start_confirmation_minutes=PV_SURPLUS_START_CONFIRMATION.total_seconds() / 60,
+        stop_confirmation_minutes=PV_SURPLUS_STOP_CONFIRMATION.total_seconds() / 60,
+        min_run_minutes=PV_SURPLUS_MIN_RUN_TIME.total_seconds() / 60,
+        restart_lockout_minutes=PV_SURPLUS_RESTART_LOCKOUT.total_seconds() / 60,
+        force_active=force_active,
+    )
+    if controller_active or (force_active and is_charging):
+        mode = last_ev_mode or ChargeMode.idle
+        reason = last_ev_reason or ""
+    else:
+        mode = ChargeMode.idle
+        reason = ""
+    set_state(
+        EV.charge_state,
+        state,
+        friendly_name="EV charge state",
+        icon="mdi:ev-charger",
+        mode=mode,
+        reason=reason,
+        countdown_seconds=round(remaining) if remaining is not None else None,
+    )

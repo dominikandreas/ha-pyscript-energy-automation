@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 from datetime import datetime
+from math import isfinite
 
 
 PV_FEEDIN_PEAK_TOLERANCE_W = 50.0
@@ -283,3 +284,125 @@ def limit_target_step(desired_w: float, previous_w: float, max_step_w: float = M
     if max_step_w <= 0:
         raise ValueError("max_step_w must be positive")
     return max(previous_w - max_step_w, min(previous_w + max_step_w, desired_w))
+
+
+def build_silent_charge_shaping_schedule(
+    surplus_slots: list[tuple[str, float, float, float]],
+    silent_power_w: float = 3500.0,
+    surplus_margin_w: float = 500.0,
+) -> dict[str, float]:
+    """Export PV surplus above the silent charge power, with a margin band.
+
+    Each slot is ``(period_key, pv_power_w, house_power_w,
+    ev_charge_power_w)``.  Battery charging is capped at ``silent_power_w``
+    only once shareable surplus (PV minus house and EV) exceeds the cap plus
+    ``surplus_margin_w``; inside the margin band the battery takes everything
+    so a few hundred watts are not pointlessly exported.  Returns per-slot
+    grid-export power for slots that need shaping.
+    """
+
+    try:
+        silent_power_w = float(silent_power_w)
+        surplus_margin_w = float(surplus_margin_w)
+    except (TypeError, ValueError, OverflowError):
+        return {}
+    if not isfinite(silent_power_w) or not isfinite(surplus_margin_w):
+        return {}
+    silent_power_w = max(0.0, silent_power_w)
+    surplus_margin_w = max(0.0, surplus_margin_w)
+    schedule = {}
+    for entry in surplus_slots:
+        try:
+            period_key, pv_power_w, house_power_w, ev_charge_power_w = entry
+            shareable_w = (
+                float(pv_power_w) - float(house_power_w) - float(ev_charge_power_w)
+            )
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if not isfinite(shareable_w):
+            continue
+        if shareable_w > silent_power_w + surplus_margin_w:
+            schedule[str(period_key)] = shareable_w - silent_power_w
+    return schedule
+
+
+def apply_silent_mode_grid_limits(
+    desired_grid_target_w: float,
+    pv_power_w: float,
+    house_load_w: float,
+    ev_charge_power_w: float,
+    max_grid_export_w: float,
+    silent_power_w: float = 3500.0,
+    surplus_margin_w: float = 500.0,
+) -> float:
+    """Clamp a live grid target so battery/grid flows stay quiet.
+
+    Sign convention: a negative target exports.  Charging is capped at
+    ``silent_power_w`` once shareable surplus (PV minus house and EV) exceeds
+    the cap plus margin, exporting the excess instead.  Battery-to-grid
+    discharge is capped at ``silent_power_w`` above PV passthrough, while
+    house and EV coverage stay unlimited.  The grid export cap always wins
+    over silence.  Invalid inputs leave the desired target untouched.
+    """
+
+    try:
+        target_w = float(desired_grid_target_w)
+        shareable_w = (
+            float(pv_power_w) - float(house_load_w) - float(ev_charge_power_w)
+        )
+        cap_w = float(max_grid_export_w)
+        silent_w = float(silent_power_w)
+        margin_w = float(surplus_margin_w)
+    except (TypeError, ValueError, OverflowError):
+        return desired_grid_target_w
+    if not (
+        isfinite(target_w)
+        and isfinite(shareable_w)
+        and isfinite(cap_w)
+        and isfinite(silent_w)
+        and isfinite(margin_w)
+    ):
+        return desired_grid_target_w
+    cap_w = max(0.0, cap_w)
+    silent_w = max(0.0, silent_w)
+    margin_w = max(0.0, margin_w)
+    if shareable_w > silent_w + margin_w:
+        target_w = min(target_w, -(shareable_w - silent_w))
+    target_w = max(target_w, -(silent_w + max(0.0, shareable_w)))
+    return max(target_w, -cap_w)
+
+
+def resolve_economic_export_floor(
+    configured_floor: float,
+    feedin_compensation_cap: float,
+    future_import_prices: list,
+) -> float | None:
+    """Gate speculative battery export on realized feed-in profitability.
+
+    The market price ranks spill-driven pre-release slots, but the realized
+    feed-in compensation is capped (a fixed tariff until the dynamic export
+    contract switch).  Selling stored energy only pays when the realized
+    revenue beats the cheapest future rebuy, so economic export is blocked
+    (``None``) unless the cap exceeds the minimum future import price; when
+    allowed, the floor is the higher of the configured floor and that cheapest
+    rebuy.  Invalid inputs fail safe to blocked.  Headroom (unavoidable-spill)
+    export is unaffected: it sells at any price rather than curtailing.
+    """
+
+    try:
+        floor = float(configured_floor)
+        cap = float(feedin_compensation_cap)
+        prices = [float(price) for price in future_import_prices]
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not prices or not isfinite(floor) or not isfinite(cap):
+        return None
+    cheapest_rebuy = None
+    for price in prices:
+        if not isfinite(price):
+            return None
+        if cheapest_rebuy is None or price < cheapest_rebuy:
+            cheapest_rebuy = price
+    if cap <= cheapest_rebuy:
+        return None
+    return max(floor, cheapest_rebuy)
