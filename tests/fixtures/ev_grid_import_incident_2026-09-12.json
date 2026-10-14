@@ -1,0 +1,28 @@
+{
+  "description": "Recorder snapshot of EV grid-import incident",
+  "recorded_at": "2026-09-12T07:24:00+00:00",
+  "charging_started_at": "2026-09-12T07:22:53.307295+00:00",
+  "charging_stopped_at": "2026-09-12T07:24:03.437937+00:00",
+  "measurements": {
+    "wallbox_power_w": 9068.5151963234,
+    "pv_power_w": 2568.4,
+    "grid_power_w": 8308.2,
+    "battery_power_w": 782.031982421875,
+    "battery_energy_kwh": 15.81,
+    "applied_victron_setpoint_w": 7485.0
+  },
+  "policy": {
+    "neutral_grid_target_w": -100.0,
+    "protected_battery_floor_kwh": 2.6,
+    "safe_optional_export_energy_kwh": 11.412,
+    "max_battery_discharge_w": 8000.0,
+    "electricity_price_eur_per_kwh": 0.2875,
+    "min_discharge_price_eur_per_kwh": 0.212
+  },
+  "ev": {
+    "is_charging": true,
+    "energy_kwh": 44.4,
+    "smart_charge_target_kwh": 48.0,
+    "able_to_charge_on_arrival": true
+  }
+}
