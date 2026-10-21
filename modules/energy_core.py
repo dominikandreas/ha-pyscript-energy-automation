@@ -468,6 +468,8 @@ def _get_charge_action(
     battery_support_power: float = 0,
     allow_battery_precharge=False,
     precharge_energy_needed=0,
+    planned_power=None,
+    planned_target_soc=0,
 ):
     """Calculate the action to take for EV charging based on various conditions.
 
@@ -537,6 +539,39 @@ def _get_charge_action(
             f"EV charge limit reached: {current_soc:.0f}% >= {surplus_charge_limit:.0f}%",
             ChargeMode.hard_stop,
         )
+
+    if planned_power is not None:
+        # A plan is an authorization, never a substitute for measured power.
+        # Optional charging cannot add home-battery discharge to PV headroom.
+        # Missing/expired/empty plans pass zero and retain only trip fallback.
+        urgent = (
+            energy_needed > 0
+            and current_soc < required_soc - 1
+            and (hours_available_to_charge < 2 or hours_available_to_charge < min_hours_needed)
+        )
+        if urgent:
+            return (ChargeAction.on, 3, Const.max_current,
+                    "Departure deadline: charging to required SOC", ChargeMode.required)
+        local_power = max(0.0, excess_power + (max(0.0, wallbox_power) if is_charging else 0.0))
+        admitted_power = min(max(0.0, planned_power), local_power)
+        target = min(surplus_charge_limit, planned_target_soc)
+        start_threshold = minimum_charge_power + (0 if is_charging else SURPLUS_START_MARGIN)
+        if current_soc < target and admitted_power >= start_threshold:
+            # Quantize down, including across phase transitions. Never use the
+            # old phase hysteresis to round up beyond physically available PV.
+            phases = 3 if admitted_power >= 3 * Const.voltage * Const.min_current else 1
+            current = min(Const.max_current, int(admitted_power // (Const.voltage * phases)))
+            return (ChargeAction.on, phases, current,
+                    f"Forecast-approved PV charge to {target:.1f}%: {admitted_power:.0f} W available",
+                    ChargeMode.surplus)
+        if energy_needed > 0 and is_low_price and hours_available_to_charge < 14:
+            return (ChargeAction.on, 3, Const.max_current,
+                    "Required trip charge in low-price window", ChargeMode.required)
+        # A withdrawn authorization or inadequate measured PV is not a cloud
+        # deficit that may be financed from grid during a minimum-run timer.
+        return (ChargeAction.off, 1, Const.min_current,
+                "Waiting for forecast-approved PV or required departure charge",
+                ChargeMode.hard_stop)
 
     if (
         allow_battery_precharge
@@ -743,6 +778,8 @@ def get_settled_simulated_ev_charge_action(
     allow_battery_precharge=False,
     precharge_energy_needed=0,
     max_control_steps=10,
+    planned_power=None,
+    planned_target_soc=0,
 ):
     """Settle minute-rate EV control inside one forecast interval.
 
@@ -790,9 +827,11 @@ def get_settled_simulated_ev_charge_action(
             battery_support_power=battery_support_power,
             allow_battery_precharge=allow_battery_precharge,
             precharge_energy_needed=precharge_energy_needed,
+            planned_power=planned_power,
+            planned_target_soc=planned_target_soc,
         )
         next_is_charging = action == ChargeAction.on
-        if new_phases != phases:
+        if new_phases != phases and planned_power is None:
             new_current = 8 if new_phases == 1 else 6
         next_state = (next_is_charging, new_phases, new_current)
         is_charging, phases, current = next_state

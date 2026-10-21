@@ -2010,7 +2010,7 @@ class SetpointControlTests(unittest.TestCase):
             node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "forecast_surplus"
         )
         forecast_calls = _expanded_forecast_keywords(forecast_surplus_node)
-        self.assertEqual(len(forecast_calls), 4)
+        self.assertEqual(len(forecast_calls), 5)
         for keywords in forecast_calls:
             published_limit = keywords.get("max_battery_power_target")
             self.assertIsInstance(published_limit, ast.Name)
@@ -2286,7 +2286,13 @@ class SetpointControlTests(unittest.TestCase):
             enforce_battery_floor=False,
         )
 
-        self.assertEqual(enforced_ev_mode, namespace["InverterMode"].on)
+        # 2026-10-21 incident: even with floor enforcement, headroom above
+        # the planned floor must not fund EV charging at low prices once the
+        # post-obligation surplus is gone (surplus -5 here); the grid funds
+        # the required charge and the battery holds its floor for the house.
+        # (Genuine-surplus and high-price cases still stay on; see
+        # test_required_night_ev_charge_comes_from_grid.)
+        self.assertEqual(enforced_ev_mode, namespace["InverterMode"].off)
         self.assertEqual(normal_ev_mode, namespace["InverterMode"].off)
 
         energy_tree = ast.parse(Path(__file__).parents[1].joinpath("energy.py").read_text())
@@ -2437,6 +2443,156 @@ class SetpointControlTests(unittest.TestCase):
         )
         self.assertEqual(empty_low_dark_mode, modes.off)
 
+    def test_required_night_ev_charge_comes_from_grid(self):
+        # 2026-10-21 incident: required trip charge 00:01-00:33 at the 0.1775
+        # night rate drained the house battery 21.7 -> 16.8 kWh even though
+        # the EV-adjusted surplus was 0.00.  The inverter must block battery
+        # discharge then so the grid funds the charge; only genuine surplus
+        # (or high prices) may keep it on.
+        victron_source = (
+            Path(__file__).parents[1].joinpath("modules/victron.py").read_text()
+        )
+        victron_tree = ast.parse(victron_source)
+        selected = [
+            node
+            for node in victron_tree.body
+            if (isinstance(node, ast.ClassDef) and node.name == "InverterMode")
+            or (
+                isinstance(node, ast.FunctionDef)
+                and node.name == "get_auto_inverter_mode"
+            )
+        ]
+        for node in selected:
+            if isinstance(node, ast.FunctionDef):
+                node.decorator_list = []
+        namespace = {}
+        exec(
+            compile(
+                ast.fix_missing_locations(
+                    ast.Module(body=selected, type_ignores=[])
+                ),
+                "victron.py",
+                "exec",
+            ),
+            namespace,
+        )
+        decide = namespace["get_auto_inverter_mode"]
+        modes = namespace["InverterMode"]
+        night = dict(
+            ev_is_charging=True,
+            surplus_energy=0.0,
+            battery_headroom_energy=15.4,
+            pv_power=0.0,
+            daily_avg_power=722.0,
+            battery_soc=67.0,
+            target_soc=5.0,
+            electricity_price=0.1775,
+            min_discharge_price=0.0,
+            max_charge_price=0.0,
+            charge_limit_percent=75.0,
+            force_charge_switch=False,
+            t_now=datetime(2026, 10, 21, 0, 1, tzinfo=timezone.utc),
+            enforce_battery_floor=True,
+            is_low_price=True,
+        )
+        night_mode, _, _, night_reason = decide(**night)
+        self.assertEqual(night_mode, modes.off)
+        self.assertIn("without PV power", night_reason)
+        # Genuine surplus still authorizes battery support at low prices.
+        surplus_mode, _, _, _ = decide(**{**night, "surplus_energy": 2.0})
+        self.assertEqual(surplus_mode, modes.on)
+        # At high prices the battery still funds the charge instead of
+        # importing at the day rate.
+        high_mode, _, _, _ = decide(
+            **{**night, "is_low_price": False, "electricity_price": 0.2875}
+        )
+        self.assertEqual(high_mode, modes.on)
+
+        # The caller must feed the post-obligation budget while the EV draws
+        # current; the plain surplus ignores the running session.
+        energy_source = Path(__file__).parents[1].joinpath("energy.py").read_text()
+        energy_tree = ast.parse(energy_source)
+        auto_node = next(
+            node
+            for node in energy_tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "auto_victron_set_inverter_mode"
+        )
+        budgeted = [
+            node
+            for node in ast.walk(auto_node)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "min"
+            and any(
+                isinstance(child, ast.Attribute)
+                and child.attr == "energy_surplus_after_ev_charging"
+                for child in ast.walk(node)
+            )
+        ]
+        self.assertEqual(len(budgeted), 1)
+
+    def test_surplus_floor_reserves_prediction_error_headroom(self):
+        # Optional-load budgets must not spend the battery to a literally
+        # empty trough: the forecast misses on both house demand and PV.
+        # The margin only narrows the surplus floor; the operational and
+        # forecast floors keep the deplete-until-empty behavior above.
+        source = Path(__file__).parents[1].joinpath("energy.py").read_text()
+        tree = ast.parse(source)
+        fraction = next(
+            node.value.value
+            for node in tree.body
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name)
+                and target.id == "SURPLUS_HEADROOM_RESERVE_FRACTION"
+                for target in node.targets
+            )
+        )
+        self.assertGreater(fraction, 0)
+        self.assertLessEqual(fraction, 0.1)
+        forecast_surplus_node = next(
+            node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "forecast_surplus"
+        )
+        floor_assignments = [
+            node.value
+            for node in ast.walk(forecast_surplus_node)
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == "surplus_battery_floor"
+                for target in node.targets
+            )
+            and isinstance(node.value, ast.Call)
+        ]
+        self.assertEqual(len(floor_assignments), 1)
+        margin = next(
+            keyword.value
+            for keyword in floor_assignments[0].keywords
+            if keyword.arg == "uncertainty_margin_kwh"
+        )
+        self.assertEqual(
+            ast.unparse(margin),
+            "SURPLUS_HEADROOM_RESERVE_FRACTION * battery_capacity",
+        )
+        selected = [
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "get_battery_export_floor"
+        ]
+        selected[0].decorator_list = []
+        namespace = {"datetime": datetime}
+        exec(
+            compile(
+                ast.fix_missing_locations(ast.Module(body=selected, type_ignores=[])),
+                "energy.py",
+                "exec",
+            ),
+            namespace,
+        )
+        floor = namespace["get_battery_export_floor"]
+        self.assertEqual(floor(32.0, 0, 0), 0)
+        self.assertAlmostEqual(floor(32.0, 0, 0, uncertainty_margin_kwh=0.05 * 32.0), 1.6)
+
     def test_dashboard_forecasts_consume_optional_export_and_reserve_schedules(self):
         source = Path(__file__).parents[1].joinpath("energy.py").read_text()
         tree = ast.parse(source)
@@ -2444,7 +2600,7 @@ class SetpointControlTests(unittest.TestCase):
             node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "forecast_surplus"
         )
         forecast_calls = _expanded_forecast_keywords(forecast_surplus_node)
-        self.assertEqual(len(forecast_calls), 4)
+        self.assertEqual(len(forecast_calls), 5)
         for keywords in forecast_calls:
             self.assertIn("optional_export_power_schedule", keywords)
             self.assertIn("battery_floor_schedule", keywords)
@@ -3062,7 +3218,7 @@ class SetpointControlTests(unittest.TestCase):
         )
         publish_node = next(
             node for node in ast.walk(forecast_surplus_node)
-            if isinstance(node, ast.FunctionDef) and node.name == "publish_5_day_balance"
+            if isinstance(node, ast.FunctionDef) and node.name == "publish_n_day_balance"
         )
         published = [
             node for node in ast.walk(publish_node)
@@ -3070,8 +3226,9 @@ class SetpointControlTests(unittest.TestCase):
             and isinstance(node.func, ast.Name)
             and node.func.id == "set_energy_surplus"
             and node.args
-            and isinstance(node.args[0], ast.Attribute)
-            and node.args[0].attr == "energy_balance_5_day"
+            and isinstance(node.args[0], ast.Call)
+            and isinstance(node.args[0].func, ast.Name)
+            and node.args[0].func.id == "getattr"
         ]
         self.assertEqual(len(published), 1)
         call_sources = {
@@ -3079,7 +3236,7 @@ class SetpointControlTests(unittest.TestCase):
             for node in ast.walk(forecast_surplus_node)
             if isinstance(node, ast.Call)
             and isinstance(node.func, ast.Name)
-            and node.func.id == "publish_5_day_balance"
+            and node.func.id == "publish_n_day_balance"
         }
         self.assertEqual(
             call_sources,
@@ -3189,7 +3346,7 @@ class SetpointControlTests(unittest.TestCase):
         )
         publish_node = next(
             node for node in ast.walk(forecast_surplus_node)
-            if isinstance(node, ast.FunctionDef) and node.name == "publish_5_day_balance"
+            if isinstance(node, ast.FunctionDef) and node.name == "publish_n_day_balance"
         )
         reserve_calls = [
             node for node in ast.walk(publish_node)
@@ -3207,7 +3364,7 @@ class SetpointControlTests(unittest.TestCase):
         ]
         self.assertEqual(len(horizon_calls), 2)
         for node in horizon_calls:
-            self.assertEqual(node.args[2].value, 120.0)
+            self.assertEqual(ast.unparse(node.args[2]), "hours")
         published = [
             node for node in ast.walk(publish_node)
             if isinstance(node, ast.Call)
@@ -3266,8 +3423,8 @@ class SetpointControlTests(unittest.TestCase):
         published_keywords = published_ev_forecasts[0]
         self.assertEqual(published_keywords["forecast_dampening"].value, 0.8)
         self.assertEqual(
-            published_keywords["ev_battery_support_energy_kwh"].id,
-            "previous_ev_adjusted_surplus",
+            published_keywords["ev_battery_support_energy_kwh"].value,
+            0,
         )
 
         raw_minimum_publications = [

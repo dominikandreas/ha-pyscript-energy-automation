@@ -911,7 +911,7 @@ class EVChargingControlTests(unittest.TestCase):
         self.assertNotEqual(charge_mode, self.core["ChargeMode"].arrival_precharge)
         self.assertIn("high electricity price", reason)
 
-    def test_live_charging_delegates_arrival_precharge_gate(self):
+    def test_live_charging_validates_shared_plan(self):
         project_root = Path(__file__).parents[1]
         tree = ast.parse((project_root / "ev_charging.py").read_text())
         live_node = next(
@@ -922,7 +922,7 @@ class EVChargingControlTests(unittest.TestCase):
             for call in ast.walk(live_node)
             if isinstance(call, ast.Call)
             and isinstance(call.func, ast.Name)
-            and call.func.id == "is_arrival_precharge_allowed"
+            and call.func.id == "valid_ev_plan_slots"
         ]
         self.assertEqual(len(gate_calls), 1)
 
@@ -1085,8 +1085,11 @@ class EVChargingControlTests(unittest.TestCase):
             and isinstance(call.func, ast.Name)
             and call.func.id == "_forecast"
         )
-        self.assertIn("charger_ready_since", [keyword.arg for keyword in forecast_delegate.keywords])
-        self.assertIn("ev_plugged_in", [keyword.arg for keyword in forecast_delegate.keywords])
+        frozen_inputs = next(node.value for node in ast.walk(forecast_wrapper_node)
+                             if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "forecast_inputs" for t in node.targets))
+        self.assertIn("charger_ready_since", [keyword.arg for keyword in frozen_inputs.keywords])
+        self.assertIn("ev_plugged_in", [keyword.arg for keyword in frozen_inputs.keywords])
+        self.assertIn("ev_charge_plan", [keyword.arg for keyword in frozen_inputs.keywords])
         forecast_charge_call = next(
             call
             for call in ast.walk(forecast_node)
@@ -1098,7 +1101,7 @@ class EVChargingControlTests(unittest.TestCase):
         self.assertIn("battery_support_power", [keyword.arg for keyword in forecast_charge_call.keywords])
         live_source = ast.unparse(live_node)
         self.assertIn("House.energy_surplus_after_ev_charging", live_source)
-        self.assertIn("calculate_ev_battery_support_power", live_source)
+        self.assertIn("valid_ev_plan_slots", live_source)
         self.assertIn("Excess.power", live_source)
         forecast_source = ast.unparse(forecast_node)
         self.assertIn("calculate_ev_battery_support_power", forecast_source)

@@ -88,8 +88,17 @@ def get_auto_inverter_mode(
         # The unified forecast already supplies a tariff-aware physical battery
         # floor.  While there is headroom above it, that floor is authoritative;
         # the broader optional-load surplus budget must not strand battery energy
-        # during a required EV charge.
-        if enforce_battery_floor and battery_headroom_energy > headroom_threshold:
+        # during a required EV charge.  Exception: at low prices with no
+        # post-obligation surplus, the grid must fund the required charge and
+        # the battery must hold its floor for the house; importing cheap power
+        # while draining storage into the EV only shifts load into the
+        # expensive morning (2026-10-21 incident: 4.9 kWh drained at 0.1775
+        # with zero EV-adjusted surplus).
+        if (
+            enforce_battery_floor
+            and battery_headroom_energy > headroom_threshold
+            and (surplus_energy > 0 or not allow_discharge_block)
+        ):
             reason = (
                 f"EV is charging with {battery_headroom_energy:.2f} kWh "
                 "above the planned battery floor"

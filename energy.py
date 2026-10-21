@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any
 # without parameter triggers at function reload
 
 if TYPE_CHECKING:
+    from modules.ev_plan import build_ev_charge_plan, ev_plan_slot, ev_schedule_signature, valid_ev_plan_slots
     # The type checker (linter) does not know that utils can directly be imported in the pyscript engine.
     # Therefore during type checking we pretend to import them from modules.utils, which it can resolve.
     from modules.utils import clip, get, get_attr, set_state
@@ -116,6 +117,7 @@ if TYPE_CHECKING:
     from electricity_price import is_low_price, get_price
 
 else:
+    from ev_plan import build_ev_charge_plan, ev_plan_slot, ev_schedule_signature, valid_ev_plan_slots
     from const import EV as EVConst
     from utils import clip, get, get_attr, now, set_state, with_timezone
     from states import (
@@ -220,6 +222,15 @@ else:
 EXPORT_HOUSE_LOAD_MARGIN_FRACTION = 0.15
 EXPORT_PV_CONFIDENCE_FACTOR = 0.75
 EXPORT_BASE_UNCERTAINTY_MARGIN_KWH = 0.1
+# Prediction-error headroom for the spendable surplus budgets.  The solar-cycle
+# surplus (and the EV-adjusted and 5-day balances derived from the same floor)
+# authorize optional loads and export, so they must not spend the battery down
+# to a literally empty trough: house demand and PV both miss the forecast and
+# LFP SOC is only an estimate.  5% of a 32 kWh pack = 1.6 kWh, roughly a 12%
+# overnight house-load miss plus efficiency slop.  This only narrows optional
+# budgets; house coverage may still drain to the BMS floor (see the
+# deplete-until-empty test), and the operational/forecast floors are untouched.
+SURPLUS_HEADROOM_RESERVE_FRACTION = 0.05
 # Silent mode (input_boolean.silent_mode) keeps the inverter quiet by capping
 # battery/grid exchange at SILENT_MODE_MAX_BATTERY_POWER_W: scheduled export
 # and live battery-to-grid discharge never exceed it, while house and EV
@@ -595,6 +606,15 @@ def auto_victron_set_inverter_mode():
     low_price = get(ElectricityPrices.low_price, False)
     ev_is_charging = get(EV.is_charging, False)
     surplus_energy = get(House.energy_surplus, -1337)
+    if ev_is_charging and surplus_energy != -1337:
+        # While the EV draws current, the post-obligation budget is the honest
+        # one: the plain surplus ignores the running session, and a stale >0
+        # would keep the inverter discharging into the EV all night.  A missing
+        # EV-adjusted sensor falls back to the plain value.
+        surplus_energy = min(
+            surplus_energy,
+            get(House.energy_surplus_after_ev_charging, surplus_energy),
+        )
     forecast_battery_headroom_energy = get(House.battery_headroom_until_trough, -1337)
     battery_soc = get(Battery.soc, -1337)
     target_soc = get(Automation.battery_target_soc, -1337)
@@ -1500,6 +1520,16 @@ def get_ev_schedule(t_now=None, preserve_recent_arrival: bool = False):
     )
 
 
+def get_current_ev_charge_plan(t_now, ev_schedule):
+    return valid_ev_plan_slots(
+        get_attr(EV.charge_plan) or {},
+        t_now,
+        ev_schedule_signature(ev_schedule, t_now),
+        get(EV.soc, -1),
+        get(Battery.energy, -1),
+    )
+
+
 @time_trigger
 @time_trigger("cron(*/2 * * * *)")
 @state_trigger(Grid.power_setpoint_target)
@@ -1532,7 +1562,6 @@ def forecast_surplus():
         max_age_seconds=LIVE_BATTERY_ENERGY_MAX_MEASUREMENT_AGE_SECONDS,
     )
     current_surplus = get(House.energy_surplus, 0)
-    previous_ev_adjusted_surplus = get(House.energy_surplus_after_ev_charging, 0)
     ev_energy = get(EV.energy, 0)
     if (
         1337 in (battery_capacity, battery_energy)
@@ -1600,6 +1629,7 @@ def forecast_surplus():
         battery_capacity,
         surplus_reserve_soc,
         surplus_reserve_soc,
+        uncertainty_margin_kwh=SURPLUS_HEADROOM_RESERVE_FRACTION * battery_capacity,
     )
 
 
@@ -1743,17 +1773,18 @@ def forecast_surplus():
         detail=detail_without_ev_vectorized,
     )
 
-    def publish_5_day_balance(detail):
+    def publish_n_day_balance(detail, n=5):
+        hours = 24 * n
         (
-            balance_5_day,
+            balance_n_day,
             balance_usable_battery_kwh,
-            balance_pv_120h_kwh,
-            balance_house_120h_kwh,
-            balance_ev_wall_120h_kwh,
+            balance_pv_kwh,
+            balance_house_kwh,
+            balance_ev_wall_kwh,
         ) = calculate_horizon_energy_balance(
             detail,
             t_now,
-            120.0,
+            hours,
             battery_energy,
             surplus_battery_floor,
             period_hours,
@@ -1762,22 +1793,22 @@ def forecast_surplus():
         ev_floor_reserve_kwh = calculate_ev_floor_reserve(
             detail,
             t_now,
-            120.0,
+            hours,
             get(EV.required_soc, 80) / 100 * EVConst.ev_capacity,
             ev_energy,
             EVConst.charge_efficiency,
         )
-        balance_5_day -= ev_floor_reserve_kwh
+        balance_n_day -= ev_floor_reserve_kwh
         set_energy_surplus(
-            House.energy_balance_5_day,
-            balance_5_day,
+            getattr(House, f"energy_balance_{n}_day"),
+            balance_n_day,
             usable_battery_kwh=round(balance_usable_battery_kwh, 3),
-            pv_120h_kwh=round(balance_pv_120h_kwh, 3),
-            house_120h_kwh=round(balance_house_120h_kwh, 3),
-            ev_wall_120h_kwh=round(balance_ev_wall_120h_kwh, 3),
+            pv_kwh=round(balance_pv_kwh, 3),
+            house_kwh=round(balance_house_kwh, 3),
+            ev_wall_kwh=round(balance_ev_wall_kwh, 3),
             ev_floor_reserve_kwh=round(ev_floor_reserve_kwh, 3),
-            horizon_hours=120.0,
-            horizon_end=(t_now + timedelta(hours=120)).isoformat(),
+            horizon_hours=hours,
+            horizon_end=(t_now + timedelta(hours=hours)).isoformat(),
             calculated_at=t_now,
             battery_energy_at_calculation=battery_energy,
         )
@@ -1818,6 +1849,38 @@ def forecast_surplus():
             0.0,
             battery_energy - surplus_battery_floor - 1.0,
         )
+        # Freeze every replay input before moving computation off the HA loop.
+        # Plan against the complete conservative trajectory, never the previous
+        # solar-cycle surplus publication. All consumers use this one plan.
+        planner_inputs = forecast(
+            **base_forecast_kwargs,
+            forecast_dampening=0.8,
+            with_ev_charging=forecast_ev_charging_enabled,
+            ev_schedule=ev_schedule,
+            battery_min_energy=surplus_battery_floor,
+            optional_export_power_schedule={},
+            battery_export_budget_kwh=0,
+            surplus_energy=0,
+            ev_energy=ev_energy,
+            ev_charge_plan={},
+            return_inputs=True,
+        )
+        ev_plan = task.executor(build_ev_charge_plan, _forecast, planner_inputs)
+        ev_charge_plan = ev_plan["slots"]
+        set_state(
+            EV.charge_plan,
+            "scheduled" if ev_charge_plan else "waiting",
+            friendly_name="EV charge plan",
+            version=1,
+            calculated_at=t_now.isoformat(),
+            horizon_end=t_end.isoformat(),
+            schedule_signature=ev_schedule_signature(ev_schedule, t_now),
+            source_ev_soc=planner_inputs["ev_soc"],
+            source_battery_kwh=battery_energy,
+            forecast_pv_factor=0.8,
+            **ev_plan,
+        )
+
         # Re-run the conservative, optional-export-free baseline with EV loads
         # included.  Start its policy accumulator at zero; a previously
         # published surplus must not authorize optional consumption here.
@@ -1834,6 +1897,7 @@ def forecast_surplus():
             allow_battery_precharge=arrival_precharge_enabled,
             precharge_arrival_time=precharge_arrival_time,
             ev_battery_precharge_budget_kwh=arrival_precharge_budget_kwh,
+            ev_charge_plan=ev_charge_plan,
         )
         # Publish the same conservative PV confidence used by the spendable
         # budget.  The dashboard must not promise an EV start that live
@@ -1848,13 +1912,12 @@ def forecast_surplus():
             battery_export_budget_kwh=unified_export_budget_kwh,
             surplus_energy=surplus,
             ev_energy=ev_energy,
-            # Use the prior conservative publication to avoid a circular
-            # forecast.  The controller applies a further 3 kWh safety reserve,
-            # so a slightly old value fails gradually instead of overcommitting.
-            ev_battery_support_energy_kwh=previous_ev_adjusted_surplus,
+            # The admitted plan replaces the old solar-cycle battery budget.
+            ev_battery_support_energy_kwh=0,
             allow_battery_precharge=arrival_precharge_enabled,
             precharge_arrival_time=precharge_arrival_time,
             ev_battery_precharge_budget_kwh=arrival_precharge_budget_kwh,
+            ev_charge_plan=ev_charge_plan,
         )
 
         min_battery_energy = min([el.battery_energy for el in forecast_with_ev.detail] or [0])
@@ -2054,7 +2117,8 @@ def forecast_surplus():
             **energy_kwh_attributes,
             ev_charging_enabled=forecast_ev_charging_enabled,
             forecast_pv_factor=0.8,
-            ev_battery_support_budget=round(previous_ev_adjusted_surplus, 3),
+            ev_battery_support_budget=0,
+            ev_plan_calculated_at=t_now.isoformat(),
             detail=detail_with_ev_vectorized,
         )
         set_energy_surplus(
@@ -2080,7 +2144,8 @@ def forecast_surplus():
             calculated_at=t_now,
             battery_energy_at_calculation=battery_energy,
         )
-        publish_5_day_balance(spendable_forecast_with_ev.detail)
+        publish_n_day_balance(spendable_forecast_with_ev.detail, n=3)
+        publish_n_day_balance(spendable_forecast_with_ev.detail, n=5)
 
     else:
         set_state(
@@ -2103,7 +2168,8 @@ def forecast_surplus():
             calculated_at=t_now,
             battery_energy_at_calculation=battery_energy,
         )
-        publish_5_day_balance(spendable_forecast.detail)
+        publish_n_day_balance(spendable_forecast.detail, n=3)
+        publish_n_day_balance(spendable_forecast.detail, n=5)
 
 
 @pyscript_compile
@@ -2333,6 +2399,8 @@ def forecast(
     battery_cells_balanced: bool | None = None,
     t_now: datetime | None = None,
     battery_discharge_limit_w: float | None = None,
+    ev_charge_plan: dict | None = None,
+    return_inputs: bool = False,
 ):
     t_now = t_now if t_now is not None else now()
 
@@ -2377,7 +2445,9 @@ def forecast(
     eff_dis = _or_get(Automation.efficient_discharge, eff_dis, False)
     battery_cells_balanced = _or_get(Battery.cells_balanced, battery_cells_balanced, False)
     max_feedin = _or_get(Grid.max_feedin_target, max_feedin, 4000)
-    return _forecast(
+    if ev_charge_plan is None:
+        ev_charge_plan = get_current_ev_charge_plan(t_now, ev_schedule)
+    forecast_inputs = dict(
         forecast=forecast,
         setpoint=setpoint,
         battery_capacity=battery_capacity,
@@ -2421,7 +2491,11 @@ def forecast(
         eff_dis=eff_dis,
         battery_cells_balanced=battery_cells_balanced,
         t_now=t_now,
+        ev_charge_plan=ev_charge_plan,
     )
+    if return_inputs:
+        return forecast_inputs
+    return _forecast(**forecast_inputs)
 
 
 @pyscript_compile
@@ -2469,6 +2543,7 @@ def _forecast(
     eff_dis: bool | None = None,
     battery_cells_balanced: bool | None = None,
     t_now: datetime | None = None,
+    ev_charge_plan: dict | None = None,
 ):
     if not len(forecast) > 1:
         return None
@@ -2684,6 +2759,9 @@ def _forecast(
                 excess_target=excess_target,
                 ev_adjusted_surplus_energy=ev_battery_support_budget_remaining_kwh,
             )
+            planned_power, planned_target_soc = ev_plan_slot(ev_charge_plan, max(start, t_now))
+            if ev_charge_plan is not None:
+                ev_battery_support_power = 0.0
             charge_action, new_charge_phases, charge_current, reason, charge_mode = (
                 get_settled_simulated_ev_charge_action(
                     next_drive=next_drive_event.start if next_drive_event else None,
@@ -2708,6 +2786,8 @@ def _forecast(
                     battery_support_power=ev_battery_support_power,
                     allow_battery_precharge=arrival_precharge_active,
                     precharge_energy_needed=precharge_energy_needed,
+                    planned_power=planned_power if ev_charge_plan is not None else None,
+                    planned_target_soc=planned_target_soc,
                 )
             )
 
@@ -2772,6 +2852,8 @@ def _forecast(
                 ev_required_soc,
                 smart_charge_limit,
             )
+            if ev_charge_plan is not None and charge_mode == ChargeMode.surplus:
+                ev_charge_energy_limit = min(ev_charge_energy_limit, planned_target_soc / 100 * EVConst.ev_capacity)
             if ev_energy + added_ev_energy > ev_charge_energy_limit:
                 added_ev_energy = max(0, ev_charge_energy_limit - ev_energy)
                 # Recalculate power to match the energy cap
@@ -3850,6 +3932,7 @@ def auto_setpoint_target():
         "ev_plugged_in": get(EV.plugged_in, False),
         "eff_dis": get(Automation.efficient_discharge, False),
         "battery_cells_balanced": get(Battery.cells_balanced, False),
+        "ev_charge_plan": get_current_ev_charge_plan(t_now, ev_schedule),
     }
 
     forecast_ctx = SetpointForecastContext(

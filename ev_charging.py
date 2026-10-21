@@ -13,10 +13,8 @@ if TYPE_CHECKING:
         ChargeMode,
         EV_SURPLUS_START_CONFIRMATION_MINUTES,
         HYSTERESIS_BUFFER,
-        calculate_ev_battery_support_power,
         get_drive_required_soc,
         get_ongoing_and_next_drive,
-        is_arrival_precharge_allowed,
         parse_ev_schedule_entries,
     )
 
@@ -41,13 +39,14 @@ if TYPE_CHECKING:
         get_ev_charge_feedback_state,
     )
 
-    from modules.states import Automation, Charger, ElectricityPrices, EV, Excess, Battery, House, PVProduction
+    from modules.states import Automation, Charger, ElectricityPrices, EV, Excess, Battery, House, PVProduction, Grid
+    from modules.ev_plan import ev_plan_slot, ev_schedule_signature, valid_ev_plan_slots
     from modules.victron import Victron
 
 else:
     from const import EV as Const
     from utils import get, set_state, get_attr, now, with_timezone
-    from states import Automation, Charger, ElectricityPrices, EV, Excess, Battery, House, PVProduction
+    from states import Automation, Charger, ElectricityPrices, EV, Excess, Battery, House, PVProduction, Grid
     from energy_core import (
         ChargeMode,
         EV_SURPLUS_START_CONFIRMATION_MINUTES,
@@ -55,13 +54,12 @@ else:
         _get_charge_action,
         _get_ev_energy_needed,
         _get_ev_smart_charge_limit,
-        calculate_ev_battery_support_power,
         get_drive_required_soc,
         get_ev_charge_feedback_state,
         get_ongoing_and_next_drive,
-        is_arrival_precharge_allowed,
         parse_ev_schedule_entries,
     )  # noqa: F401
+    from ev_plan import ev_plan_slot, ev_schedule_signature, valid_ev_plan_slots
     from victron import Victron
 
 
@@ -248,6 +246,13 @@ def set_phases_and_current(phases, current, reason: str | None = None):
         return True
 
     if last_ev_charging_phase_change > now() - timedelta(minutes=15):
+        # A blocked phase reduction must not leave the previous, larger load
+        # importing. Reduce within the current phase configuration or stop.
+        safe_current = int(phases * current // configured_phases)
+        if safe_current >= Const.min_current:
+            set_current(min(configured_current, safe_current), reason)
+        elif charger_enabled:
+            turn_off_charger("Insufficient PV during phase cooldown", check_phase_change_cooldown=False)
         log.warning(
             f"Phase change too frequent - cooldown active. Keeping existing {configured_phases}P-{configured_current}A. "
             f"Requested {phases}P-{current}A. Reason: {reason or 'no reason provided'}"
@@ -260,7 +265,7 @@ def set_phases_and_current(phases, current, reason: str | None = None):
     if charger_enabled:
         turn_off_charger(f"Phase change from {configured_phases} -> {phases}", check_phase_change_cooldown=False)
 
-    service.call("vestel_ecv04", "set_phases_and_current", current=Const.max_current, num_phases=phases)
+    service.call("vestel_ecv04", "set_phases_and_current", current=current, num_phases=phases)
     last_ev_charging_phase_change = now()  # Update phase change timestamp
     log.warning(f"Phase change initiated - waiting {Const.ev_phase_switch_delay} seconds")
     task.sleep(Const.ev_phase_switch_delay)
@@ -427,20 +432,11 @@ async def auto_ev_charging():
         )
         return
     wallbox_power = get(Charger.power, 0)
-    battery_support_power = calculate_ev_battery_support_power(
-        excess_target=excess_target,
-        ev_adjusted_surplus_energy=surplus_energy,
-    )
+    # Both filtered and instantaneous headroom must support discretionary
+    # charging. The full-horizon plan does not authorize battery assistance.
+    battery_support_power = 0.0
     instantaneous_excess_power = get(Excess.power, excess_power_average)
-    # The one-minute average prevents chatter, but is unsafe as the sole input
-    # while intentionally discharging the battery: charger ramp-up can outrun
-    # the filter by several kW.  Use the lower instantaneous value as a hard
-    # ceiling, while retaining the average for conservative ramp-up.
-    excess_power = (
-        min(excess_power_average, instantaneous_excess_power)
-        if battery_support_power > 0
-        else excess_power_average
-    )
+    excess_power = min(excess_power_average, instantaneous_excess_power)
 
     smart_limiter_active = get(Automation.auto_charge_limit, False)
     ev_charge_limit = get(EV.smart_charge_limit, 80)
@@ -486,40 +482,17 @@ async def auto_ev_charging():
     # these are binary sensors defined separately that indicate whether the price is relatively low or high
     low_price = get(ElectricityPrices.low_price, False)
     high_price = get(ElectricityPrices.high_price, False)
-    # Recovered rule: don't fund precharge from the home battery when the
-    # next drive leaves enough time to catch tomorrow's solar surplus.
-    # Precharge is a low-price top-up only: at the day rate it self-sustains
-    # on wallbox feedback and imports for hours (2026-10-01 incident).
-    arrival_precharge_allowed = is_arrival_precharge_allowed(
-        get(EV.able_to_charge_on_arrival, False),
-        next_drive,
-        ongoing,
-        current_soc,
-        ev_charge_limit,
-        hours_available_to_charge,
-        battery_soc,
-        low_price,
+    plan_slots = valid_ev_plan_slots(
+        get_attr(EV.charge_plan) or {}, t_now,
+        ev_schedule_signature(ev_schedule, t_now), current_soc, get(Battery.energy, -1),
     )
-    precharge_energy_needed = (
-        max(0.0, (ev_charge_limit - current_soc) / 100 * Const.ev_capacity)
-        if arrival_precharge_allowed
-        else 0.0
-    )
-    precharge_battery_energy = get(Battery.energy, 0)
-    precharge_battery_capacity = get(Battery.capacity, 0)
-    precharge_available_kwh = max(
-        0.0,
-        precharge_battery_energy
-        - protected_battery_floor_kwh
-        - 1.0,
-    )
-    precharge_battery_support_power = (
-        min(3000.0, precharge_available_kwh * 1000.0)
-        if arrival_precharge_allowed and precharge_battery_capacity > 0
-        else 0.0
-    )
-    if precharge_battery_support_power > battery_support_power:
-        battery_support_power = precharge_battery_support_power
+    planned_power, planned_target_soc = ev_plan_slot(plan_slots, t_now)
+    planned_power = min(planned_power, max(0.0, pv_total_power - get(House.loads, pv_total_power)))
+    # Correct immediate import while charging instead of waiting for the
+    # one-minute filter or the ordinary five-minute surplus stop timer.
+    grid_import_w = max(0.0, get(Grid.power_ac, 0) * 1000)
+    if is_charging and grid_import_w > 200:
+        planned_power = min(planned_power, max(0.0, wallbox_power - grid_import_w - 150))
 
     # Calculate minimum time needed to charge the vehicle, we subtract 1 to account for charging inefficiencies
     min_hours_needed = energy_needed / (3 * Const.voltage * (Const.max_current - 1) / 1000)  # in hours
@@ -533,7 +506,7 @@ async def auto_ev_charging():
         f"Energy needed: {energy_needed:.2f} kWh, Time needed: {min_hours_needed:.2f}h, "
         f"low price: {low_price}, high price: {high_price}, next drive: {next_drive}, "
         f"EV charge limit: {ev_charge_limit:.0f}%, protected battery floor: {battery_floor_soc:.1f}%, "
-        f"bounded battery support: {battery_support_power:.0f} W"
+        f"plan cap: {planned_power:.0f} W to {planned_target_soc:.1f}%"
     )
 
     #  -------------------------- Charging Strategy Logic -----------------------------------
@@ -566,8 +539,8 @@ async def auto_ev_charging():
         wallbox_power=wallbox_power,
         battery_floor_soc=battery_floor_soc,
         battery_support_power=battery_support_power,
-        allow_battery_precharge=arrival_precharge_allowed,
-        precharge_energy_needed=precharge_energy_needed,
+        planned_power=planned_power,
+        planned_target_soc=planned_target_soc,
     )
 
     global last_ev_action, last_ev_mode, last_ev_reason

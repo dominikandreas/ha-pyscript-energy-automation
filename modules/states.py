@@ -124,6 +124,8 @@ class EV:
     plugged_in = "binary_sensor.tesla_plugged_in"
     charge_state = "sensor.ev_charge_state"
     """Dashboard feedback for the EV surplus-timing state machine."""
+    charge_plan = "sensor.ev_charge_plan"
+    """Shared full-horizon EV charging authorizations and replay diagnostics."""
 
 
 class House:
@@ -149,6 +151,8 @@ class House:
     """Battery energy in kWh above the hard battery floor before the next local forecast minimum"""
     energy_surplus_after_ev_charging = "sensor.energy_surplus_after_ev_charging"
     """Energy surplus in kWh after accounting for planned EV charging"""
+    energy_balance_3_day = "sensor.energy_balance_3_day"
+    """Signed net energy position in kWh over the next 3 days after reserving an EV minimum-charge top-up; negative means grid import will be needed"""
     energy_balance_5_day = "sensor.energy_balance_5_day"
     """Signed net energy position in kWh over the next 5 days after reserving an EV minimum-charge top-up; negative means grid import will be needed"""
     energy_forecast = "sensor.energy_forecast"
