@@ -250,6 +250,8 @@ class Automation:
     """Switch to enable/disable automatic battery target SOC calculation"""
     auto_excess_target = "input_boolean.auto_excess_target"
     """Switch to enable/disable automatic excess target power calculation"""
+    auto_force_charge_target = "input_boolean.auto_force_charge_target"
+    """Switch to enable/disable automatic grid force-charge target from the solar-cycle shortfall"""
     battery_target_soc = "input_number.battery_target_soc"
     """Target SOC for the battery, set by automation or manually"""
     min_discharge_price = "input_number.min_discharge_price"

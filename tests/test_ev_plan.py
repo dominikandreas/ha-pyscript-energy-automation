@@ -22,7 +22,11 @@ class EVPlanTests(unittest.TestCase):
         # instead of the house battery (inverter no longer forced on at low
         # prices without post-obligation surplus), so the plan imports ~0.06
         # kWh more while the EV outcome below is unchanged.
-        self.assertAlmostEqual(plan["planned_grid_kwh"], 8.107, places=3)
+        # 2026-10-22: the simulator no longer hard-pins the battery at the
+        # reserve schedule (live control discharges through it at high
+        # prices), so the plan self-consumes ~0.86 kWh more instead of
+        # importing it.
+        self.assertAlmostEqual(plan["planned_grid_kwh"], 7.2495, places=3)
         departure = self.inputs["ev_schedule"][0].start
         final_ev = [e.ev_energy for e in result.detail if e.period_start < departure][-1]
         self.assertAlmostEqual(final_ev / 60 * 100, 69.5, places=3)
@@ -94,3 +98,78 @@ class EVPlanTests(unittest.TestCase):
         exec(compile(ast.fix_missing_locations(ast.Module(body=[func],type_ignores=[])),"ev_charging.py","exec"),namespace)
         self.assertFalse(namespace["set_phases_and_current"](1,6,"test"))
         self.assertEqual(writes[0][0],"off")
+
+class ForecastFloorTests(unittest.TestCase):
+    # 2026-10-22 incident: the backward-accumulated reserve schedule (24 kWh
+    # against dark-day deficits) hard-pinned the simulated battery at
+    # 9.26 kWh for 24 h while the house imported at peak rates.  Live control
+    # discharges through the schedule at high prices and only honors it via
+    # the inverter mode at low prices; the simulator must do the same.
+    @classmethod
+    def setUpClass(cls):
+        cls.energy = load_energy()
+
+    def _run(self, start, schedule_floor):
+        periods = [start + timedelta(minutes=30 * i) for i in range(4)]
+        forecast = [self.energy.PVForecastWithPrices(p, 0.0, 0.2875) for p in periods]
+        return self.energy._forecast(
+            forecast=forecast,
+            setpoint=-20,
+            battery_capacity=32,
+            battery_energy=9.26,
+            battery_min_energy=0.0,
+            battery_floor_schedule={p.isoformat(): schedule_floor for p in periods},
+            with_ev_charging=False,
+            ev_schedule=[],
+            ev_required_soc=70.0,
+            ev_soc=65.0,
+            surplus_energy=4.49,
+            battery_export_budget_kwh=0.0,
+            optional_export_power_schedule={},
+            max_setpoint=-20,
+            daily_power=920.0,
+            nightly_power=546.0,
+            is_charging_ev=False,
+            smart_limiter_active=False,
+            charge_limit=90.0,
+            max_charge_price=0.2,
+            force_charge_switch=False,
+            min_discharge_price=0.0,
+            battery_cells_balanced=True,
+            eff_dis=False,
+            t_now=start,
+        )
+
+    def test_sim_discharges_through_schedule_floor_at_high_price(self):
+        from datetime import datetime
+        result = self._run(datetime(2026, 10, 22, 18, 0), 24.0)
+        final_battery = result.detail[-1].battery_energy
+        grid_kwh = sum(e.power_from_grid for e in result.detail) * 0.5 / 1000
+        self.assertLess(final_battery, 8.5)
+        self.assertLess(grid_kwh, 0.1)
+
+    def test_sim_holds_schedule_floor_at_low_price(self):
+        from datetime import datetime
+        result = self._run(datetime(2026, 10, 22, 1, 0), 24.0)
+        final_battery = result.detail[-1].battery_energy
+        grid_kwh = sum(e.power_from_grid for e in result.detail) * 0.5 / 1000
+        self.assertAlmostEqual(final_battery, 9.26, places=2)
+        self.assertGreater(grid_kwh, 0.5)
+
+    def test_sim_ev_gating_uses_protected_floor_not_schedule(self):
+        tree = ast.parse((ROOT / "energy.py").read_text())
+        forecast_node = next(
+            n for n in tree.body
+            if isinstance(n, ast.FunctionDef) and n.name == "_forecast"
+        )
+        calls = [
+            c for c in ast.walk(forecast_node)
+            if isinstance(c, ast.Call)
+            and isinstance(c.func, ast.Name)
+            and c.func.id == "get_settled_simulated_ev_charge_action"
+        ]
+        self.assertEqual(len(calls), 1)
+        floor_kw = next(
+            k for k in calls[0].keywords if k.arg == "battery_floor_soc"
+        )
+        self.assertIn("period_battery_hard_floor", ast.unparse(floor_kw.value))

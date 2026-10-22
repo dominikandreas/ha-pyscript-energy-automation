@@ -3210,6 +3210,180 @@ class SetpointControlTests(unittest.TestCase):
             with self.subTest(override=override), self.assertRaises(ValueError):
                 calculate(**(base | override))
 
+    def _load_shortfall_helpers(self):
+        source = Path(__file__).parents[1].joinpath("energy.py").read_text()
+        tree = ast.parse(source)
+        selected = [
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name in ("get_solar_cycle_shortfall", "calculate_force_charge_target_soc")
+        ]
+        self.assertEqual(len(selected), 2)
+        for node in selected:
+            node.decorator_list = []
+        namespace = {"datetime": datetime, "timedelta": timedelta}
+        exec(
+            compile(
+                ast.fix_missing_locations(ast.Module(body=selected, type_ignores=[])),
+                "energy.py",
+                "exec",
+            ),
+            namespace,
+        )
+        return namespace["get_solar_cycle_shortfall"], namespace["calculate_force_charge_target_soc"]
+
+    def test_shortfall_sums_cycle_grid_import_plus_floor_top_up(self):
+        shortfall, _ = self._load_shortfall_helpers()
+        start = datetime(2026, 10, 12, 20, 0, tzinfo=timezone.utc)
+
+        def entry(offset_hours, battery, grid_w):
+            return SimpleNamespace(
+                period_start=start + timedelta(hours=offset_hours),
+                pv_estimate=0.0,
+                house_power=400.0,
+                battery_energy=battery,
+                power_from_grid=grid_w,
+            )
+
+        night = [entry(h, 10.0 - h, 0.0) for h in (0.0, 0.5, 1.0, 1.5)]
+        value, horizon = shortfall(night, 1.6, start, 0.5, 0.9)
+        self.assertAlmostEqual(value, 0.0)
+        self.assertEqual(horizon, start + timedelta(hours=1.5))
+
+        drained = [
+            entry(0.0, 2.0, 0.0),
+            entry(0.5, 0.5, 500.0),
+            entry(1.0, 0.5, 500.0),
+        ]
+        value, _ = shortfall(drained, 1.6, start, 0.5, 0.9)
+        # 0.5 kWh imported + (1.6 - 0.5) kWh spent below the floor, delivered.
+        self.assertAlmostEqual(value, 0.5 + 1.1 * 0.9)
+
+        self.assertEqual(shortfall([], 1.6, start, 0.5, 0.9), (0.0, None))
+
+    def test_shortfall_stops_at_next_solar_start(self):
+        shortfall, _ = self._load_shortfall_helpers()
+        start = datetime(2026, 10, 12, 10, 0, tzinfo=timezone.utc)
+
+        def entry(when, pv, house, battery, grid_w):
+            return SimpleNamespace(
+                period_start=when,
+                pv_estimate=pv,
+                house_power=house,
+                battery_energy=battery,
+                power_from_grid=grid_w,
+            )
+
+        detail = [
+            entry(start, 3000.0, 500.0, 20.0, 0.0),
+            entry(start + timedelta(hours=10), 0.0, 500.0, 5.0, 1000.0),
+            entry(start + timedelta(hours=22), 3000.0, 500.0, 5.0, 0.0),
+            entry(start + timedelta(hours=26), 0.0, 500.0, 1.0, 2000.0),
+        ]
+        value, _ = shortfall(detail, 1.6, start, 0.5, 0.9)
+        # Only the in-cycle 1000 W period counts; post-sunrise import excluded.
+        self.assertAlmostEqual(value, 0.5)
+
+    def test_shortfall_rejects_invalid_inputs(self):
+        shortfall, _ = self._load_shortfall_helpers()
+        start = datetime(2026, 10, 12, 10, 0, tzinfo=timezone.utc)
+        base = dict(
+            detail=[],
+            battery_export_floor=1.6,
+            t_now=start,
+            period_hours=0.5,
+            battery_discharge_efficiency=0.9,
+        )
+        for kwargs in (
+            {"period_hours": 0.0},
+            {"period_hours": -0.5},
+            {"battery_discharge_efficiency": 0.0},
+            {"battery_discharge_efficiency": 1.5},
+            {"battery_export_floor": float("nan")},
+        ):
+            with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
+                shortfall(**(base | kwargs))
+
+    def test_force_charge_target_covers_shortfall_from_current_level(self):
+        _, target = self._load_shortfall_helpers()
+        self.assertEqual(target(16.0, 32.0, 0.04, 0.9, 0.05), 0.0)
+        self.assertEqual(target(16.0, 32.0, 0.0, 0.9, 0.05), 0.0)
+        # 3.6 kWh delivered needs 4.0 kWh stored on top of 16 kWh in 32 kWh.
+        self.assertAlmostEqual(target(16.0, 32.0, 3.6, 0.9, 0.05), 62.5)
+        self.assertEqual(target(30.0, 32.0, 10.0, 0.9, 0.05), 100.0)
+        for args in (
+            (16.0, 0.0, 3.6, 0.9, 0.05),
+            (16.0, 32.0, 3.6, 0.0, 0.05),
+            (16.0, 32.0, 3.6, 1.5, 0.05),
+            (float("nan"), 32.0, 3.6, 0.9, 0.05),
+        ):
+            with self.subTest(args=args), self.assertRaises(ValueError):
+                target(*args)
+
+    def test_surplus_run_publishes_shortfall_and_force_charge_target(self):
+        source = Path(__file__).parents[1].joinpath("energy.py").read_text()
+        tree = ast.parse(source)
+        node = next(
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "forecast_surplus"
+        )
+        shortfall_calls = [
+            call for call in ast.walk(node)
+            if isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Name)
+            and call.func.id == "get_solar_cycle_shortfall"
+        ]
+        self.assertEqual(len(shortfall_calls), 1)
+        # House-only baseline: required EV charging must never be routed
+        # through the house battery.
+        self.assertEqual(ast.unparse(shortfall_calls[0].args[0]), "spendable_detail_80h")
+        target_sets = [
+            call for call in ast.walk(node)
+            if isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Name)
+            and call.func.id == "set_state"
+            and any(
+                isinstance(child, ast.Attribute) and child.attr == "force_charge_up_to"
+                for child in ast.walk(call)
+            )
+        ]
+        self.assertEqual(len(target_sets), 1)
+        published = [
+            call for call in ast.walk(node)
+            if isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Name)
+            and call.func.id == "set_energy_surplus"
+            and any(keyword.arg == "expected_shortfall_kwh" for keyword in call.keywords)
+        ]
+        self.assertEqual(len(published), 1)
+
+    def test_force_charge_target_write_is_behind_its_flag(self):
+        source = Path(__file__).parents[1].joinpath("energy.py").read_text()
+        tree = ast.parse(source)
+        node = next(
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "forecast_surplus"
+        )
+        gated = [
+            if_node for if_node in ast.walk(node)
+            if isinstance(if_node, ast.If)
+            and "auto_force_charge_target" in ast.unparse(if_node.test)
+            and any(
+                isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Name)
+                and call.func.id == "set_state"
+                and any(
+                    isinstance(child, ast.Attribute) and child.attr == "force_charge_up_to"
+                    for child in ast.walk(call)
+                )
+                for stmt in if_node.body
+                for call in ast.walk(stmt)
+            )
+        ]
+        self.assertEqual(len(gated), 1)
+        # The flag defaults to off: a missing helper must not enable writes.
+        self.assertIn("False", ast.unparse(gated[0].test))
+
     def test_balance_3_day_published_from_conservative_detail(self):
         source = Path(__file__).parents[1].joinpath("energy.py").read_text()
         tree = ast.parse(source)

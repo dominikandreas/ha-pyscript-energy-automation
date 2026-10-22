@@ -231,6 +231,9 @@ EXPORT_BASE_UNCERTAINTY_MARGIN_KWH = 0.1
 # budgets; house coverage may still drain to the BMS floor (see the
 # deplete-until-empty test), and the operational/forecast floors are untouched.
 SURPLUS_HEADROOM_RESERVE_FRACTION = 0.05
+# Shortfalls below this are measurement noise, not a charge instruction: the
+# force-charge target snaps to 0 (off) instead of chasing watt-hours.
+FORCE_CHARGE_SHORTFALL_EPSILON_KWH = 0.05
 # Silent mode (input_boolean.silent_mode) keeps the inverter quiet by capping
 # battery/grid exchange at SILENT_MODE_MAX_BATTERY_POWER_W: scheduled export
 # and live battery-to-grid discharge never exceed it, while house and EV
@@ -1280,6 +1283,139 @@ def get_spendable_solar_cycle_curve(
 
 
 @pyscript_compile
+def get_solar_cycle_shortfall(
+    detail: list["ForecastEntry"],
+    battery_export_floor: float,
+    t_now: datetime,
+    period_hours: float,
+    battery_discharge_efficiency: float = 1.0,
+) -> tuple[float, datetime | None]:
+    """Return expected grid import (kWh, delivered) over the solar cycle.
+
+    Companion to ``get_spendable_solar_cycle_energy`` over the same window:
+    the surplus measures spendable energy above the protected floor, the
+    shortfall measures delivered energy the house must import because PV and
+    usable storage fall short.  The caller must provide the conservative
+    no-EV baseline: required EV charging draws from the grid directly and
+    must never be routed through the house battery (double conversion loss).
+
+    shortfall = simulated grid import + battery energy the simulation spent
+    below the protected floor (the baseline simulates against the lower
+    forecast floor).  Drives the nightly grid force-charge target.
+    """
+    try:
+        battery_export_floor = float(battery_export_floor)
+        period_hours = float(period_hours)
+        battery_discharge_efficiency = float(battery_discharge_efficiency)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError("shortfall inputs must be finite numbers")
+    for value in (
+        battery_export_floor,
+        period_hours,
+        battery_discharge_efficiency,
+    ):
+        if value != value or abs(value) == float("inf"):
+            raise ValueError("shortfall inputs must be finite numbers")
+    if period_hours <= 0:
+        raise ValueError("period_hours must be positive")
+    if battery_discharge_efficiency <= 0 or battery_discharge_efficiency > 1:
+        raise ValueError("battery_discharge_efficiency must be in (0, 1]")
+
+    future = [entry for entry in detail if entry.period_start >= t_now]
+    if not future:
+        return 0.0, None
+
+    today = t_now.date()
+    solar_today = [
+        entry
+        for entry in future
+        if entry.period_start.date() == today and entry.pv_estimate >= entry.house_power
+    ]
+
+    if not solar_today:
+        trough_energy = future[0].battery_energy
+        previous_energy = trough_energy
+        trough_time = future[0].period_start
+        for entry in future[1:]:
+            if entry.battery_energy <= trough_energy:
+                trough_energy = entry.battery_energy
+                trough_time = entry.period_start
+            elif entry.battery_energy > previous_energy + 0.05:
+                break
+            previous_energy = entry.battery_energy
+        window = [entry for entry in future if entry.period_start <= trough_time]
+    else:
+        solar_end_time = solar_today[-1].period_start
+        next_solar_start = next(
+            (
+                entry.period_start
+                for entry in future
+                if entry.period_start.date() > today and entry.pv_estimate >= entry.house_power
+            ),
+            None,
+        )
+        window = [
+            entry
+            for entry in future
+            if next_solar_start is None or entry.period_start < next_solar_start
+        ]
+        after_solar = [entry for entry in window if entry.period_start >= solar_end_time]
+        trough_entry = min(after_solar or window, key=lambda entry: entry.battery_energy)
+        trough_energy = trough_entry.battery_energy
+        trough_time = trough_entry.period_start
+
+    grid_kwh = sum(max(0.0, entry.power_from_grid) for entry in window) * period_hours / 1000
+    floor_top_up = max(0.0, battery_export_floor - trough_energy) * battery_discharge_efficiency
+    return grid_kwh + floor_top_up, trough_time
+
+
+@pyscript_compile
+def calculate_force_charge_target_soc(
+    battery_energy_now: float,
+    battery_capacity_kwh: float,
+    shortfall_kwh: float,
+    battery_discharge_efficiency: float,
+    negligible_kwh: float,
+) -> float:
+    """Return the grid force-charge target SOC (%) covering a shortfall.
+
+    ``shortfall_kwh`` is delivered energy the house must otherwise import;
+    storing it instead needs ``shortfall / discharge_efficiency`` in the
+    battery on top of the current level.  Returns 0 when the shortfall is
+    negligible so the force-charge loop stays off.  The low-price gate still
+    decides whether charging happens at all.
+    """
+    try:
+        battery_energy_now = float(battery_energy_now)
+        battery_capacity_kwh = float(battery_capacity_kwh)
+        shortfall_kwh = float(shortfall_kwh)
+        battery_discharge_efficiency = float(battery_discharge_efficiency)
+        negligible_kwh = float(negligible_kwh)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError("target inputs must be finite numbers")
+    for value in (
+        battery_energy_now,
+        battery_capacity_kwh,
+        shortfall_kwh,
+        battery_discharge_efficiency,
+        negligible_kwh,
+    ):
+        if value != value or abs(value) == float("inf"):
+            raise ValueError("target inputs must be finite numbers")
+    if battery_capacity_kwh <= 0:
+        raise ValueError("battery_capacity_kwh must be positive")
+    if battery_discharge_efficiency <= 0 or battery_discharge_efficiency > 1:
+        raise ValueError("battery_discharge_efficiency must be in (0, 1]")
+    if shortfall_kwh < negligible_kwh:
+        return 0.0
+    stored_needed_kwh = shortfall_kwh / battery_discharge_efficiency
+    return min(
+        100.0,
+        max(0.0, (battery_energy_now + stored_needed_kwh) / battery_capacity_kwh * 100),
+    )
+
+
+@pyscript_compile
 def calculate_ev_adjusted_spendable_energy(
     base_spendable_energy_kwh: float,
     ev_forecast_spendable_energy_kwh: float,
@@ -1738,6 +1874,32 @@ def forecast_surplus():
         HOME_BATTERY_DISCHARGE_EFFICIENCY,
         battery_discharge_allowed,
     )
+    # Expected grid import over the same cycle, from the house-only baseline.
+    # Required EV charging stays out (it draws from the grid directly).
+    cycle_shortfall_kwh, _ = get_solar_cycle_shortfall(
+        spendable_detail_80h,
+        surplus_battery_floor,
+        t_now,
+        period_hours,
+        HOME_BATTERY_DISCHARGE_EFFICIENCY,
+    )
+    # Automatic force-charge target, behind its flag (default off).  When
+    # enabled, 0 disables the force-charge loop; the low-price gate still
+    # decides whether charging happens at all.  When disabled the helper
+    # keeps its last value for manual control.
+    if get(Automation.auto_force_charge_target, False):
+        set_state(
+            Battery.force_charge_up_to,
+            round(
+                calculate_force_charge_target_soc(
+                    battery_energy,
+                    battery_capacity,
+                    cycle_shortfall_kwh,
+                    HOME_BATTERY_DISCHARGE_EFFICIENCY,
+                    FORCE_CHARGE_SHORTFALL_EPSILON_KWH,
+                )
+            ),
+        )
 
     forecast_today = [el for el in forecast_no_ev.detail if el.period_start.day == t_now.day]
     feedin_today = sum([max(0, el.feedin - 20) for el in forecast_today]) * period_hours / 1000
@@ -1753,6 +1915,7 @@ def forecast_surplus():
         surplus,
         battery_headroom=battery_headroom_until_trough,
         conservative_pv_spill=round(conservative_pv_spill, 2),
+        expected_shortfall_kwh=round(cycle_shortfall_kwh, 3),
         protected_battery_floor=round(surplus_battery_floor, 2),
         forecast_battery_floor=round(forecast_battery_floor, 2),
         operational_battery_floor=round(operational_battery_floor, 2),
@@ -2678,8 +2841,18 @@ def _forecast(
             pv_power=power_production,
             battery_cells_balanced=bool(battery_cells_balanced),
         )
+        # The reserve schedule models what live control protects at LOW prices
+        # (via the inverter-mode headroom below), but live control freely
+        # discharges through it at HIGH prices.  Hard-clamping simulated energy
+        # at the schedule freezes the forecast battery for a day while the
+        # house imports at peak rates (2026-10-22: pinned at 9.26 kWh for 24 h
+        # against a 24 kWh backward-accumulated deficit).  Clamp energy at the
+        # pass floor only; the schedule keeps feeding the mode decision.
+        period_battery_hard_floor = battery_min_energy
         if low_pv_reserve_soc > 0:
-            period_battery_min_energy = max(period_battery_min_energy, battery_capacity * low_pv_reserve_soc / 100 + 1)
+            low_pv_floor = battery_capacity * low_pv_reserve_soc / 100 + 1
+            period_battery_min_energy = max(period_battery_min_energy, low_pv_floor)
+            period_battery_hard_floor = max(period_battery_hard_floor, low_pv_floor)
 
         smart_charge_limit = 101
         if next_drive_event:
@@ -2782,7 +2955,10 @@ def _forecast(
                     t_now=start,
                     inverter_mode=inverter_mode,
                     battery_force_charge=is_force_charging,
-                    battery_floor_soc=period_battery_min_energy / battery_capacity * 100,
+                    # Live EV control gates on the protected surplus floor, not
+                    # the reserve schedule (which can demand 24 kWh on dark
+                    # days and would veto all simulated charging).  Match it.
+                    battery_floor_soc=period_battery_hard_floor / battery_capacity * 100,
                     battery_support_power=ev_battery_support_power,
                     allow_battery_precharge=arrival_precharge_active,
                     precharge_energy_needed=precharge_energy_needed,
@@ -2983,13 +3159,13 @@ def _forecast(
                 # Check Mode/SOC constraints
                 if (
                     inverter_mode in (InverterMode.off, InverterMode.charger_only)
-                    or current_bat_kwh <= period_battery_min_energy
+                    or current_bat_kwh <= period_battery_hard_floor
                 ):
                     actual_discharge_watts = 0
                 else:
                     # Physical Constraints: Limit and Available Energy
                     max_discharge_rate = forecast_discharge_limit_w
-                    available_energy_kwh = current_bat_kwh - period_battery_min_energy
+                    available_energy_kwh = current_bat_kwh - period_battery_hard_floor
                     max_discharge_by_energy = (
                         available_energy_kwh
                         * HOME_BATTERY_DISCHARGE_EFFICIENCY
