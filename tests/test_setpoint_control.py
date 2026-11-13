@@ -112,10 +112,12 @@ class SetpointControlTests(unittest.TestCase):
             "if setpoint < pv_only_setpoint",
             target_source,
         )
-        # Stale telemetry holds the last setpoint and disables discharge.
+        # Stale telemetry neutralizes optional export without changing the
+        # physical discharge limit used by Victron's local ESS controller.
         self.assertIn("if not measurements_available", target_source)
         self.assertIn("prev_telemetry_hold_active", target_source)
-        self.assertIn("set_state(Battery.discharge_limit, 0)", target_source)
+        self.assertNotIn("set_state(Battery.discharge_limit, 0)", target_source)
+        self.assertIn("setpoint = max_setpoint", target_source)
         self.assertIn("select_finite_grid_target", target_source)
         self.assertIn("LIVE_TELEMETRY_FAILSAFE_IMPORT_TARGET_W", target_source)
 
@@ -256,6 +258,8 @@ class SetpointControlTests(unittest.TestCase):
             "live_headroom_hold_until": None,
             "prev_live_headroom_mode": "normal",
             "last_live_headroom_publish": now_value,
+            "get_planned_discharge_limit_w": lambda default=-1: -1.0,
+            "resolve_battery_discharge_policy": lambda cap, hold=False: 0 if hold else cap,
             "prev_telemetry_hold_active": False,
             "prev_discharge_limit_before_hold": None,
             "prev_telemetry_good_streak": 0,
@@ -491,6 +495,8 @@ class SetpointControlTests(unittest.TestCase):
             "live_headroom_hold_until": None,
             "prev_live_headroom_mode": "normal",
             "last_live_headroom_publish": now_value,
+            "get_planned_discharge_limit_w": lambda default=-1: -1.0,
+            "resolve_battery_discharge_policy": lambda cap, hold=False: 0 if hold else cap,
             "prev_telemetry_hold_active": False,
             "prev_discharge_limit_before_hold": None,
             "prev_telemetry_good_streak": 0,
@@ -563,67 +569,43 @@ class SetpointControlTests(unittest.TestCase):
         self.assertEqual(writes_to(symbols["Battery"].discharge_limit), [])
         self.assertFalse(namespace["prev_telemetry_hold_active"])
 
-        # Second consecutive bad cycle: the hold engages, the setpoint is
-        # left untouched and discharge is disabled.
+        # Second consecutive bad cycle: optional export is neutralized while
+        # normal ESS discharge remains available for household loads.
         actuator_calls.clear()
         logged_warnings.clear()
         namespace["auto_apply_setpoint"]()
-        self.assertEqual(writes_to(symbols["Grid"].power_setpoint), [])
-        discharge_writes = writes_to(symbols["Battery"].discharge_limit)
-        self.assertEqual([call[1] for call in discharge_writes], [0])
-        hold_logs = [message for message in logged_warnings if "holding last" in message]
-        self.assertEqual(len(hold_logs), 1)
-        self.assertIn("holding last grid setpoint (-100 W)", hold_logs[0])
-        self.assertTrue(namespace["prev_telemetry_hold_active"])
-        self.assertEqual(
-            persisted_states.get("pyscript.telemetry_hold_discharge_limit"),
-            "-1.0",
-        )
-
-        # Simulate a reload during the hold: the volatile latch is lost, but
-        # the persisted pre-hold limit lets the next cycle resume the hold
-        # instead of stranding a disabled discharge with no owner.
-        namespace["prev_telemetry_hold_active"] = False
-        namespace["prev_discharge_limit_before_hold"] = None
-        namespace["prev_telemetry_good_streak"] = 0
-        namespace["prev_telemetry_bad_streak"] = 0
-        namespace["prev_telemetry_hold_boot_checked"] = False
-        actuator_calls.clear()
-        logged_warnings.clear()
-        namespace["auto_apply_setpoint"]()
-        self.assertEqual(writes_to(symbols["Grid"].power_setpoint), [])
+        neutral_writes = writes_to(symbols["Grid"].power_setpoint)
+        self.assertEqual([call[1] for call in neutral_writes], [-100])
         self.assertEqual(writes_to(symbols["Battery"].discharge_limit), [])
+        hold_logs = [message for message in logged_warnings if "suppressing optional export" in message]
+        self.assertEqual(len(hold_logs), 1)
+        self.assertIn("neutral grid setpoint -100 W", hold_logs[0])
+        self.assertIn("discharge limit unchanged", hold_logs[0])
         self.assertTrue(namespace["prev_telemetry_hold_active"])
-        self.assertEqual(namespace["prev_discharge_limit_before_hold"], -1.0)
-        resume_logs = [message for message in logged_warnings if "after restart" in message]
-        self.assertEqual(len(resume_logs), 1)
 
         # A single fresh sample does not release the hold yet.
         actuator_calls.clear()
         logged_warnings.clear()
         power_freshness["stale"] = False
         namespace["auto_apply_setpoint"]()
-        self.assertEqual(writes_to(symbols["Grid"].power_setpoint), [])
+        neutral_writes = writes_to(symbols["Grid"].power_setpoint)
+        self.assertEqual([call[1] for call in neutral_writes], [-100])
         self.assertEqual(writes_to(symbols["Battery"].discharge_limit), [])
         self.assertTrue(namespace["prev_telemetry_hold_active"])
 
-        # Second consecutive fresh sample: discharge limit restored, writes resume.
+        # Second consecutive fresh sample: optimized setpoint control resumes;
+        # the discharge limit was never changed.
         actuator_calls.clear()
         logged_warnings.clear()
         namespace["auto_apply_setpoint"]()
-        restored_writes = writes_to(symbols["Battery"].discharge_limit)
-        self.assertEqual([call[1] for call in restored_writes], [-1.0])
+        self.assertEqual(writes_to(symbols["Battery"].discharge_limit), [])
         resumed_writes = writes_to(symbols["Grid"].power_setpoint)
         self.assertTrue(resumed_writes)
         recovery_logs = [message for message in logged_warnings if "recovered" in message]
         self.assertEqual(len(recovery_logs), 1)
         self.assertFalse(namespace["prev_telemetry_hold_active"])
-        self.assertEqual(
-            persisted_states.get("pyscript.telemetry_hold_discharge_limit"),
-            "",
-        )
 
-    def test_stale_telemetry_holds_setpoint_and_disables_discharge(self):
+    def test_stale_telemetry_uses_neutral_setpoint_without_disabling_discharge(self):
         source = Path(__file__).parents[1].joinpath("energy.py").read_text()
         tree = ast.parse(source)
         target = next(
@@ -646,16 +628,17 @@ class SetpointControlTests(unittest.TestCase):
             "if ev_is_charging and not setpoint_input_invalid",
             target_source,
         )
-        # Stale telemetry holds instead of falling back: no blind target is
-        # pinned, and discharge is disabled until fresh data arrives.
+        # Stale telemetry suppresses optional export through the neutral grid
+        # target while leaving the physical discharge configuration alone.
         self.assertNotIn("telemetry_safe_grid_target_w", target_source)
         self.assertNotIn("battery_discharge_guard_target_w", target_source)
         self.assertIn("if not measurements_available:", target_source)
         self.assertIn("prev_telemetry_hold_active", target_source)
         self.assertIn("prev_telemetry_bad_streak", target_source)
         self.assertIn("prev_telemetry_good_streak", target_source)
-        self.assertIn("set_state(Battery.discharge_limit, 0)", target_source)
-        self.assertIn("pyscript.telemetry_hold_discharge_limit", target_source)
+        self.assertNotIn("set_state(Battery.discharge_limit, 0)", target_source)
+        self.assertIn("setpoint = max_setpoint", target_source)
+        self.assertIn("battery discharge limit unchanged", target_source)
 
     def test_planned_discharge_limit_ignores_telemetry_hold_zero(self):
         # 2026-09-24: the planner sampled the discharge-limit input while a
@@ -686,31 +669,19 @@ class SetpointControlTests(unittest.TestCase):
         )
         helper = namespace["get_planned_discharge_limit_w"]
 
-        values["pyscript.telemetry_hold_discharge_limit"] = "-1.0"
+        values["pyscript.telemetry_hold_discharge_limit"] = "0.0"
         values["Battery.discharge_limit"] = 0.0
+        values["input_number.battery_discharge_power_cap"] = -1.0
         self.assertEqual(helper(-1), -1.0)
-
-        # No latch: a sustained zero (price automation, inverter ban) still
-        # reaches the simulation unchanged.
-        values["pyscript.telemetry_hold_discharge_limit"] = ""
-        values["Battery.discharge_limit"] = 0.0
+        # An intentional configured limit remains authoritative, including zero.
+        values["input_number.battery_discharge_power_cap"] = 2500.0
+        self.assertEqual(helper(-1), 2500.0)
+        values["input_number.battery_discharge_power_cap"] = 0.0
+        self.assertEqual(helper(-1), 0.0)
+        del values["input_number.battery_discharge_power_cap"]
         self.assertEqual(helper(-1), 0.0)
 
-        # Normal operation passes the live input through.
-        values["Battery.discharge_limit"] = -1.0
-        self.assertEqual(helper(-1), -1.0)
-
-        # An unparseable latch falls back to the live input, never to a
-        # fabricated capability.
-        values["pyscript.telemetry_hold_discharge_limit"] = "stuck"
-        values["Battery.discharge_limit"] = 0.0
-        self.assertEqual(helper(-1), 0.0)
-
-    def test_telemetry_hold_latch_brackets_the_zero_write(self):
-        # The planner trusts the latch to explain a hold-owned 0, so the
-        # latch must bracket the input write on both transitions: persist
-        # before parking at 0 on engage, restore before clearing on release.
-        # Either order leaves no window with an unexplained 0.
+    def test_telemetry_hold_never_writes_the_discharge_limit(self):
         source = Path(__file__).parents[1].joinpath("energy.py").read_text()
         tree = ast.parse(source)
         target = next(
@@ -731,15 +702,10 @@ class SetpointControlTests(unittest.TestCase):
         self.assertIn("engage", branches)
         self.assertIn("release", branches)
         engage = branches["engage"]
-        self.assertLess(
-            engage.index("telemetry_hold_discharge_limit"),
-            engage.index("set_state(Battery.discharge_limit, 0)"),
-        )
         release = branches["release"]
-        self.assertLess(
-            release.index("set_state(Battery.discharge_limit, restored_limit)"),
-            release.index("telemetry_hold_discharge_limit"),
-        )
+        self.assertNotIn("Battery.discharge_limit", engage)
+        self.assertNotIn("Battery.discharge_limit", release)
+        self.assertNotIn("set_state(Battery.discharge_limit, 0)", ast.unparse(target))
 
     def test_fast_loop_has_no_arrival_precharge_guard(self):
         source = Path(__file__).parents[1].joinpath("energy.py").read_text()
@@ -1725,10 +1691,11 @@ class SetpointControlTests(unittest.TestCase):
             "datetime": datetime,
             "timedelta": timedelta,
             "PVForecast": PVForecastStub,
-            "PVForecastWithPrices": lambda period_start, pv_estimate, price_per_kwh: SimpleNamespace(
+            "PVForecastWithPrices": lambda period_start, pv_estimate, price_per_kwh, pv_estimate10=None: SimpleNamespace(
                 period_start=period_start,
                 pv_estimate=pv_estimate,
                 price_per_kwh=price_per_kwh,
+                pv_estimate10=pv_estimate10,
             ),
             "get_attr": get_attr,
             "get_price": lambda _hour, _minute: 0.2875,
@@ -3340,8 +3307,7 @@ class SetpointControlTests(unittest.TestCase):
         target_sets = [
             call for call in ast.walk(node)
             if isinstance(call, ast.Call)
-            and isinstance(call.func, ast.Name)
-            and call.func.id == "set_state"
+            and (ast.unparse(call.func) in ("set_state", "service.call"))
             and any(
                 isinstance(child, ast.Attribute) and child.attr == "force_charge_up_to"
                 for child in ast.walk(call)
@@ -3370,8 +3336,7 @@ class SetpointControlTests(unittest.TestCase):
             and "auto_force_charge_target" in ast.unparse(if_node.test)
             and any(
                 isinstance(call, ast.Call)
-                and isinstance(call.func, ast.Name)
-                and call.func.id == "set_state"
+                and (ast.unparse(call.func) in ("set_state", "service.call"))
                 and any(
                     isinstance(child, ast.Attribute) and child.attr == "force_charge_up_to"
                     for child in ast.walk(call)

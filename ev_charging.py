@@ -1,6 +1,6 @@
 # ruff: noqa: I001
 
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 
@@ -10,9 +10,14 @@ if TYPE_CHECKING:
     from modules.utils import get, get_attr
     from modules.const import EV as Const
     from modules.energy_core import (
+        ChargeAction,
         ChargeMode,
         EV_SURPLUS_START_CONFIRMATION_MINUTES,
         HYSTERESIS_BUFFER,
+        calculate_live_pv_headroom_power,
+        get_low_pv_ev_charge_target,
+        is_low_pv_ev_grid_charge_authorized,
+        get_ev_surplus_import_safety_action,
         get_drive_required_soc,
         get_ongoing_and_next_drive,
         parse_ev_schedule_entries,
@@ -48,12 +53,17 @@ else:
     from utils import get, set_state, get_attr, now, with_timezone
     from states import Automation, Charger, ElectricityPrices, EV, Excess, Battery, House, PVProduction, Grid
     from energy_core import (
+        ChargeAction,
         ChargeMode,
         EV_SURPLUS_START_CONFIRMATION_MINUTES,
         HYSTERESIS_BUFFER,
         _get_charge_action,
         _get_ev_energy_needed,
         _get_ev_smart_charge_limit,
+        calculate_live_pv_headroom_power,
+        get_low_pv_ev_charge_target,
+        is_low_pv_ev_grid_charge_authorized,
+        get_ev_surplus_import_safety_action,
         get_drive_required_soc,
         get_ev_charge_feedback_state,
         get_ongoing_and_next_drive,
@@ -63,7 +73,7 @@ else:
     from victron import Victron
 
 
-@state_trigger(f"{EV.planned_drives}")
+@state_trigger(f"{EV.planned_drives} or {EV.soc} or {House.energy_balance_5_day} or {EV.charge_plan}")
 @time_trigger
 @time_trigger("period(now, 30sec)")
 def smart_charge_limit():
@@ -73,15 +83,78 @@ def smart_charge_limit():
 
     The limit is calculated based on the time until the next drive.
     """
+    t_now = now()
     schedule = get_attr(EV.planned_drives, "next_event")
     active_schedule = get(EV.planned_drives, False)
+    try:
+        five_day_balance = (
+            float(get_attr(House.energy_balance_5_day, "usable_battery_kwh"))
+            + float(get_attr(House.energy_balance_5_day, "pv_kwh"))
+            - float(get_attr(House.energy_balance_5_day, "house_kwh"))
+        )
+    except (TypeError, ValueError, OverflowError):
+        five_day_balance = float("nan")
+    existing_target = get(EV.low_pv_charge_target, 0)
+    existing_deadline = get_attr(EV.low_pv_charge_target, "target_deadline")
+    if isinstance(existing_deadline, str) and existing_deadline:
+        existing_deadline = datetime.fromisoformat(existing_deadline)
+    pv_opportunity_kwh = get_attr(EV.charge_plan, "planned_pv_ev_wall_kwh")
+    pv_opportunity_calculated_at = get_attr(EV.charge_plan, "calculated_at")
+    balance_calculated_at = get_attr(House.energy_balance_5_day, "calculated_at")
+    low_pv_target = get_low_pv_ev_charge_target(
+        current_soc=get(EV.soc, float("nan")),
+        five_day_balance=five_day_balance,
+        next_drive=schedule,
+        t_now=t_now,
+        existing_target=existing_target,
+        balance_calculated_at=balance_calculated_at,
+        existing_deadline=existing_deadline,
+        pv_opportunity_kwh=pv_opportunity_kwh,
+        pv_opportunity_calculated_at=pv_opportunity_calculated_at,
+    )
+    if low_pv_target >= 100:
+        low_pv_deadline = existing_deadline if existing_target >= 100 and existing_deadline else schedule
+    else:
+        low_pv_deadline = None
+    grid_charge_authorized = is_low_pv_ev_grid_charge_authorized(
+        low_pv_target,
+        get(EV.soc, float("nan")),
+        five_day_balance,
+        t_now,
+        balance_calculated_at,
+        pv_opportunity_kwh,
+        pv_opportunity_calculated_at,
+        active_session=low_pv_target >= 80,
+    )
+    set_state(
+        EV.low_pv_charge_target,
+        low_pv_target,
+        friendly_name="EV low-PV overnight charge target",
+        unit_of_measurement="%",
+        active=low_pv_target > 0,
+        grid_charge_authorized=grid_charge_authorized,
+        five_day_energy_available_before_ev_kwh=five_day_balance,
+        published_five_day_balance_kwh=get(House.energy_balance_5_day, float("nan")),
+        balance_threshold_kwh=3.0,
+        active_session_completion_threshold_kwh=0.1,
+        trigger_soc=40.0,
+        target_deadline=low_pv_deadline.isoformat() if low_pv_deadline else None,
+        planned_pv_ev_wall_kwh=pv_opportunity_kwh,
+        pv_opportunity_calculated_at=pv_opportunity_calculated_at,
+        calculated_at=t_now.isoformat(),
+    )
 
-    smart_charge_limit = _get_ev_smart_charge_limit(schedule, now(), active_schedule=active_schedule)
+    smart_charge_limit = _get_ev_smart_charge_limit(schedule, t_now, active_schedule=active_schedule)
+    if low_pv_target >= 100:
+        smart_charge_limit = 100
+    elif low_pv_target >= 80 and not schedule:
+        smart_charge_limit = 80
 
     set_state(EV.smart_charge_limit, smart_charge_limit)
 
 
 last_ev_charging_phase_change = now() - timedelta(minutes=15)
+last_ev_load_adjustment_at = now() - timedelta(minutes=15)
 last_charger_reset = now() - timedelta(minutes=15)
 
 PV_SURPLUS_START_CONFIRMATION = timedelta(minutes=EV_SURPLUS_START_CONFIRMATION_MINUTES)
@@ -97,6 +170,49 @@ last_pv_surplus_stop = now() - PV_SURPLUS_RESTART_LOCKOUT
 last_ev_action = None
 last_ev_mode = None
 last_ev_reason = ""
+last_offer_reconcile_transaction = None
+
+
+@time_trigger("period(now, 60sec)")
+def reconcile_required_charge_offer():
+    """Repair a stale transaction profile when a required charge is throttled.
+
+    The station-wide limit can read 16 A while a lower transaction profile
+    still offers 6 A. Apply one transaction-bound correction only for an
+    automation-owned required or low-PV grid charge, after meter readings have
+    had time to settle. Station-wide circuit limits remain authoritative.
+    """
+    global last_offer_reconcile_transaction
+    if not get(Automation.auto_ev_charging, False) or get(Charger.force_charge, False):
+        return
+    if last_ev_mode not in (ChargeMode.required, ChargeMode.low_pv_grid):
+        return
+    if not get(Charger.control_switch, False):
+        return
+    if str(get(Charger.status_connector, "")).lower() != "charging":
+        return
+    started = get_attr(Charger.status_connector, "last_changed")
+    if started is None or (now() - started).total_seconds() < 60:
+        return
+    transaction = str(get(Charger.transaction_id, ""))
+    if transaction in ("", "unknown", "unavailable", "0", "none"):
+        return
+    if transaction == last_offer_reconcile_transaction:
+        return
+    desired = get(Charger.current_setting, None, mapper=float)
+    offered = get(Charger.current_offered, None, mapper=float)
+    if desired is None or offered is None or not Const.min_current <= desired <= Const.max_current:
+        return
+    if not 0 < offered < desired - 1:
+        return
+    # Mark before calling the service so a rejection cannot cause a request
+    # storm. A subsequent transaction is eligible for a fresh attempt.
+    last_offer_reconcile_transaction = transaction
+    log.warning(
+        f"Required EV charge: wallbox offers {offered:.1f} A despite a {desired:.0f} A "
+        f"station limit; updating transaction {transaction} current profile"
+    )
+    service.call("number", "set_value", entity_id=Charger.session_current_limit, value=desired)
 
 
 def set_pv_surplus_marker(active: bool):
@@ -210,6 +326,7 @@ def turn_off_charger(reason: str = "", check_phase_change_cooldown=True, force=F
 
 
 def set_current(current, reason: str | None = None):
+    global last_ev_load_adjustment_at
     configured_current = get(Charger.current_setting, -1)
     if configured_current != current:
         if not Const.min_current <= current <= Const.max_current:
@@ -218,6 +335,8 @@ def set_current(current, reason: str | None = None):
             )
             return
         service.call("number", "set_value", entity_id=Charger.current_setting, value=current)
+        if get(Charger.control_switch, False):
+            last_ev_load_adjustment_at = now()
         log.warning(
             f"Setting current from {configured_current:.0f}A to {current}A. Reason: {reason or 'no reason provided'}"
         )
@@ -228,7 +347,7 @@ def set_current(current, reason: str | None = None):
 def set_phases_and_current(phases, current, reason: str | None = None):
     task.unique("control_ev_charging", kill_me=False)
 
-    global last_ev_charging_phase_change
+    global last_ev_charging_phase_change, last_ev_load_adjustment_at
 
     charger_enabled = get(Charger.control_switch, False)
     configured_phases = get(Charger.phases, 3)
@@ -275,6 +394,7 @@ def set_phases_and_current(phases, current, reason: str | None = None):
 
     if charger_enabled:
         turn_on_charger(reason)
+        last_ev_load_adjustment_at = now()
 
     return True
 
@@ -282,12 +402,12 @@ def set_phases_and_current(phases, current, reason: str | None = None):
 @time_trigger
 @time_trigger("period(now, 30sec)")
 def ev_energy_needed():
-    """Publish the same effective trip target used by live EV control."""
+    """Publish the hard trip obligation separately from optional charging."""
     fallback_required_soc = get(EV.required_soc, 80)
-    required_soc = fallback_required_soc
-    current_soc = get(EV.soc, 0)
+    required_soc = current_soc = get(EV.soc, 0)
     smart_charge_limit = get(EV.smart_charge_limit, required_soc)
     smart_limiter_active = get(Automation.auto_charge_limit, False)
+    low_pv_charge_target = get(EV.low_pv_charge_target, 0)
 
     target_source = "input"
     scheduled_required_soc = None
@@ -302,8 +422,8 @@ def ev_energy_needed():
                 required_soc = scheduled_required_soc
                 target_source = "schedule"
 
-    energy_needed = _get_ev_energy_needed(required_soc, current_soc, smart_charge_limit, smart_limiter_active)
     effective_required_soc = min(required_soc, smart_charge_limit) if smart_limiter_active else required_soc
+    energy_needed = max(0, effective_required_soc - current_soc) / 100 * Const.ev_capacity
     set_state(
         EV.energy_needed,
         energy_needed,
@@ -312,6 +432,8 @@ def ev_energy_needed():
         scheduled_required_soc=scheduled_required_soc,
         effective_required_soc=effective_required_soc,
         smart_charge_limit=smart_charge_limit,
+        low_pv_charge_target=low_pv_charge_target,
+        optional_energy_to_target=max(0, low_pv_charge_target - current_soc) / 100 * Const.ev_capacity,
         target_source=target_source,
         next_drive=next_drive.isoformat() if next_drive else None,
     )
@@ -364,6 +486,7 @@ def get_ev_schedule(t_now=None):
 
 @time_trigger
 @time_trigger("period(now, 60sec)")
+@state_trigger(f"{Grid.power_ac}.as_float() > 0.3 and {Charger.control_switch} == 'on'")
 @state_active(
     f"{Charger.force_charge} == 'off' and {Automation.auto_ev_charging} == 'on' and ({Charger.ready} == 'on' or {Charger.control_switch} == 'on')"
 )
@@ -373,6 +496,10 @@ async def auto_ev_charging():
 
     # ensure only one instance of this task is running (phase switching can take a while)
     task.unique("control_ev_charging", kill_me=True)
+    global last_ev_action, last_ev_mode, last_ev_reason
+    global pv_surplus_active, pv_surplus_started_at
+    global pv_surplus_start_candidate_since, pv_surplus_stop_candidate_since, last_pv_surplus_stop
+    global last_ev_load_adjustment_at
 
     # Configuration parameters from Const class
     Const.voltage = 230  # Volts (regional standard)
@@ -387,7 +514,7 @@ async def auto_ev_charging():
     t_now = now()
 
     # required state of charge defined by the owner
-    required_soc = get(EV.required_soc, 80)
+    required_soc = current_soc
 
     # the current excess power available, this is defined as power going into the battery or into the grid (or the opposite, depending on the sign)
     excess_power_average = get(Excess.power_1m_average, 1337)  # in W
@@ -440,8 +567,9 @@ async def auto_ev_charging():
 
     smart_limiter_active = get(Automation.auto_charge_limit, False)
     ev_charge_limit = get(EV.smart_charge_limit, 80)
+    low_pv_charge_target = get(EV.low_pv_charge_target, 0)
 
-    energy_needed = get(EV.energy_needed, 0)  # in kWh
+    energy_needed = 0.0  # hard trip obligation only
     battery_force_charge = get(Battery.force_charge_switch, False)
 
     inverter_mode = get(Victron.inverter_mode_sensor, default="off").lower()
@@ -477,6 +605,15 @@ async def auto_ev_charging():
     if next_drive:
         next_drive = with_timezone(next_drive)
 
+    if low_pv_charge_target > current_soc:
+        # Optional replenishment raises the PV/overnight ceiling, but never the
+        # hard trip obligation used by emergency and daytime grid branches.
+        ev_charge_limit = max(ev_charge_limit, low_pv_charge_target)
+    energy_needed = max(0, required_soc - current_soc) / 100 * Const.ev_capacity
+    low_pv_grid_charge_allowed = bool(
+        get_attr(EV.low_pv_charge_target, "grid_charge_authorized", False)
+    )
+
     hours_available_to_charge = ((next_drive - t_now).total_seconds() / 3600) if next_drive else 999
 
     # these are binary sensors defined separately that indicate whether the price is relatively low or high
@@ -490,9 +627,76 @@ async def auto_ev_charging():
     planned_power = min(planned_power, max(0.0, pv_total_power - get(House.loads, pv_total_power)))
     # Correct immediate import while charging instead of waiting for the
     # one-minute filter or the ordinary five-minute surplus stop timer.
-    grid_import_w = max(0.0, get(Grid.power_ac, 0) * 1000)
+    grid_power_w = get(Grid.power_ac, 0) * 1000
+    grid_import_w = max(0.0, grid_power_w)
+    grid_export_w = max(0.0, -grid_power_w)
+    # A phase change takes time and PV can collapse while the wallbox ramps.
+    # Do not wait for the normal one-minute control tick in that case: a
+    # surplus-only charge that begins importing must yield immediately. This
+    # guard never interrupts a required or low-price charge.
+    settling_started_at = pv_surplus_started_at
+    if settling_started_at is None or last_ev_load_adjustment_at > settling_started_at:
+        settling_started_at = last_ev_load_adjustment_at
+    surplus_run_seconds = (
+        (t_now - settling_started_at).total_seconds()
+        if settling_started_at is not None
+        else None
+    )
+    surplus_import_detected = (
+        is_charging
+        and grid_import_w > 300
+        and last_ev_mode == ChargeMode.surplus
+    )
+    safety_action, safety_current = get_ev_surplus_import_safety_action(
+        grid_import_w,
+        surplus_run_seconds,
+        configured_current,
+        configured_phases,
+    ) if surplus_import_detected else ("none", None)
+    if safety_action == "hold":
+        log.warning(
+            f"Allowing transient grid import {grid_import_w:.0f} W while EV/home-battery controls settle "
+            f"({surplus_run_seconds:.0f}s/30s)"
+        )
+        return
+    if safety_action == "reduce":
+        reason = (
+            f"Surplus safety adjustment for {grid_import_w:.0f} W grid import: "
+            f"reducing {configured_phases}P current from {configured_current:.0f}A to {safety_current}A"
+        )
+        log.warning(reason)
+        set_current(safety_current, reason)
+        return
+    if safety_action == "stop":
+        reason = f"Immediate surplus safety stop: measured grid import {grid_import_w:.0f} W"
+        log.warning(reason)
+        turn_off_charger(reason, check_phase_change_cooldown=False, force=True)
+        if get(Charger.control_switch, False):
+            log.warning("Immediate surplus safety stop was not confirmed")
+            return
+        pv_surplus_active = False
+        pv_surplus_started_at = None
+        pv_surplus_start_candidate_since = None
+        pv_surplus_stop_candidate_since = None
+        last_pv_surplus_stop = t_now
+        set_pv_surplus_marker(False)
+        last_ev_action = ChargeAction.off
+        last_ev_mode = ChargeMode.hard_stop
+        last_ev_reason = reason
+        return
     if is_charging and grid_import_w > 200:
         planned_power = min(planned_power, max(0.0, wallbox_power - grid_import_w - 150))
+    # The forecast plan chooses among future PV windows. It must not prevent
+    # consumption of physically measured PV that is already exporting or is
+    # currently being absorbed by the home battery. The helper subtracts all
+    # simultaneous import, so this never authorizes grid or forced-battery
+    # charging.
+    live_pv_headroom_power = calculate_live_pv_headroom_power(
+        grid_power_w,
+        get(Battery.power, 0),
+        wallbox_power,
+        is_charging,
+    )
 
     # Calculate minimum time needed to charge the vehicle, we subtract 1 to account for charging inefficiencies
     min_hours_needed = energy_needed / (3 * Const.voltage * (Const.max_current - 1) / 1000)  # in hours
@@ -506,7 +710,10 @@ async def auto_ev_charging():
         f"Energy needed: {energy_needed:.2f} kWh, Time needed: {min_hours_needed:.2f}h, "
         f"low price: {low_price}, high price: {high_price}, next drive: {next_drive}, "
         f"EV charge limit: {ev_charge_limit:.0f}%, protected battery floor: {battery_floor_soc:.1f}%, "
-        f"plan cap: {planned_power:.0f} W to {planned_target_soc:.1f}%"
+        f"low-PV overnight target: {low_pv_charge_target:.0f}%, "
+        f"low-PV grid authorized: {low_pv_grid_charge_allowed}, "
+        f"plan cap: {planned_power:.0f} W to {planned_target_soc:.1f}%, "
+        f"measured PV headroom: {live_pv_headroom_power:.0f} W"
     )
 
     #  -------------------------- Charging Strategy Logic -----------------------------------
@@ -541,18 +748,14 @@ async def auto_ev_charging():
         battery_support_power=battery_support_power,
         planned_power=planned_power,
         planned_target_soc=planned_target_soc,
+        live_pv_headroom_power=live_pv_headroom_power,
+        low_pv_charge_target_soc=low_pv_charge_target,
+        low_pv_grid_charge_allowed=low_pv_grid_charge_allowed,
     )
 
-    global last_ev_action, last_ev_mode, last_ev_reason
     last_ev_action, last_ev_mode, last_ev_reason = action, charge_mode, reason
 
     log.warning(f"Got charge action: {action} mode {charge_mode} phases {phases} current {current}: {reason}")
-
-    global pv_surplus_active
-    global pv_surplus_started_at
-    global pv_surplus_start_candidate_since
-    global pv_surplus_stop_candidate_since
-    global last_pv_surplus_stop
 
     is_pv_surplus_action = action == "on" and charge_mode == ChargeMode.surplus
     hard_stop = charge_mode == ChargeMode.hard_stop
@@ -593,7 +796,9 @@ async def auto_ev_charging():
 
         if not pv_surplus_active:
             pv_surplus_active = True
-            pv_surplus_started_at = t_now
+            # Phase/current changes can take tens of seconds. Anchor startup
+            # safety to the confirmed switch-on, not the stale policy snapshot.
+            pv_surplus_started_at = now()
             set_pv_surplus_marker(True)
         pv_surplus_start_candidate_since = None
 

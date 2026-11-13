@@ -139,11 +139,26 @@ def get_auto_inverter_mode(
             )
             new_mode = InverterMode.charger_only
 
-    if electricity_price < max_charge_price and battery_soc < target_soc and battery_soc < charge_limit_percent:
+    # The grid-charge target is independent of the self-consumption reserve.
+    # During the overnight cheap-price window this is the energy required at
+    # its end to cover the following expensive region.  Let the battery serve
+    # cheap-period load while it is above that reserve, then turn the inverter
+    # off at the reserve so it cannot be drained below the forecast need and
+    # charged back again. Daytime low-price periods retain normal inverter
+    # behavior so PV can serve loads and charge the battery. The start
+    # tolerance only covers the 0.1% SOC reporting resolution.
+    is_night = t_now.hour < 7 or t_now.hour >= 19
+    night_battery_hold_required = (
+        0 < charge_limit_percent <= 100
+        and battery_soc <= charge_limit_percent
+    )
+    if (electricity_price < max_charge_price
+            and 0 < charge_limit_percent <= 100
+            and battery_soc < charge_limit_percent - (0 if force_charge_switch else 0.1)):
         reason = "Setting Victron inverter mode to 'On' due to low price"
         new_mode = InverterMode.on
         # turn on switch.victron_victron_force_charge
-        reason = f"Enabling force charge switch and setting charge limit, {battery_soc} < {target_soc}, < {charge_limit_percent}"
+        reason = f"Grid charging: SOC {battery_soc:.1f}% < charge target {charge_limit_percent:.1f}%, price {electricity_price:.4f} < {max_charge_price:.4f}"
         new_force_charge_switch_state = True
         new_charge_limit = 3000
     else:
@@ -151,6 +166,14 @@ def get_auto_inverter_mode(
             reason = "Disabling force charge switch and resetting charge limit"
             new_charge_limit = -1
             new_force_charge_switch_state = False
+        if is_low_price and is_night and night_battery_hold_required and not ev_is_charging:
+            reason = (
+                f"Low-price battery hold: SOC {battery_soc:.1f}% has reached "
+                f"the {charge_limit_percent:.1f}% reserve for the following "
+                "high-price period"
+            )
+            new_mode = InverterMode.off
+            new_charge_limit = -1
         elif (
             allow_discharge_block
             and pv_power < 0.5 * daily_avg_power

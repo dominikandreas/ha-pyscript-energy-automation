@@ -14,7 +14,7 @@ if TYPE_CHECKING:
     from modules.ev_plan import build_ev_charge_plan, ev_plan_slot, ev_schedule_signature, valid_ev_plan_slots
     # The type checker (linter) does not know that utils can directly be imported in the pyscript engine.
     # Therefore during type checking we pretend to import them from modules.utils, which it can resolve.
-    from modules.utils import clip, get, get_attr, set_state
+    from modules.utils import clip, get, get_attr, register_output_state, set_state
     from modules.const import EV as EVConst
     from modules.energy_core import (
         _get_ev_smart_charge_limit,
@@ -119,7 +119,7 @@ if TYPE_CHECKING:
 else:
     from ev_plan import build_ev_charge_plan, ev_plan_slot, ev_schedule_signature, valid_ev_plan_slots
     from const import EV as EVConst
-    from utils import clip, get, get_attr, now, set_state, with_timezone
+    from utils import clip, get, get_attr, now, register_output_state, set_state, with_timezone
     from states import (
         Automation,
         Battery,
@@ -349,6 +349,39 @@ state.persist(  # noqa: F821 - provided by the Pyscript runtime
     },
 )
 
+state.persist("pyscript.battery_balance_completed_at", default_value="")
+state.persist("pyscript.battery_balance_session", default_value="")
+state.persist("pyscript.night_charge_authorization", default_value="")
+
+
+@time_trigger
+@time_trigger("period(now, 60sec)")
+def record_battery_balance_completion():
+    """Record an actual continuous full-charge hold, including PV charges."""
+    full = "binary_sensor.battery_fully_charged"
+    if not get(full, False):
+        return
+    since = get_attr(full, "last_changed")
+    if since is None or (now() - since).total_seconds() < 1800:
+        return
+    completed = parse_aware_datetime(get("pyscript.battery_balance_completed_at", ""))
+    if completed is None or completed < since:
+        state.set("pyscript.battery_balance_completed_at", now().isoformat())
+        service.call("input_boolean", "turn_on", entity_id=Battery.cells_balanced)
+        log.warning("Battery balance completed after 30 minutes continuously full")
+
+
+@pyscript_compile
+def is_night_charge_authorized(target, authorized_target, valid_until, t_now):
+    try:
+        target = float(target)
+        authorized_target = float(authorized_target)
+        return (isfinite(target) and isfinite(authorized_target)
+                and abs(target - authorized_target) <= 0.11
+                and valid_until is not None and t_now < valid_until)
+    except (TypeError, ValueError, OverflowError):
+        return False
+
 
 @service  # noqa: F821 - provided by the Pyscript runtime
 def set_roof_pv_emergency_pending(pending=True):
@@ -397,23 +430,17 @@ def limit_forecast_discharge_to_hardware_w(
 
 
 def get_planned_discharge_limit_w(default: float = -1):
-    """Read discharge capability for planning, ignoring the telemetry hold.
+    """Configured capability, never the price/telemetry-limited actuator value."""
+    return get("input_number.battery_discharge_power_cap", 0)
 
-    The stale-telemetry hold parks the shared discharge-limit input at 0
-    for a few seconds to freeze live actuation.  A 24-hour forecast that
-    samples that transient zero plans a battery that cannot discharge at
-    all: frozen energy, grid import all night, slashed export schedule
-    (observed 2026-09-24).  While the hold latch holds the pre-hold value,
-    plan with that instead; sustained bans (price automation, inverter)
-    set no latch and still reach the simulation unchanged.
-    """
-    held_limit = get("pyscript.telemetry_hold_discharge_limit", "")
-    if held_limit not in ("", None, "unknown", "unavailable"):
-        try:
-            return float(held_limit)
-        except (TypeError, ValueError):
-            pass
-    return get(Battery.discharge_limit, default)
+
+@pyscript_compile
+def resolve_battery_discharge_policy(cap_w, telemetry_hold=False):
+    """Compose independent constraints; never save a temporary zero as capacity."""
+    if telemetry_hold or not isfinite(cap_w) or cap_w < -1:
+        return 0.0
+    return cap_w
+
 
 
 @pyscript_compile
@@ -597,6 +624,11 @@ def grid_1m_average():
 @state_trigger(Automation.min_discharge_price)
 @state_trigger(ElectricityPrices.current_price)
 @state_trigger(EV.is_charging)
+@state_trigger(Battery.force_charge_up_to)
+@state_trigger(Battery.max_charge_price)
+@state_trigger(Battery.soc)
+@state_trigger("sensor.battery_night_charge_plan")
+@state_trigger("pyscript.night_charge_authorization")
 @time_trigger("period(now, 300sec)")
 def auto_victron_set_inverter_mode():
     # Get the current time and electricity price
@@ -632,6 +664,14 @@ def auto_victron_set_inverter_mode():
     reserve_soc = get_reserve_soc()
     minimal_soc = get(Automation.minimal_soc, reserve_soc)
     t_now = now()
+
+    # An automatic target is an expiring authorization, not a permanent
+    # instruction to charge. Manual targets remain under the user's control.
+    if get(Automation.auto_force_charge_target, False):
+        auth_target = get("pyscript.night_charge_authorization", None, mapper=float)
+        auth_until = parse_aware_datetime(get_attr("pyscript.night_charge_authorization", "valid_until"))
+        if not is_night_charge_authorized(charge_limit_percent, auth_target, auth_until, t_now):
+            charge_limit_percent = 0
 
     unified_scheduler_active = get_attr(Grid.power_setpoint_target, "unified_scheduler_active", False)
     if battery_capacity != -1337 and battery_energy != -1337:
@@ -680,9 +720,39 @@ def auto_victron_set_inverter_mode():
         is_low_price=low_price,
     )
 
+    # Keep a scheduled balancing session supplied while the full-charge
+    # sensor accumulates its 30-minute dwell. Never extend beyond the cheap
+    # window or override a disabled automatic target.
+    balance_deadline = parse_aware_datetime(get_attr("sensor.battery_night_charge_plan", "balance_deadline"))
+    balance_calculated = parse_aware_datetime(get_attr("sensor.battery_night_charge_plan", "calculated_at"))
+    if (
+        get(Automation.auto_force_charge_target, False)
+        and get_attr("sensor.battery_night_charge_plan", "balance_active", False)
+        and balance_deadline is not None and t_now < balance_deadline
+        and balance_calculated is not None
+        and 0 <= (t_now - balance_calculated).total_seconds() <= 300
+        and electricity_price < max_charge_price
+        and charge_limit_percent >= 100
+    ):
+        new_mode = InverterMode.on
+        new_charge_power_limit = 3000
+        new_force_charge_switch_state = True
+        reason = "Scheduled battery cell-balancing charge and full-SOC hold"
+
     # log.warning(
     #     f"Auto Victron inverter mode: {new_mode} {reason} pv power {pv_power}W daily avg {daily_avg_power}W battery soc {battery_soc}% target soc {target_soc}% surplus energy {surplus_energy}kWh target soc {target_soc}%"
     # )
+
+    set_state(
+        "sensor.battery_grid_charge_decision",
+        "charging" if new_force_charge_switch_state else "waiting",
+        target_soc=charge_limit_percent,
+        battery_soc=battery_soc,
+        price=electricity_price,
+        max_charge_price=max_charge_price,
+        reason=reason,
+        calculated_at=t_now.isoformat(),
+    )
 
     if new_charge_power_limit is not None:
         set_state(Battery.charge_limit, new_charge_power_limit)
@@ -700,7 +770,7 @@ def auto_victron_set_inverter_mode():
         )
 
         last_changed = get_attr(Victron.inverter_mode_input_select, "last_changed")
-        if new_mode == InverterMode.on and (now() - last_changed).total_seconds() / 60 < 30:
+        if new_mode == InverterMode.on and not new_force_charge_switch_state and (now() - last_changed).total_seconds() / 60 < 30:
             log.warning("Skipping Victron inverter mode change since last change was less than 30 minutes ago")
             return
 
@@ -1370,6 +1440,130 @@ def get_solar_cycle_shortfall(
 
 
 @pyscript_compile
+def calculate_night_charge_plan(forecast, t_now, capacity, floor_kwh,
+                                daily_w, nightly_w, max_price,
+                                pv_factor=0.8, charge_efficiency=0.9,
+                                discharge_efficiency=0.9, pv_charge_limit_w=6600):
+    """Stored energy needed at cheap-window end until the following cheap window.
+
+    Backward net-load integration credits only PV available before each load.
+    It never reads current SOC, a prior target, simulated grid charging, or EV
+    demand, so charging cannot erase its own target or cause 0/target oscillation.
+    Prices use the same retail tariff as the simulator, not EPEX export prices.
+    """
+    if (len(forecast) < 2 or not all(isfinite(v) for v in
+            (capacity, floor_kwh, daily_w, nightly_w, max_price, pv_factor,
+             charge_efficiency, discharge_efficiency, pv_charge_limit_w))
+            or capacity <= 0 or daily_w < 0 or nightly_w < 0
+            or not 0 < charge_efficiency <= 1 or not 0 < discharge_efficiency <= 1
+            or not 0 <= pv_factor <= 1 or pv_charge_limit_w < 0):
+        raise ValueError("Invalid night-charge planning inputs")
+    step = forecast[1].period_start - forecast[0].period_start
+    if step.total_seconds() <= 0:
+        raise ValueError("Invalid forecast interval")
+    future = [e for e in forecast if e.period_start + step > t_now]
+    cheap_started = False
+    charge_end = coverage_end = None
+    demand = []
+    previous = None
+    for entry in future:
+        if previous is not None and entry.period_start - previous != step:
+            raise ValueError("Night-charge forecast has missing intervals")
+        previous = entry.period_start
+        if not isfinite(entry.pv_estimate) or entry.pv_estimate < 0:
+            raise ValueError("Invalid PV forecast")
+        cheap = get_price(entry.period_start.hour, entry.period_start.minute) < max_price
+        if not cheap_started:
+            cheap_started = cheap
+            continue
+        if charge_end is None:
+            if cheap:
+                continue
+            charge_end = entry.period_start
+        if cheap:
+            coverage_end = entry.period_start
+            break
+        demand.append(entry)
+    if charge_end is None or coverage_end is None:
+        return dict(target_soc=0.0, status="no_complete_charge_window",
+                    charge_end=None, coverage_end=None, required_kwh=0.0)
+    required = max(0.0, min(capacity, floor_kwh))
+    hours = step.total_seconds() / 3600
+    unserved = 0.0
+    for entry in reversed(demand):
+        house = daily_w if 7 < entry.period_start.hour < 19 else nightly_w
+        conservative_pv = getattr(entry, "pv_estimate10", None)
+        if conservative_pv is None or not isfinite(conservative_pv) or conservative_pv < 0:
+            conservative_pv = entry.pv_estimate * pv_factor
+        else:
+            conservative_pv = min(conservative_pv, entry.pv_estimate * pv_factor)
+        net = house - conservative_pv * 1000
+        if net >= 0:
+            required += net * hours / 1000 / discharge_efficiency
+        else:
+            required = max(floor_kwh, required - min(-net, pv_charge_limit_w) * hours / 1000 * charge_efficiency)
+        if required > capacity:
+            unserved += required - capacity
+            required = capacity
+    # Bound the initial energy against a second, sunnier PV scenario. The
+    # backward pass above protects the low-PV case; this forward pass estimates
+    # how much room is needed for an unexpectedly productive day. If those
+    # constraints conflict, preserve the minimum energy needed to avoid
+    # depletion and report the conflict rather than hiding it.
+    def peak_for_initial(initial_kwh):
+        energy = initial_kwh
+        peak = energy
+        for entry in demand:
+            house = daily_w if 7 < entry.period_start.hour < 19 else nightly_w
+            net_w = entry.pv_estimate * 1000 * 1.1 - house
+            if net_w >= 0:
+                energy += min(net_w, pv_charge_limit_w) * hours / 1000 * charge_efficiency
+            else:
+                energy = max(0.0, energy + net_w * hours / 1000 / discharge_efficiency)
+            peak = max(peak, energy)
+        return peak
+
+    # Retain 2% of nominal capacity as headroom for forecast error. This is a
+    # soft objective: a forecast deficit takes priority over this ceiling.
+    peak_limit = capacity * 0.98
+    lo, hi = 0.0, capacity
+    for _ in range(24):
+        mid = (lo + hi) / 2
+        if peak_for_initial(mid) <= peak_limit:
+            lo = mid
+        else:
+            hi = mid
+    headroom_conflict = required > lo + 0.001
+    # Keep enough energy for loads before conservative PV first exceeds the
+    # house load. Only trade up to 5% capacity of later reserve for headroom;
+    # do not sacrifice reserve if even an empty battery would fill anyway.
+    morning_required = floor_kwh
+    for entry in demand:
+        house = daily_w if 7 < entry.period_start.hour < 19 else nightly_w
+        low_pv = getattr(entry, "pv_estimate10", None)
+        if low_pv is None or not isfinite(low_pv) or low_pv < 0:
+            low_pv = entry.pv_estimate * pv_factor
+        else:
+            low_pv = min(low_pv, entry.pv_estimate * pv_factor)
+        if low_pv * 1000 >= house:
+            break
+        morning_required += (house - low_pv * 1000) * hours / 1000 / discharge_efficiency
+    selected = required
+    if headroom_conflict and peak_for_initial(0.0) <= peak_limit and lo > 0:
+        selected = min(required, max(lo, morning_required, required - capacity * 0.05))
+    return dict(target_soc=min(100.0, max(0.0, selected / capacity * 100)),
+                status="planned", charge_end=charge_end.isoformat(),
+                coverage_end=coverage_end.isoformat(), required_kwh=round(required, 3),
+                capacity_shortfall_kwh=round(unserved, 3),
+                high_pv_peak_kwh=round(peak_for_initial(required), 3),
+                selected_high_pv_peak_kwh=round(peak_for_initial(selected), 3),
+                headroom_ceiling_kwh=round(lo, 3),
+                headroom_conflict=headroom_conflict,
+                selected_kwh=round(selected, 3),
+                morning_reserve_kwh=round(morning_required, 3))
+
+
+@pyscript_compile
 def calculate_force_charge_target_soc(
     battery_energy_now: float,
     battery_capacity_kwh: float,
@@ -1667,6 +1861,21 @@ def get_current_ev_charge_plan(t_now, ev_schedule):
 
 
 @time_trigger
+def register_user_owned_flags():
+    """Declare user-owned helpers without touching their states.
+
+    Runs at reload; the entity schema lands in the generated YAML while the
+    user's on/off setting is never written, so reloads cannot clobber it.
+    No `initial`: fresh installs default off, otherwise the state restores.
+    """
+    register_output_state(
+        Automation.auto_force_charge_target,
+        name="Auto force charge target",
+        icon="mdi:battery-charging",
+    )
+
+
+@time_trigger
 @time_trigger("cron(*/2 * * * *)")
 @state_trigger(Grid.power_setpoint_target)
 def forecast_surplus():
@@ -1684,8 +1893,112 @@ def forecast_surplus():
     setpoint = get(Grid.power_setpoint_basis, -20)
     battery_capacity = get(Battery.capacity, 1337)
     battery_energy = get(Battery.energy, 1337)
+    if not isfinite(battery_capacity) or not 0 < battery_capacity < 1337:
+        log.warning("Battery capacity unavailable; cannot plan night charge")
+        return
+    reserve_soc = get_reserve_soc()
+    current_charge_limit = get(Battery.charge_limit, -1)
+    # The grid-charge controller temporarily writes 3000 W; that is not the
+    # PV charging capability for the following day.
+    if get(Battery.force_charge_switch, False) and current_charge_limit == 3000:
+        current_charge_limit = -1
+    configured_battery_charge_limit_w = resolve_directional_power_limit_w(
+        current_charge_limit,
+        6600.0,
+        6600.0,
+    )
+    # Keep the unbalanced-cell low-PV reserve for optional loads. The spendable
+    # horizon ends at an overnight/early-morning trough, where that reserve is
+    # active even though it is deliberately excluded from minimal_soc above.
+    battery_cells_balanced = get(Battery.cells_balanced, False)
+    surplus_reserve_soc = max(reserve_soc, 0 if battery_cells_balanced else 15)
+    surplus_battery_floor = get_battery_export_floor(
+        battery_capacity,
+        surplus_reserve_soc,
+        surplus_reserve_soc,
+        uncertainty_margin_kwh=SURPLUS_HEADROOM_RESERVE_FRACTION * battery_capacity,
+    )
+
+
+    pv_forecast = get_pv_forecast_with_prices(t_start=t_now, t_end=t_end, epex_prices=epex_prices)
+    if not pv_forecast or len(pv_forecast) < 2:
+        log.warning("Not enough PV forecast data to calculate surplus")
+        return
+    period_hours = (pv_forecast[1].period_start - pv_forecast[0].period_start).total_seconds() / 3600
+
+    # Plan from raw PV and house load, independently of charging decisions.
+    # Use one target immediately in both the controller and all forecast passes.
+    effective_charge_target = get(Battery.force_charge_up_to, 0)
+    try:
+        night_plan = calculate_night_charge_plan(
+            pv_forecast, t_now, battery_capacity, surplus_battery_floor,
+            get(House.daily_average_power, 0), get(House.nightly_average_power, 0),
+            get(Battery.max_charge_price, 0),
+            charge_efficiency=HOME_BATTERY_CHARGE_EFFICIENCY,
+            discharge_efficiency=HOME_BATTERY_DISCHARGE_EFFICIENCY,
+            pv_charge_limit_w=configured_battery_charge_limit_w,
+        )
+    except (ValueError, TypeError, OverflowError) as exc:
+        log.warning(f"Night charge forecast invalid; retaining bounded last authorization: {exc}")
+        return
+    if night_plan["status"] != "planned":
+        log.warning("Night charge window incomplete; retaining bounded last authorization")
+        return
+    # A balancing session is latched only once the cheap window starts. It is
+    # bounded by that window and survives reloads; a completed 30-minute full
+    # hold ends it. Existing full-SOC history seeds the first weekly interval.
+    automatic_night_target = get(Automation.auto_force_charge_target, False)
+    session_start = parse_aware_datetime(get("pyscript.battery_balance_session", ""))
+    session_deadline = parse_aware_datetime(get_attr("pyscript.battery_balance_session", "deadline"))
+    completed_at = parse_aware_datetime(get("pyscript.battery_balance_completed_at", ""))
+    last_full = parse_aware_datetime(get("pyscript.battery_last_full", ""))
+    # Seed the new completion history once from the previous full-SOC tracker.
+    # Do not keep re-reading it: an incomplete balance attempt can reach 99.5%
+    # and update that tracker without satisfying the 30-minute dwell.
+    if completed_at is None and last_full is not None:
+        state.set("pyscript.battery_balance_completed_at", last_full.isoformat())
+        completed_at = last_full
+    last_balance = completed_at
+    session_active = bool(
+        automatic_night_target and session_start is not None and session_deadline is not None
+        and session_start <= t_now < session_deadline
+        and (completed_at is None or completed_at < session_start)
+    )
+    due = last_balance is None or (t_now - last_balance).total_seconds() >= 7 * 86400
+    charge_end = parse_aware_datetime(night_plan.get("charge_end"))
+    if (
+        not session_active and automatic_night_target and due
+        and t_now.month in (11, 12, 1, 2)
+        and (t_now.hour >= 19 or t_now.hour < 7)
+        and night_plan["status"] == "planned"
+        and charge_end is not None and charge_end > t_now
+        and get(ElectricityPrices.current_price, 999) < get(Battery.max_charge_price, 0)
+        and night_plan["high_pv_peak_kwh"] < battery_capacity * 0.98
+    ):
+        session_start, session_deadline = t_now, charge_end
+        state.set("pyscript.battery_balance_session", t_now.isoformat(), deadline=charge_end.isoformat())
+        session_active = True
+        log.warning(f"Starting weekly winter battery balancing session, deadline {charge_end.isoformat()}")
+    night_plan["balance_active"] = session_active
+    night_plan["balance_due"] = due
+    night_plan["balance_deadline"] = session_deadline.isoformat() if session_active else None
+    night_plan["last_balance_completion"] = completed_at.isoformat() if completed_at else None
+    if session_active:
+        night_plan["target_soc"] = 100.0
+    if get(Automation.auto_force_charge_target, False):
+        effective_charge_target = round(night_plan["target_soc"], 1)
+        state.set("pyscript.night_charge_authorization", str(effective_charge_target),
+                  valid_until=night_plan["charge_end"], calculated_at=t_now.isoformat())
+        # The helper supports 0..100%; service writes persist across reloads.
+        service.call("input_number", "set_value", entity_id=Battery.force_charge_up_to,
+                     value=effective_charge_target)
+    set_state("sensor.battery_night_charge_plan", night_plan["status"],
+              automatic=get(Automation.auto_force_charge_target, False),
+              effective_target_soc=effective_charge_target,
+              calculated_at=t_now.isoformat(), **night_plan)
+
     battery_energy_updated_at = get_attr(Battery.energy, "last_updated")
-    # Battery.power is in W; an idle battery's energy reading legitimately
+    # Battery.power is in kW; convert for the W-based idle check. An idle battery's energy reading legitimately
     # sits still (HA only refreshes last_updated on change).
     battery_energy_measurement_fresh = is_battery_energy_measurement_usable(
         t_now,
@@ -1693,9 +2006,10 @@ def forecast_surplus():
         battery_energy,
         battery_capacity,
         get(Battery.soc, -1),
-        get(Battery.power, 1337),
+        get(Battery.power, 1337) * 1000,
         get_attr(Battery.power, "last_updated"),
         max_age_seconds=LIVE_BATTERY_ENERGY_MAX_MEASUREMENT_AGE_SECONDS,
+        battery_soc_updated_at=get_attr(Battery.soc, "last_updated"),
     )
     current_surplus = get(House.energy_surplus, 0)
     ev_energy = get(EV.energy, 0)
@@ -1709,11 +2023,6 @@ def forecast_surplus():
     if not are_battery_energy_values_valid(EVConst.ev_capacity, ev_energy):
         log.warning("EV energy invalid; cannot calculate EV-adjusted surplus")
         return
-    configured_battery_charge_limit_w = resolve_directional_power_limit_w(
-        get(Battery.charge_limit, -1),
-        6600.0,
-        6600.0,
-    )
     hardware_discharge_limit_w = resolve_directional_power_limit_w(
         get_planned_discharge_limit_w(-1),
         8000.0,
@@ -1756,25 +2065,6 @@ def forecast_surplus():
         reserve_soc,
     )
 
-    # Keep the unbalanced-cell low-PV reserve for optional loads. The spendable
-    # horizon ends at an overnight/early-morning trough, where that reserve is
-    # active even though it is deliberately excluded from minimal_soc above.
-    battery_cells_balanced = get(Battery.cells_balanced, False)
-    surplus_reserve_soc = max(reserve_soc, 0 if battery_cells_balanced else 15)
-    surplus_battery_floor = get_battery_export_floor(
-        battery_capacity,
-        surplus_reserve_soc,
-        surplus_reserve_soc,
-        uncertainty_margin_kwh=SURPLUS_HEADROOM_RESERVE_FRACTION * battery_capacity,
-    )
-
-
-    pv_forecast = get_pv_forecast_with_prices(t_start=t_now, t_end=t_end, epex_prices=epex_prices)
-    if not pv_forecast or len(pv_forecast) < 2:
-        log.warning("Not enough PV forecast data to calculate surplus")
-        return
-    period_hours = (pv_forecast[1].period_start - pv_forecast[0].period_start).total_seconds() / 3600
-
     battery_floor_schedule = None
     if unified_scheduler_active:
         daily_house_power = get(House.daily_average_power, 0)
@@ -1800,6 +2090,7 @@ def forecast_surplus():
     # only the dampening, EV participation, and budget knobs that define it.
     base_forecast_kwargs = dict(
         forecast=pv_forecast,
+        charge_limit=effective_charge_target,
         battery_capacity=battery_capacity,
         battery_energy=battery_energy,
         setpoint=setpoint,
@@ -1883,24 +2174,6 @@ def forecast_surplus():
         period_hours,
         HOME_BATTERY_DISCHARGE_EFFICIENCY,
     )
-    # Automatic force-charge target, behind its flag (default off).  When
-    # enabled, 0 disables the force-charge loop; the low-price gate still
-    # decides whether charging happens at all.  When disabled the helper
-    # keeps its last value for manual control.
-    if get(Automation.auto_force_charge_target, False):
-        set_state(
-            Battery.force_charge_up_to,
-            round(
-                calculate_force_charge_target_soc(
-                    battery_energy,
-                    battery_capacity,
-                    cycle_shortfall_kwh,
-                    HOME_BATTERY_DISCHARGE_EFFICIENCY,
-                    FORCE_CHARGE_SHORTFALL_EPSILON_KWH,
-                )
-            ),
-        )
-
     forecast_today = [el for el in forecast_no_ev.detail if el.period_start.day == t_now.day]
     feedin_today = sum([max(0, el.feedin - 20) for el in forecast_today]) * period_hours / 1000
     pv_feedin_today = sum([max(0, el.pv_feedin - 20) for el in forecast_today]) * period_hours / 1000
@@ -1976,12 +2249,14 @@ def forecast_surplus():
             battery_energy_at_calculation=battery_energy,
         )
 
-    if ev_schedule:
-        forecast_ev_charging_enabled = bool(
-            get(Automation.auto_ev_charging, False)
-            or get(Charger.force_charge, False)
-            or get(EV.is_charging, False)
-        )
+    forecast_ev_charging_enabled = bool(
+        get(Automation.auto_ev_charging, False)
+        or get(Charger.force_charge, False)
+        or get(EV.is_charging, False)
+    )
+    # An empty drive schedule means there is no trip obligation. It does not
+    # mean the optional low-PV/PV-surplus EV policy disappears from forecasts.
+    if forecast_ev_charging_enabled or ev_schedule:
         drive_ongoing_for_precharge, _ = get_ongoing_and_next_drive(ev_schedule, t_now)
         recent_arrival_for_precharge = None
         if drive_ongoing_for_precharge is None:
@@ -2026,6 +2301,10 @@ def forecast_surplus():
             surplus_energy=0,
             ev_energy=ev_energy,
             ev_charge_plan={},
+            # Determine attainable PV charging without assuming that the
+            # optional night-grid fill has already happened.
+            ev_low_pv_charge_target_soc=0,
+            ev_low_pv_grid_charge_allowed=False,
             return_inputs=True,
         )
         ev_plan = task.executor(build_ev_charge_plan, _forecast, planner_inputs)
@@ -2408,6 +2687,7 @@ def define_interfaces():
         period_start: datetime
         pv_estimate: float
         price_per_kwh: float = 0
+        pv_estimate10: float | None = None
 
     return EVScheduleEntry, ForecastResult, ForecastEntry, PVForecastWithPrices
 
@@ -2563,6 +2843,9 @@ def forecast(
     t_now: datetime | None = None,
     battery_discharge_limit_w: float | None = None,
     ev_charge_plan: dict | None = None,
+    ev_low_pv_charge_target_soc: float | None = None,
+    ev_low_pv_charge_deadline: datetime | None = None,
+    ev_low_pv_grid_charge_allowed: bool | None = None,
     return_inputs: bool = False,
 ):
     t_now = t_now if t_now is not None else now()
@@ -2607,6 +2890,19 @@ def forecast(
     ev_plugged_in = _or_get(EV.plugged_in, ev_plugged_in, False)
     eff_dis = _or_get(Automation.efficient_discharge, eff_dis, False)
     battery_cells_balanced = _or_get(Battery.cells_balanced, battery_cells_balanced, False)
+    ev_low_pv_charge_target_soc = _or_get(
+        EV.low_pv_charge_target,
+        ev_low_pv_charge_target_soc,
+        0,
+    )
+    if ev_low_pv_charge_target_soc > 0 and ev_low_pv_charge_deadline is None:
+        ev_low_pv_charge_deadline = get_attr(EV.low_pv_charge_target, "target_deadline")
+    if isinstance(ev_low_pv_charge_deadline, str) and ev_low_pv_charge_deadline:
+        ev_low_pv_charge_deadline = datetime.fromisoformat(ev_low_pv_charge_deadline)
+    if ev_low_pv_grid_charge_allowed is None:
+        ev_low_pv_grid_charge_allowed = bool(
+            get_attr(EV.low_pv_charge_target, "grid_charge_authorized", False)
+        )
     max_feedin = _or_get(Grid.max_feedin_target, max_feedin, 4000)
     if ev_charge_plan is None:
         ev_charge_plan = get_current_ev_charge_plan(t_now, ev_schedule)
@@ -2655,6 +2951,9 @@ def forecast(
         battery_cells_balanced=battery_cells_balanced,
         t_now=t_now,
         ev_charge_plan=ev_charge_plan,
+        ev_low_pv_charge_target_soc=ev_low_pv_charge_target_soc,
+        ev_low_pv_charge_deadline=ev_low_pv_charge_deadline,
+        ev_low_pv_grid_charge_allowed=ev_low_pv_grid_charge_allowed,
     )
     if return_inputs:
         return forecast_inputs
@@ -2707,6 +3006,9 @@ def _forecast(
     battery_cells_balanced: bool | None = None,
     t_now: datetime | None = None,
     ev_charge_plan: dict | None = None,
+    ev_low_pv_charge_target_soc: float = 0,
+    ev_low_pv_charge_deadline: datetime | None = None,
+    ev_low_pv_grid_charge_allowed: bool = False,
 ):
     if not len(forecast) > 1:
         return None
@@ -2753,6 +3055,10 @@ def _forecast(
 
     if with_ev_charging:
         assert ev_energy is not None, "ev_energy must be provided if with_ev_charging is True"
+    low_pv_target_satisfied = (
+        ev_low_pv_charge_target_soc <= 0
+        or ev_soc >= ev_low_pv_charge_target_soc - 0.01
+    )
 
     def is_charging_possible(dt, ev_energy, smart_charge_limit):
         if not with_ev_charging:
@@ -2855,10 +3161,38 @@ def _forecast(
             period_battery_hard_floor = max(period_battery_hard_floor, low_pv_floor)
 
         smart_charge_limit = 101
-        if next_drive_event:
-            smart_charge_limit = _get_ev_smart_charge_limit(next_drive_event.start, start, active_schedule=False)
+        if smart_limiter_active:
+            smart_charge_limit = _get_ev_smart_charge_limit(
+                next_drive_event.start if next_drive_event else None,
+                start,
+                active_schedule=False,
+            )
 
-        ev_energy_needed = _get_ev_energy_needed(ev_required_soc, ev_soc, smart_charge_limit, smart_limiter_active)
+        low_pv_target_active = bool(
+            not low_pv_target_satisfied
+            and ev_low_pv_charge_target_soc > 0
+            and (
+                ev_low_pv_charge_deadline is None
+                or start < ev_low_pv_charge_deadline
+            )
+        )
+        # A trip target can authorize emergency/daytime grid energy. The
+        # optional target may raise the PV/grid-night ceiling, but must never
+        # become a hard departure obligation.
+        period_ev_required_soc = ev_required_soc
+        if low_pv_target_active:
+            smart_charge_limit = (
+                max(smart_charge_limit, ev_low_pv_charge_target_soc)
+                if next_drive_event
+                else ev_low_pv_charge_target_soc
+            )
+
+        ev_energy_needed = _get_ev_energy_needed(
+            period_ev_required_soc,
+            ev_soc,
+            smart_charge_limit,
+            smart_limiter_active,
+        )
 
         ev_battery_support_power = 0.0
         arrival_precharge_active = bool(
@@ -2870,7 +3204,7 @@ def _forecast(
         )
         precharge_energy_needed = 0.0
         if arrival_precharge_active:
-            precharge_target_soc = max(ev_required_soc, smart_charge_limit)
+            precharge_target_soc = max(period_ev_required_soc, smart_charge_limit)
             precharge_energy_needed = max(
                 0.0,
                 (precharge_target_soc - ev_soc) / 100 * EVConst.ev_capacity,
@@ -2901,7 +3235,7 @@ def _forecast(
         excess_target = _get_excess_target(
             battery_target_soc=battery_target_soc,
             battery_soc=tentative_batt_soc,
-            ev_required_soc=ev_required_soc,
+            ev_required_soc=period_ev_required_soc,
             ev_is_charging=is_charging_ev,
             next_planned_drive=next_drive_event.start if next_drive_event else None,
             pv_power=power_production,
@@ -2939,7 +3273,7 @@ def _forecast(
                 get_settled_simulated_ev_charge_action(
                     next_drive=next_drive_event.start if next_drive_event else None,
                     current_soc=ev_soc,
-                    required_soc=ev_required_soc,
+                    required_soc=period_ev_required_soc,
                     energy_needed=ev_energy_needed,
                     excess_target=excess_target,
                     surplus_energy=surplus,
@@ -2964,6 +3298,12 @@ def _forecast(
                     precharge_energy_needed=precharge_energy_needed,
                     planned_power=planned_power if ev_charge_plan is not None else None,
                     planned_target_soc=planned_target_soc,
+                    low_pv_charge_target_soc=(
+                        ev_low_pv_charge_target_soc if low_pv_target_active else 0
+                    ),
+                    low_pv_grid_charge_allowed=(
+                        ev_low_pv_grid_charge_allowed if low_pv_target_active else False
+                    ),
                 )
             )
 
@@ -3025,7 +3365,7 @@ def _forecast(
             added_ev_energy = ev_charge_power * period_hours / 1000 * EVConst.charge_efficiency
             ev_charge_energy_limit = get_ev_charge_energy_limit(
                 charge_mode,
-                ev_required_soc,
+                period_ev_required_soc,
                 smart_charge_limit,
             )
             if ev_charge_plan is not None and charge_mode == ChargeMode.surplus:
@@ -3081,6 +3421,8 @@ def _forecast(
         if ev_energy is not None:
             ev_energy = max(5, ev_energy)
             ev_soc = (ev_energy / EVConst.ev_capacity) * 100
+            if ev_soc >= ev_low_pv_charge_target_soc - 0.01:
+                low_pv_target_satisfied = True
 
         # --- Battery & Grid Physics ---
 
@@ -3107,7 +3449,7 @@ def _forecast(
             )
 
             # Physical limit check (Capacity)
-            max_intake_wh = (battery_capacity - current_bat_kwh) * 1000
+            max_intake_wh = max(0.0, min(battery_capacity, charge_limit / 100 * battery_capacity) - current_bat_kwh) * 1000
             possible_charge_power = min(
                 target_charge_power,
                 max_intake_wh
@@ -3467,6 +3809,7 @@ def get_pv_forecast_with_prices(t_start: datetime, t_end: datetime, epex_prices:
                 start_time,
                 pv_estimate=forecast_entry["pv_estimate"],
                 price_per_kwh=period_price,
+                pv_estimate10=forecast_entry.get("pv_estimate10"),
             )
         )
     forecast = priced_forecast
@@ -3999,7 +4342,7 @@ def auto_setpoint_target():
     forecast_dampening = 1.0  # dampen the forecast to account for inaccuracies
     battery_energy = get(Battery.energy, 0)
     battery_energy_updated_at = get_attr(Battery.energy, "last_updated")
-    # Battery.power is in W; an idle battery's energy reading legitimately
+    # Battery.power is in kW; convert for the W-based idle check. An idle battery's energy reading legitimately
     # sits still (HA only refreshes last_updated on change).
     battery_energy_measurement_fresh = is_battery_energy_measurement_usable(
         t_now,
@@ -4007,9 +4350,10 @@ def auto_setpoint_target():
         battery_energy,
         get(Battery.capacity, 1337),
         get(Battery.soc, -1),
-        get(Battery.power, 1337),
+        get(Battery.power, 1337) * 1000,
         get_attr(Battery.power, "last_updated"),
         max_age_seconds=LIVE_BATTERY_ENERGY_MAX_MEASUREMENT_AGE_SECONDS,
+        battery_soc_updated_at=get_attr(Battery.soc, "last_updated"),
     )
     min_feedin_price = 0
 
@@ -4023,7 +4367,12 @@ def auto_setpoint_target():
         or not battery_energy_measurement_fresh
     ):
         log.error(
-            "Battery capacity or energy is unavailable, invalid, or stale; cannot calculate setpoint"
+            "Battery capacity or energy unavailable, invalid, or stale; cannot calculate setpoint: "
+            f"capacity={battery_capacity}, energy={battery_energy}, "
+            f"energy_updated={battery_energy_updated_at}, soc={get(Battery.soc, -1)}, "
+            f"soc_updated={get_attr(Battery.soc, 'last_updated')}, "
+            f"power_kw={get(Battery.power, 1337)}, "
+            f"power_updated={get_attr(Battery.power, 'last_updated')}"
         )
         return
     configured_battery_charge_limit_w = resolve_directional_power_limit_w(
@@ -4109,6 +4458,10 @@ def auto_setpoint_target():
         "eff_dis": get(Automation.efficient_discharge, False),
         "battery_cells_balanced": get(Battery.cells_balanced, False),
         "ev_charge_plan": get_current_ev_charge_plan(t_now, ev_schedule),
+        "ev_low_pv_charge_target_soc": get(EV.low_pv_charge_target, 0),
+        "ev_low_pv_charge_deadline": parse_aware_datetime(
+            get_attr(EV.low_pv_charge_target, "target_deadline")
+        ),
     }
 
     forecast_ctx = SetpointForecastContext(
@@ -5546,7 +5899,6 @@ prev_live_headroom_mode = None
 last_live_headroom_publish = None
 prev_applied_grid_target_w = None
 prev_telemetry_hold_active = False
-prev_discharge_limit_before_hold = None
 prev_telemetry_good_streak = 0
 prev_telemetry_bad_streak = 0
 prev_telemetry_hold_boot_checked = False
@@ -5570,7 +5922,6 @@ def auto_apply_setpoint():
     global last_live_headroom_publish
     global prev_applied_grid_target_w
     global prev_telemetry_hold_active
-    global prev_discharge_limit_before_hold
     global prev_telemetry_good_streak
     global prev_telemetry_bad_streak
     global prev_telemetry_hold_boot_checked
@@ -5825,7 +6176,7 @@ def auto_apply_setpoint():
         current_control_time,
         battery_energy_updated_at,
     )
-    # Battery.power is in W; an idle battery's energy reading legitimately
+    # Battery.power is in kW; convert for the W-based idle check. An idle battery's energy reading legitimately
     # sits still (HA only refreshes last_updated on change).
     battery_energy_measurement_fresh = is_battery_energy_measurement_usable(
         current_control_time,
@@ -5833,9 +6184,10 @@ def auto_apply_setpoint():
         battery_energy,
         battery_capacity,
         get(Battery.soc, -1),
-        get(Battery.power, 1337),
+        get(Battery.power, 1337) * 1000,
         get_attr(Battery.power, "last_updated"),
         max_age_seconds=LIVE_BATTERY_ENERGY_MAX_MEASUREMENT_AGE_SECONDS,
+        battery_soc_updated_at=get_attr(Battery.soc, "last_updated"),
     )
     battery_energy_values_valid = are_battery_energy_values_valid(
         battery_capacity,
@@ -5995,28 +6347,36 @@ def auto_apply_setpoint():
         # so the hold engages after two consecutive bad cycles and releases
         # after two consecutive good ones.  Everything downstream, including
         # the headroom mode and the tail hold, uses the debounced signal.
-        # A missing persisted entity makes get() log an error line, so check
-        # at most once per load; a reload resets the flag and re-checks.
-        if not prev_telemetry_hold_active and not prev_telemetry_hold_boot_checked:
+        # Older versions parked the physical discharge limit at zero during a
+        # telemetry hold and persisted a latch so a reload could restore it.
+        # Migrate that state once, then keep telemetry safety entirely in the
+        # grid-setpoint controller. A measurement outage must not disable
+        # normal ESS coverage of household loads.
+        if not prev_telemetry_hold_boot_checked:
             prev_telemetry_hold_boot_checked = True
             persisted_hold_limit = get(
                 "pyscript.telemetry_hold_discharge_limit", ""
             )
             if persisted_hold_limit not in ("", None, "unknown", "unavailable"):
                 try:
-                    prev_discharge_limit_before_hold = float(persisted_hold_limit)
+                    persisted_hold_limit = float(persisted_hold_limit)
                 except (TypeError, ValueError):
-                    prev_discharge_limit_before_hold = None
-                    state.set(  # noqa: F821 - provided by the Pyscript runtime
-                        "pyscript.telemetry_hold_discharge_limit",
-                        "",
-                    )
-                else:
-                    prev_telemetry_hold_active = True
+                    persisted_hold_limit = None
+                configured_discharge_limit = get_planned_discharge_limit_w(-1)
+                if (
+                    persisted_hold_limit not in (None, 0)
+                    and get(Battery.discharge_limit, -1) == 0
+                    and configured_discharge_limit != 0
+                ):
+                    set_state(Battery.discharge_limit, configured_discharge_limit)
                     log.warning(
-                        "Resuming telemetry hold after restart; battery "
-                        "discharge stays disabled until fresh measurements arrive"
+                        "Cleared legacy telemetry hold and restored configured "
+                        f"battery discharge limit {configured_discharge_limit} W"
                     )
+                state.set(  # noqa: F821 - provided by the Pyscript runtime
+                    "pyscript.telemetry_hold_discharge_limit",
+                    "",
+                )
         if measurements_available:
             prev_telemetry_good_streak += 1
             prev_telemetry_bad_streak = 0
@@ -6024,55 +6384,15 @@ def auto_apply_setpoint():
             prev_telemetry_bad_streak += 1
             prev_telemetry_good_streak = 0
         if not prev_telemetry_hold_active and prev_telemetry_bad_streak >= 2:
-            held_setpoint = (
-                f"{prev_applied_grid_target_w} W"
-                if prev_applied_grid_target_w is not None
-                else "unknown"
-            )
-            prev_discharge_limit_before_hold = get(Battery.discharge_limit, -1)
-            # Persist the pre-hold limit outside volatile globals: a reload
-            # between entry and recovery must not strand a 0 limit with no
-            # owner left to restore it.
-            state.set(  # noqa: F821 - provided by the Pyscript runtime
-                "pyscript.telemetry_hold_discharge_limit",
-                str(prev_discharge_limit_before_hold),
-            )
-            if prev_discharge_limit_before_hold != 0:
-                set_state(Battery.discharge_limit, 0)
             log.warning(
-                f"Power telemetry {measurement_rejection_reason}: holding last "
-                f"grid setpoint ({held_setpoint}), battery discharge disabled"
+                f"Power telemetry {measurement_rejection_reason}: suppressing "
+                f"optional export at neutral grid setpoint {max_setpoint:.0f} W; "
+                "battery discharge limit unchanged"
             )
             prev_telemetry_hold_active = True
         elif prev_telemetry_hold_active and prev_telemetry_good_streak >= 2:
-            restored_limit = prev_discharge_limit_before_hold
             prev_telemetry_hold_active = False
-            prev_discharge_limit_before_hold = None
-            # Restore the input before clearing the latch (engage does the
-            # reverse: latch first, then park at 0).  Either order leaves no
-            # window where the planner sees a hold-owned 0 with no latch to
-            # explain it, so get_planned_discharge_limit_w stays race-free.
-            current_limit = get(Battery.discharge_limit, -1)
-            if current_limit == 0 and restored_limit not in (None, 0):
-                set_state(Battery.discharge_limit, restored_limit)
-                log.warning(
-                    "Power telemetry recovered, "
-                    f"battery discharge limit restored to {restored_limit}"
-                )
-            elif current_limit == 0:
-                log.warning(
-                    "Power telemetry recovered, discharge limit already "
-                    "disabled before hold, nothing to restore"
-                )
-            else:
-                log.warning(
-                    "Power telemetry recovered, discharge limit changed "
-                    "externally during hold, leaving as-is"
-                )
-            state.set(  # noqa: F821 - provided by the Pyscript runtime
-                "pyscript.telemetry_hold_discharge_limit",
-                "",
-            )
+            log.warning("Power telemetry recovered; normal grid-setpoint control resumed")
         measurements_available = not prev_telemetry_hold_active
 
         if not measurements_available:
@@ -6306,6 +6626,15 @@ def auto_apply_setpoint():
             )
             setpoint = pv_only_setpoint
 
+    # Loss of synchronized power telemetry invalidates optional export, but it
+    # does not invalidate Victron's local ESS control. Apply the neutral grid
+    # target so the battery can continue covering the house while export is
+    # withheld. Never use the physical discharge-power limit as a transient
+    # telemetry actuator.
+    if not measurements_available:
+        setpoint = max_setpoint
+        msg += f" telemetry-neutral target {max_setpoint:.0f} W"
+
     publish_live_headroom = live_headroom_mode != prev_live_headroom_mode
     if last_live_headroom_publish is None:
         publish_live_headroom = True
@@ -6438,12 +6767,6 @@ def auto_apply_setpoint():
             )
         prev_live_headroom_mode = live_headroom_mode
         last_live_headroom_publish = now()
-
-    # Debounced stale-telemetry hold (see above): leave the last applied
-    # setpoint untouched instead of pinning a blind fallback.  Discharge
-    # handling already ran with the debounce transition.
-    if not measurements_available:
-        return
 
     if logging:
         log.warning(msg)

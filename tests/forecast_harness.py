@@ -22,6 +22,7 @@ def load_energy():
     builtins.pyscript_compile = lambda f: f
     utils = types.ModuleType("utils")
     utils.get = utils.get_attr = utils.set_state = utils.now = forbidden
+    utils.register_output_state = lambda *args, **kwargs: None
     utils.clip = lambda x, lo, hi: max(lo, min(hi, x))
     utils.with_timezone = aware
     sys.modules["utils"] = utils

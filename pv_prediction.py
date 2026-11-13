@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import TYPE_CHECKING
 # ruff: noqa: I001
 
@@ -29,16 +29,13 @@ def calculate_target_time_and_energy():
     log.info(f"Time to reach target: {time_to_reach_target}, Energy until target: {energy_until_target}")
 
     if not time_to_reach_target:
-        log.info("unable to compute time to reach target")
-
-        time_to_reach_target = current_time
-        if current_time.hour > 10:
-            time_to_reach_target += timedelta(days=1, hours=10 - current_time.hour)
-        time_to_reach_target = time_to_reach_target.replace(hour=10, minute=0, second=0)
-        energy_until_target = (time_to_reach_target - current_time).seconds / 3600 * house_demand
+        # Missing or incomplete PV data must not invent energy that downstream
+        # battery policy can spend. Keep the time unavailable and publish zero.
+        log.warning("unable to compute when PV production will meet demand")
+        energy_until_target = 0.0
 
     log.info(f"Time to reach target: {time_to_reach_target}, Energy until target: {energy_until_target}")
-    set_state(PVProduction.next_meet_demand, time_to_reach_target)
+    set_state(PVProduction.next_meet_demand, time_to_reach_target or "unknown")
     set_state(
         PVProduction.energy_until_production_meets_demand,
         energy_until_target,
@@ -57,7 +54,7 @@ def get_forecast_data():
             PVForecast.forecast_day_4,
         ]
     ]
-    if not forecast:
+    if not any(forecast):
         log.warning("could not get any forecast:" + str(get_attr(PVForecast.forecast_today, "detailedForecast")))
     return forecast or []
 
@@ -69,84 +66,49 @@ def interpolate_value(p, p1, p2, v1, v2):
 
 
 def find_time_and_energy_to_reach_target(target_production, forecast_days):
+    """Integrate forecast PV until its power first meets house demand."""
+
     t_now = now()
-    total_energy = 0.0
-    time_to_reach_target = None
-    past_reached_time = None
-    log_msg = "\n"
-
-    for forecast_data in forecast_days:
-        if not forecast_data:
-            continue
-
-        for current_period, next_period in zip(forecast_data, forecast_data[1:]):
-            current_period_start = current_period["period_start"]
-            next_period_start = next_period["period_start"]
-            
-            current_period_estimate = float(current_period["pv_estimate"])
-            next_period_estimate = float(next_period["pv_estimate"])
-            period_hours = (next_period_start - current_period_start).seconds / 3600
-
-            log_msg += f"{current_period_start} target {target_production} is {current_period['pv_estimate']} kWh\n"
-
-            # Localize current_time to the same timezone as current_period_start
-
-            if next_period_start < t_now:
-                if current_period_estimate >= target_production:
-                    past_reached_time = current_period_start
-
+    periods = {}
+    for forecast_data in forecast_days or []:
+        for period in forecast_data or []:
+            try:
+                periods[period["period_start"]] = max(0.0, float(period["pv_estimate"]))
+            except (KeyError, TypeError, ValueError, OverflowError):
                 continue
+    ordered = sorted(periods.items(), key=lambda item: item[0])
+    if len(ordered) < 2:
+        return None, 0.0
 
-            if current_period_start <= t_now < next_period_start:
-                interpolated_pv = interpolate_value(
-                    t_now.timestamp(),
-                    current_period_start.timestamp(),
-                    next_period_start.timestamp(),
-                    current_period_estimate,
-                    next_period_estimate,
-                )
-                remaining_hours = (next_period_start - t_now).total_seconds() / 3600
-                total_energy += interpolated_pv * remaining_hours
-                log_msg += f"iterpolated total energy to now: {total_energy} from td {next_period_start - current_period_start}: pv {interpolated_pv} kWh  total {total_energy}\n"
+    total_energy = 0.0
+    for (period_start, period_power), (next_start, next_power) in zip(ordered, ordered[1:]):
+        if next_start <= t_now or next_start <= period_start:
+            continue
+        start = max(period_start, t_now)
+        if start >= next_start:
+            continue
+        start_power = interpolate_value(
+            start.timestamp(),
+            period_start.timestamp(),
+            next_start.timestamp(),
+            period_power,
+            next_power,
+        )
+        if start_power >= target_production:
+            return start, total_energy
+        if next_power >= target_production and next_power > start_power:
+            crossing_ts = interpolate_value(
+                target_production,
+                start_power,
+                next_power,
+                start.timestamp(),
+                next_start.timestamp(),
+            )
+            crossing = datetime.fromtimestamp(crossing_ts, tz=start.tzinfo)
+            hours = (crossing - start).total_seconds() / 3600
+            total_energy += (start_power + target_production) / 2 * hours
+            return crossing, total_energy
+        hours = (next_start - start).total_seconds() / 3600
+        total_energy += (start_power + next_power) / 2 * hours
 
-            elif (
-                next_period_estimate >= target_production
-                and time_to_reach_target is None
-                and (not past_reached_time or current_period_start.day != past_reached_time.day)
-            ):
-                log_msg += f"found next period to reach target: {next_period_start} - {next_period['pv_estimate']} kWh total {total_energy}\n"
-                interpolated_time = interpolate_value(
-                    target_production,
-                    current_period_estimate,
-                    next_period_estimate,
-                    current_period_start.timestamp(),
-                    next_period_start.timestamp(),
-                )
-                time_to_reach_target = datetime.fromtimestamp(interpolated_time, tz=current_period_start.tzinfo)
-
-                interpolated_pv = interpolate_value(
-                    interpolated_time,
-                    current_period_start.timestamp(),
-                    next_period_start.timestamp(),
-                    current_period_estimate,
-                    next_period_estimate,
-                )
-                elapsed_until_target_hours = (time_to_reach_target - current_period_start).total_seconds() / 3600
-                total_energy += interpolated_pv * elapsed_until_target_hours
-                log_msg += f"trtt {time_to_reach_target}: current {current_period_start} - next {next_period_start}: pv {interpolated_pv} kWh  total {total_energy}\n"
-                break
-            else:
-                total_energy += period_hours * next_period_estimate
-                log_msg += f"start:{current_period_start} day now {t_now.day}- reached day {past_reached_time.day if past_reached_time else 'None'} next period > production {next_period['pv_estimate'] >= target_production} time to reach is None {time_to_reach_target is None}  total {total_energy}\n"
-
-            if time_to_reach_target is not None:
-                if (
-                    next_period_start.hour + next_period_start.minute / 60
-                    <= time_to_reach_target.hour + time_to_reach_target.minute / 60
-                ):
-                    total_energy += next_period_estimate * period_hours
-                break
-
-    log.info("find time to reach targert log:\n" + log_msg)
-
-    return time_to_reach_target, total_energy
+    return None, 0.0

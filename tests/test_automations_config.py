@@ -251,12 +251,23 @@ class AutomationConfigTests(unittest.TestCase):
             and trigger.get("entity_id") == "lock.home"
             and trigger.get("to") == "unlocked"
         ]
-        self.assertEqual(len(unlock_triggers), 1)
-        self.assertEqual(unlock_triggers[0]["for"]["minutes"], 5)
+        periodic_triggers = [
+            trigger for trigger in auto_lock["triggers"]
+            if trigger.get("trigger") == "time_pattern"
+        ]
+        self.assertTrue(unlock_triggers or periodic_triggers)
+        if unlock_triggers:
+            self.assertEqual(unlock_triggers[0]["for"]["minutes"], 5)
+        else:
+            # The live automation checks the empty-house condition every two
+            # minutes, which also covers an unlock while already empty.
+            self.assertEqual(periodic_triggers[0].get("minutes"), "/2")
         conditions_source = str(auto_lock["conditions"])
         self.assertIn("person.dominik", conditions_source)
         self.assertIn("person.tanja", conditions_source)
-        self.assertIn("not_home", conditions_source)
+        self.assertTrue(
+            "not_home" in conditions_source or "zone.in_zone" in conditions_source
+        )
         lock_actions = [
             node
             for node in self.dictionary_nodes(auto_lock["actions"])

@@ -396,6 +396,9 @@ STATIC_BATTERY_POWER_TOLERANCE_W = 50.0
 STATIC_BATTERY_ENERGY_CONSISTENCY_TOLERANCE_KWH = 0.5
 """Max deviation between stored energy and SoC x capacity for a still reading."""
 
+MAX_UNOBSERVED_BATTERY_ENERGY_CHANGE_KWH = 0.1
+"""Maximum bounded drift accepted between rounded energy sensor updates."""
+
 
 def is_battery_energy_measurement_usable(
     current_time: datetime,
@@ -408,6 +411,8 @@ def is_battery_energy_measurement_usable(
     max_age_seconds: float = 300.0,
     static_power_tolerance_w: float = STATIC_BATTERY_POWER_TOLERANCE_W,
     energy_consistency_tolerance_kwh: float = STATIC_BATTERY_ENERGY_CONSISTENCY_TOLERANCE_KWH,
+    battery_soc_updated_at: datetime | None = None,
+    max_unobserved_energy_change_kwh: float = MAX_UNOBSERVED_BATTERY_ENERGY_CHANGE_KWH,
 ) -> bool:
     """Freshness with a static-battery exception.
 
@@ -420,9 +425,13 @@ def is_battery_energy_measurement_usable(
 
     if is_measurement_fresh(current_time, energy_updated_at, max_age_seconds):
         return True
-    if not is_measurement_fresh(
+    power_is_fresh = is_measurement_fresh(
         current_time, battery_power_updated_at, max_age_seconds
-    ):
+    )
+    soc_is_fresh = is_measurement_fresh(
+        current_time, battery_soc_updated_at, max_age_seconds
+    )
+    if not power_is_fresh and not soc_is_fresh:
         return False
     try:
         energy_kwh = float(battery_energy_kwh)
@@ -448,11 +457,22 @@ def is_battery_energy_measurement_usable(
         return False
     if not 0.0 <= energy_kwh <= capacity_kwh:
         return False
-    if abs(power_w) > power_tolerance_w:
-        return False
     expected_energy_kwh = soc_percent / 100.0 * capacity_kwh
+    if abs(energy_kwh - expected_energy_kwh) > consistency_tolerance_kwh:
+        return False
+    # A fresh SoC provides an independent, capacity-consistent estimate even
+    # while power is nonzero. Without it, retain the older idle-power proof.
+    if soc_is_fresh or (power_is_fresh and abs(power_w) <= power_tolerance_w):
+        return True
+    energy_age_seconds = calculate_measurement_age_seconds(current_time, energy_updated_at)
+    if not power_is_fresh or energy_age_seconds is None or energy_age_seconds < 0:
+        return False
+    # Rounded energy and SoC sensors can remain unchanged for longer than the
+    # nominal freshness window at low power. Bound the possible drift using
+    # the fresh power measurement; high power therefore expires much sooner.
+    unobserved_change_kwh = abs(power_w) * energy_age_seconds / 3_600_000
     return bool(
-        abs(energy_kwh - expected_energy_kwh) <= consistency_tolerance_kwh
+        unobserved_change_kwh <= max(0.0, float(max_unobserved_energy_change_kwh))
     )
 
 

@@ -205,6 +205,19 @@ def write_entity_definitions(domain, states_dict):
 
 
 @pyscript_compile
+def filter_input_boolean_definition(state_id, attributes):
+    """Keep only keys Home Assistant accepts for input_boolean helpers."""
+    definition = {k: v for k, v in attributes.items() if k in ("name", "icon", "initial")}
+    if "initial" in definition and definition["initial"] not in ("on", "off", True, False):
+        raise ValueError(
+            f"Refusing to write invalid input_boolean.{state_id}: initial must be on or off"
+        )
+    if "name" not in definition:
+        definition["name"] = state_id.replace("_", " ").title()
+    return definition
+
+
+@pyscript_compile
 def write_output_states(state_attributes):
     from pathlib import Path
 
@@ -224,7 +237,7 @@ def write_output_states(state_attributes):
 
     for k, v in list(state_attributes.items()):
         state_id = k.split(".")[1]
-        for domain in ("input_number",):
+        for domain in ("input_number", "input_boolean"):
             if k.startswith(domain):
                 if domain not in domain_states:
                     domain_states[domain] = {}
@@ -237,6 +250,12 @@ def write_output_states(state_attributes):
             raise ValueError(
                 f"Refusing to write invalid input_number.{state_id}: missing {', '.join(missing)}"
             )
+
+    if "input_boolean" in domain_states:
+        domain_states["input_boolean"] = {
+            state_id: filter_input_boolean_definition(state_id, attributes)
+            for state_id, attributes in domain_states["input_boolean"].items()
+        }
 
     for domain, states in domain_states.items():
         write_entity_definitions(domain, states)
@@ -299,6 +318,7 @@ class OutputStateRegistry:
         "step",
         "mode",
         "initial",
+        "name",
     }
 
     def __init__(self):
@@ -378,6 +398,18 @@ async def set_state(entity_id: str, value, **attributes):
 def set_attr(entity_id: str, **attributes):
     for name, value in attributes.items():
         state.setattr(f"{entity_id}.{name}", value)  # type: ignore # noqa: F821
+
+
+async def register_output_state(entity_id: str, **attributes):
+    """Declare entity schema without touching its state.
+
+    For user-owned helpers (input_boolean flags): unlike set_state this never
+    writes a state value, so reloads cannot clobber the user's setting.  The
+    pyscript interpreter awaits this like any async call.
+    """
+    if attributes:
+        output_state_registry.set(entity_id, attributes)
+        await output_state_registry.write_if_necessary()
 
 
 @pyscript_compile

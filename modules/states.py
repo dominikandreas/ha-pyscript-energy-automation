@@ -71,6 +71,9 @@ class Charger:
     """The current the EV charger is configured to use (sensor)"""
     current_setting = "number.charger_maximum_current"
     """The current the EV charger is configured to use (number entity to set value)"""
+    current_offered = "sensor.charger_current_offered"
+    session_current_limit = "number.charger_session_current_limit"
+    transaction_id = "sensor.charger_transaction_id"
     status_connector = "sensor.charger_status_connector"
     """The status of the charger connector"""
     control_switch = "switch.charger_charge_control"
@@ -126,6 +129,8 @@ class EV:
     """Dashboard feedback for the EV surplus-timing state machine."""
     charge_plan = "sensor.ev_charge_plan"
     """Shared full-horizon EV charging authorizations and replay diagnostics."""
+    low_pv_charge_target = "sensor.ev_low_pv_charge_target"
+    """Latched overnight charge target admitted by the five-day energy balance."""
 
 
 class House:

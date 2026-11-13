@@ -1,7 +1,7 @@
 import ast
 import unittest
 from datetime import datetime, time, timedelta, timezone
-from math import pi
+from math import ceil, pi
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -52,6 +52,7 @@ def _load_energy_core_symbols():
         "is_forecast_ev_available",
         "is_arrival_precharge_allowed",
         "_get_charge_action",
+        "required_departure_charge_setting",
         "get_ev_charge_feedback_state",
         "calculate_charger_current_adjustment",
     }
@@ -78,6 +79,7 @@ def _load_energy_core_symbols():
         "Const": _EVConst,
         "Victron": _Victron,
         "clip": _clip,
+        "ceil": ceil,
     }
     module = ast.Module(body=selected, type_ignores=[])
     ast.fix_missing_locations(module)

@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta
+from math import ceil, isfinite
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -20,6 +21,18 @@ SURPLUS_STOP_MARGIN = 300  # W tolerated below the physical minimum while runnin
 EV_SURPLUS_START_CONFIRMATION_MINUTES = 3.0
 EV_BATTERY_SUPPORT_RESERVE_KWH = 3.0
 EV_BATTERY_SUPPORT_BUDGET_HOURS = 1.0
+LIVE_PV_HEADROOM_RUNNING_MARGIN_W = 150.0
+EV_SURPLUS_IMPORT_STOP_W = 300.0
+EV_SURPLUS_IMPORT_EMERGENCY_STOP_W = 5000.0
+EV_SURPLUS_IMPORT_STARTUP_GRACE_SECONDS = 30.0
+EV_LOW_PV_TRIGGER_SOC = 40.0
+EV_LOW_PV_TARGET_SOC = 80.0
+EV_LOW_PV_DRIVE_TARGET_SOC = 100.0
+EV_LOW_PV_BALANCE_THRESHOLD_KWH = 3.0
+EV_LOW_PV_ACTIVE_SESSION_MIN_SHORTFALL_KWH = 0.1
+EV_LOW_PV_BALANCE_MAX_AGE_MINUTES = 20.0
+EV_LOW_PRICE_NIGHT_START_HOUR = 19
+EV_LOW_PRICE_NIGHT_END_HOUR = 7
 
 
 class ChargeAction:
@@ -31,8 +44,105 @@ class ChargeMode:
     hard_stop = "hard_stop"
     idle = "idle"
     required = "required"
+    low_pv_grid = "low_pv_grid"
     surplus = "surplus"
     arrival_precharge = "arrival_precharge"
+
+
+@pyscript_compile
+def get_ev_surplus_import_safety_action(
+    grid_import_w,
+    seconds_since_adjustment,
+    configured_current,
+    configured_phases,
+    stop_threshold_w=EV_SURPLUS_IMPORT_STOP_W,
+    emergency_threshold_w=EV_SURPLUS_IMPORT_EMERGENCY_STOP_W,
+    startup_grace_seconds=EV_SURPLUS_IMPORT_STARTUP_GRACE_SECONDS,
+    voltage=230.0,
+    min_current=6,
+):
+    """Return the least disruptive response to surplus-charge grid import.
+
+    The wallbox and home-battery controller need several seconds to exchange
+    load after the charge switch closes or its current changes. Moderate import
+    during that interval is not evidence of an ongoing deficit. Once settled,
+    shed enough current to approach the import threshold before stopping the
+    transaction. Only an emergency import or persistent import at minimum
+    current requires an immediate stop.
+
+    Returns ``(action, current)`` where action is one of ``none``, ``hold``,
+    ``reduce`` or ``stop``. ``current`` is populated only for ``reduce``.
+    """
+
+    try:
+        grid_import_w = float(grid_import_w)
+        configured_current = float(configured_current)
+        configured_phases = int(configured_phases)
+        stop_threshold_w = float(stop_threshold_w)
+        emergency_threshold_w = float(emergency_threshold_w)
+        startup_grace_seconds = float(startup_grace_seconds)
+        voltage = float(voltage)
+        min_current = int(min_current)
+        if seconds_since_adjustment is not None:
+            seconds_since_adjustment = float(seconds_since_adjustment)
+    except (TypeError, ValueError, OverflowError):
+        return "stop", None
+
+    if not isfinite(grid_import_w) or grid_import_w <= stop_threshold_w:
+        return "none", None
+    if grid_import_w >= emergency_threshold_w:
+        return "stop", None
+    if (
+        seconds_since_adjustment is None
+        or not isfinite(seconds_since_adjustment)
+        or seconds_since_adjustment < startup_grace_seconds
+    ):
+        return "hold", None
+    if configured_phases not in (1, 3) or voltage <= 0 or configured_current <= min_current:
+        return "stop", None
+
+    amps_to_shed = max(
+        1,
+        ceil((grid_import_w - stop_threshold_w) / (voltage * configured_phases)),
+    )
+    return "reduce", max(min_current, int(configured_current) - amps_to_shed)
+
+
+@pyscript_compile
+def calculate_live_pv_headroom_power(
+    grid_power_w,
+    battery_power_kw,
+    wallbox_power_w,
+    is_charging,
+    running_margin_w=LIVE_PV_HEADROOM_RUNNING_MARGIN_W,
+):
+    """Return measured PV power that can be redirected to the EV safely.
+
+    A zero grid reading is ambiguous while the home battery is charging: the
+    battery may be absorbing substantial PV before it reaches the meter. Its
+    positive charge power is therefore recoverable PV headroom, just like
+    export. Any simultaneous import is removed, so the value can never use a
+    grid or forced battery charge. During an active EV charge the wallbox load
+    is added back to retain the proven level, with a small import margin.
+    """
+
+    try:
+        grid_power_w = float(grid_power_w)
+        battery_power_kw = float(battery_power_kw)
+        wallbox_power_w = float(wallbox_power_w)
+        running_margin_w = float(running_margin_w)
+    except (TypeError, ValueError):
+        return 0.0
+
+    grid_import_w = max(0.0, grid_power_w)
+    grid_export_w = max(0.0, -grid_power_w)
+    battery_charge_w = max(0.0, battery_power_kw * 1000.0)
+    recovered_wallbox_w = max(0.0, wallbox_power_w) if is_charging else 0.0
+    margin_w = max(0.0, running_margin_w) if is_charging else 0.0
+    return max(
+        0.0,
+        grid_export_w + battery_charge_w + recovered_wallbox_w - grid_import_w - margin_w,
+    )
 
 
 @pyscript_compile
@@ -50,6 +160,173 @@ def get_ongoing_and_next_drive(ev_schedule, t_now):
     ongoing = next(iter([event for event in ev_schedule if event.start <= t_now < event.end]), None)
     next_drive = next(iter([event for event in ev_schedule if event.start > t_now]), None)
     return ongoing, next_drive
+
+
+@pyscript_compile
+def get_low_pv_ev_charge_target(
+    current_soc,
+    five_day_balance,
+    next_drive,
+    t_now,
+    existing_target=0,
+    balance_calculated_at=None,
+    existing_deadline=None,
+    pv_opportunity_kwh=None,
+    pv_opportunity_calculated_at=None,
+):
+    """Return the latched overnight EV target for a weak five-day forecast.
+
+    Preserve an admitted session independently of transient forecast validity.
+    Grid authorization is evaluated separately, so stale data can pause a
+    session without losing it. ``existing_deadline`` binds a 100% target to the
+    departure that created it, allowing the session to survive midnight.
+    """
+
+    try:
+        current_soc = float(current_soc)
+        five_day_balance = float(five_day_balance)
+        existing_target = float(existing_target or 0)
+        if isinstance(next_drive, str):
+            next_drive = datetime.fromisoformat(next_drive)
+        if isinstance(balance_calculated_at, str):
+            balance_calculated_at = datetime.fromisoformat(balance_calculated_at)
+        if isinstance(existing_deadline, str) and existing_deadline:
+            existing_deadline = datetime.fromisoformat(existing_deadline)
+        if isinstance(pv_opportunity_calculated_at, str) and pv_opportunity_calculated_at:
+            pv_opportunity_calculated_at = datetime.fromisoformat(pv_opportunity_calculated_at)
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+
+    if not all(isfinite(value) for value in (current_soc, existing_target)):
+        return 0.0
+    if not isinstance(t_now, datetime):
+        return 0.0
+
+    if existing_target >= EV_LOW_PV_TARGET_SOC:
+        if current_soc >= existing_target - 0.5:
+            return 0.0
+        following_day_drive = bool(
+            isinstance(next_drive, datetime)
+            and next_drive.date() == (t_now + timedelta(days=1)).date()
+        )
+        if existing_target >= EV_LOW_PV_DRIVE_TARGET_SOC:
+            # Keep the balancing target while the same departure is pending.
+            if existing_deadline is not None and next_drive == existing_deadline:
+                return EV_LOW_PV_DRIVE_TARGET_SOC
+            return EV_LOW_PV_DRIVE_TARGET_SOC if following_day_drive else EV_LOW_PV_TARGET_SOC
+        return EV_LOW_PV_DRIVE_TARGET_SOC if following_day_drive else EV_LOW_PV_TARGET_SOC
+
+    if not isfinite(five_day_balance):
+        return 0.0
+    if current_soc >= EV_LOW_PV_TRIGGER_SOC:
+        return 0.0
+
+    following_day_drive = bool(
+        isinstance(next_drive, datetime)
+        and next_drive.date() == (t_now + timedelta(days=1)).date()
+    )
+    candidate = EV_LOW_PV_DRIVE_TARGET_SOC if following_day_drive else EV_LOW_PV_TARGET_SOC
+    return candidate if is_low_pv_ev_grid_charge_authorized(
+        candidate,
+        current_soc,
+        five_day_balance,
+        t_now,
+        balance_calculated_at,
+        pv_opportunity_kwh,
+        pv_opportunity_calculated_at,
+    ) else 0.0
+
+
+@pyscript_compile
+def is_low_pv_ev_grid_charge_authorized(
+    target_soc,
+    current_soc,
+    five_day_balance,
+    t_now,
+    balance_calculated_at,
+    pv_opportunity_kwh=None,
+    pv_opportunity_calculated_at=None,
+    active_session=False,
+):
+    """Validate current data before optional grid charging is allowed.
+
+    The five-day balance remains the broad weak-PV gate. When the forecast
+    planner has published a fresh EV-specific PV opportunity, require a real
+    shortfall to the target as well. The opportunity is wall energy already
+    admitted by the complete house/battery replay. The 3 kWh threshold is an
+    admission filter: once a session has been admitted, finish the target as
+    long as forecast PV still leaves a material shortfall. Reapplying the
+    admission threshold to the shrinking remainder would always stop a charge
+    several percentage points below its target.
+    """
+
+    try:
+        target_soc = float(target_soc)
+        current_soc = float(current_soc)
+        five_day_balance = float(five_day_balance)
+        if isinstance(balance_calculated_at, str):
+            balance_calculated_at = datetime.fromisoformat(balance_calculated_at)
+        if isinstance(pv_opportunity_calculated_at, str) and pv_opportunity_calculated_at:
+            pv_opportunity_calculated_at = datetime.fromisoformat(pv_opportunity_calculated_at)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if not all(isfinite(v) for v in (target_soc, current_soc, five_day_balance)):
+        return False
+    if not isinstance(t_now, datetime) or not isinstance(balance_calculated_at, datetime):
+        return False
+
+    def age_minutes(measured_at):
+        if not isinstance(measured_at, datetime):
+            return None
+        if t_now.tzinfo is not None and measured_at.tzinfo is None:
+            measured_at = measured_at.replace(tzinfo=t_now.tzinfo)
+        try:
+            return (t_now - measured_at).total_seconds() / 60
+        except (TypeError, ValueError):
+            return None
+
+    balance_age = age_minutes(balance_calculated_at)
+    if balance_age is None or not 0 <= balance_age <= EV_LOW_PV_BALANCE_MAX_AGE_MINUTES:
+        return False
+    if five_day_balance > EV_LOW_PV_BALANCE_THRESHOLD_KWH or target_soc <= current_soc:
+        return False
+
+    # No planner result yet: retain the conservative five-day fallback. Once a
+    # planner result exists, stale opportunity data fails closed for new grid
+    # energy and for an active session until the next forecast refresh.
+    if pv_opportunity_kwh is None:
+        return True
+    try:
+        pv_opportunity_kwh = float(pv_opportunity_kwh)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    opportunity_age = age_minutes(pv_opportunity_calculated_at)
+    if (
+        not isfinite(pv_opportunity_kwh)
+        or opportunity_age is None
+        or not 0 <= opportunity_age <= EV_LOW_PV_BALANCE_MAX_AGE_MINUTES
+    ):
+        return False
+    wall_energy_to_target = max(
+        0.0,
+        (target_soc - current_soc) / 100 * Const.ev_capacity / Const.charge_efficiency,
+    )
+    minimum_shortfall = (
+        EV_LOW_PV_ACTIVE_SESSION_MIN_SHORTFALL_KWH
+        if active_session
+        else EV_LOW_PV_BALANCE_THRESHOLD_KWH
+    )
+    return wall_energy_to_target - max(0.0, pv_opportunity_kwh) > minimum_shortfall
+
+
+@pyscript_compile
+def is_low_price_night(t_now):
+    """Return whether a timestamp is inside the overnight charging window."""
+
+    return bool(
+        isinstance(t_now, datetime)
+        and (t_now.hour >= EV_LOW_PRICE_NIGHT_START_HOUR or t_now.hour < EV_LOW_PRICE_NIGHT_END_HOUR)
+    )
 
 
 @pyscript_compile
@@ -443,6 +720,18 @@ def get_ev_charge_feedback_state(
 
 
 @pyscript_compile
+def required_departure_charge_setting(energy_needed_kwh, hours_available, required_soc):
+    """Choose the lowest standard EVSE setting likely to meet a hard trip target."""
+    usable_hours = max(0.05, hours_available - (0.5 if required_soc >= 99 else 0.25))
+    if required_soc >= 99:
+        usable_hours /= 1.25  # high-SOC taper and uncertainty
+    wall_w = max(0.0, energy_needed_kwh) * 1000 / (0.9 * usable_hours)
+    phases = 1 if wall_w <= Const.voltage * Const.max_current else 3
+    amps = max(Const.min_current, min(Const.max_current, ceil(wall_w / (Const.voltage * phases))))
+    return phases, amps
+
+
+@pyscript_compile
 def _get_charge_action(
     next_drive,
     current_soc,
@@ -470,6 +759,9 @@ def _get_charge_action(
     precharge_energy_needed=0,
     planned_power=None,
     planned_target_soc=0,
+    live_pv_headroom_power=0,
+    low_pv_charge_target_soc=0,
+    low_pv_grid_charge_allowed=True,
 ):
     """Calculate the action to take for EV charging based on various conditions.
 
@@ -490,6 +782,13 @@ def _get_charge_action(
 
     # Calculate minimum time needed to charge the vehicle, we subtract 1 to account for charging inefficiencies
     min_hours_needed = energy_needed / (3 * Const.voltage * (Const.max_current - 1) / 1000)  # in hours
+    # Charging to full can taper materially near 100%. A bare constant-power
+    # estimate starts the departure fallback too late for cell balancing and
+    # normal charger or vehicle delays. This applies only to a hard 100% trip
+    # requirement, not the optional low-PV 100% ceiling.
+    deadline_hours_needed = (
+        min_hours_needed * 1.25 + 0.5 if required_soc >= 99 and energy_needed > 0 else min_hours_needed
+    )
 
     # Adjust target excess and surplus energy to account for inefficiencies, leave room for other devices
     surplus_energy = surplus_energy - 3
@@ -506,10 +805,11 @@ def _get_charge_action(
     required_charge_limit = required_soc
     if smart_limiter_active:
         required_charge_limit = min(required_soc, smart_charge_limit)
+    required_charge_limit = max(required_charge_limit, low_pv_charge_target_soc)
 
     # Required SoC is a hard trip target. Smart limit is the PV-opportunistic
     # ceiling. Do not block surplus charging just because the trip target is met.
-    surplus_charge_limit = max(required_charge_limit, smart_charge_limit)
+    surplus_charge_limit = max(required_charge_limit, smart_charge_limit, low_pv_charge_target_soc)
     available_ev_power = calculate_available_ev_power(
         excess_power=excess_power,
         excess_target=excess_target,
@@ -540,27 +840,66 @@ def _get_charge_action(
             ChargeMode.hard_stop,
         )
 
+    if (
+        low_pv_charge_target_soc > current_soc
+        and low_pv_grid_charge_allowed
+        and is_low_price
+        and is_low_price_night(t_now)
+    ):
+        return (
+            ChargeAction.on,
+            3,
+            Const.max_current,
+            f"Low-PV overnight charge to {low_pv_charge_target_soc:.0f}%",
+            ChargeMode.low_pv_grid,
+        )
+
     if planned_power is not None:
         # A plan is an authorization, never a substitute for measured power.
         # Optional charging cannot add home-battery discharge to PV headroom.
         # Missing/expired/empty plans pass zero and retain only trip fallback.
+        # Measured PV headroom is an exception: it is energy currently flowing
+        # to the grid or into a charging home battery, so it must remain usable
+        # even when a horizon plan deliberately reserved a later PV slot. The
+        # live value is capped by the same local-power measurement and may
+        # never borrow from the battery or create an import.
         urgent = (
             energy_needed > 0
             and current_soc < required_soc - 1
-            and (hours_available_to_charge < 2 or hours_available_to_charge < min_hours_needed)
+            and (hours_available_to_charge < 2 or hours_available_to_charge < deadline_hours_needed)
         )
         if urgent:
-            return (ChargeAction.on, 3, Const.max_current,
+            phases, current = required_departure_charge_setting(energy_needed, hours_available_to_charge, required_soc)
+            return (ChargeAction.on, phases, current,
                     "Departure deadline: charging to required SOC", ChargeMode.required)
         local_power = max(0.0, excess_power + (max(0.0, wallbox_power) if is_charging else 0.0))
         admitted_power = min(max(0.0, planned_power), local_power)
         target = min(surplus_charge_limit, planned_target_soc)
         start_threshold = minimum_charge_power + (0 if is_charging else SURPLUS_START_MARGIN)
+        measured_pv_headroom = min(max(0.0, live_pv_headroom_power or 0.0), local_power)
+        if current_soc < surplus_charge_limit and measured_pv_headroom >= start_threshold:
+            # Keep the start-confirmation margin in reserve during the first
+            # command. Previously it was required by the eligibility check and
+            # then immediately consumed by current quantization, which caused
+            # a small import transient and repeated safety-stop cycles.
+            # Preserve control reserve during running adjustments too. An
+            # upward amp step must not consume all measured headroom.
+            command_power = measured_pv_headroom - SURPLUS_START_MARGIN
+            phases = 3 if command_power >= 3 * Const.voltage * Const.min_current else 1
+            current = max(Const.min_current, min(Const.max_current, int(command_power // (Const.voltage * phases))))
+            return (
+                ChargeAction.on,
+                phases,
+                current,
+                f"Measured PV headroom charging to {surplus_charge_limit:.1f}%: {measured_pv_headroom:.0f} W available",
+                ChargeMode.surplus,
+            )
         if current_soc < target and admitted_power >= start_threshold:
             # Quantize down, including across phase transitions. Never use the
             # old phase hysteresis to round up beyond physically available PV.
-            phases = 3 if admitted_power >= 3 * Const.voltage * Const.min_current else 1
-            current = min(Const.max_current, int(admitted_power // (Const.voltage * phases)))
+            command_power = admitted_power - SURPLUS_START_MARGIN
+            phases = 3 if command_power >= 3 * Const.voltage * Const.min_current else 1
+            current = max(Const.min_current, min(Const.max_current, int(command_power // (Const.voltage * phases))))
             return (ChargeAction.on, phases, current,
                     f"Forecast-approved PV charge to {target:.1f}%: {admitted_power:.0f} W available",
                     ChargeMode.surplus)
@@ -613,11 +952,11 @@ def _get_charge_action(
             ChargeMode.hard_stop,
         )
     # Emergency charge, independently of price or excess power
-    elif (hours_available_to_charge < 2 or hours_available_to_charge < min_hours_needed) and current_soc < (
+    elif (hours_available_to_charge < 2 or hours_available_to_charge < deadline_hours_needed) and current_soc < (
         required_soc - 1
     ):
         reason = f"Emergency charge - SOC: hours available {hours_available_to_charge} time needed {min_hours_needed}  {current_soc}% < Target: {required_soc}%"
-        phases, current = (3, Const.max_current)
+        phases, current = required_departure_charge_setting(energy_needed, hours_available_to_charge, required_soc)
         return (ChargeAction.on, phases, current, reason, ChargeMode.required)
     elif (
         battery_floor_soc > 0
@@ -780,6 +1119,8 @@ def get_settled_simulated_ev_charge_action(
     max_control_steps=10,
     planned_power=None,
     planned_target_soc=0,
+    low_pv_charge_target_soc=0,
+    low_pv_grid_charge_allowed=True,
 ):
     """Settle minute-rate EV control inside one forecast interval.
 
@@ -829,6 +1170,8 @@ def get_settled_simulated_ev_charge_action(
             precharge_energy_needed=precharge_energy_needed,
             planned_power=planned_power,
             planned_target_soc=planned_target_soc,
+            low_pv_charge_target_soc=low_pv_charge_target_soc,
+            low_pv_grid_charge_allowed=low_pv_grid_charge_allowed,
         )
         next_is_charging = action == ChargeAction.on
         if new_phases != phases and planned_power is None:

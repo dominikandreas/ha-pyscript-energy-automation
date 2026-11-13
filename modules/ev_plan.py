@@ -114,6 +114,11 @@ def build_ev_charge_plan(replay, frozen_inputs):
         _, departure = get_ongoing_and_next_drive(inputs.get("ev_schedule"), start)
         required = departure.required_soc if departure and departure.required_soc is not None else inputs["ev_required_soc"]
         smart = _get_ev_smart_charge_limit(departure.start, start) if departure else 80.0
+        low_pv_target = float(inputs.get("ev_low_pv_charge_target_soc", 0) or 0)
+        low_pv_deadline = inputs.get("ev_low_pv_charge_deadline")
+        if low_pv_deadline is None or start < low_pv_deadline:
+            required = max(required, low_pv_target)
+            smart = max(smart, low_pv_target)
         target = min(required, smart) if inputs["smart_limiter_active"] else required
         # Highest local production first; prefer later equally productive slots
         # to avoid storing unnecessary energy in the EV far before departure.
@@ -149,6 +154,11 @@ def build_ev_charge_plan(replay, frozen_inputs):
                 plan, accepted, metrics = proposed, candidate, measure
         if not optional:
             required_metrics = metrics
+    planned_pv_ev_wall_kwh = 0.0
+    planned_starts = set(plan)
+    for entry in accepted.detail:
+        if entry.period_start.isoformat() in planned_starts:
+            planned_pv_ev_wall_kwh += max(0.0, entry.ev_charge_power) * period_hours / 1000
     return {
         "slots": plan,
         "baseline_grid_kwh": round(initial_metrics[0], 4),
@@ -156,6 +166,7 @@ def build_ev_charge_plan(replay, frozen_inputs):
         "planned_grid_kwh": round(metrics[0], 4),
         "planned_grid_cost": round(metrics[1], 4),
         "planned_ev_wall_kwh": round(metrics[2], 4),
+        "planned_pv_ev_wall_kwh": round(planned_pv_ev_wall_kwh, 4),
         "terminal_battery_kwh": round(metrics[3], 4),
         "replay_count": replay_count,
     }

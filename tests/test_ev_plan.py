@@ -26,7 +26,7 @@ class EVPlanTests(unittest.TestCase):
         # reserve schedule (live control discharges through it at high
         # prices), so the plan self-consumes ~0.86 kWh more instead of
         # importing it.
-        self.assertAlmostEqual(plan["planned_grid_kwh"], 7.2495, places=3)
+        self.assertAlmostEqual(plan["planned_grid_kwh"], 14.225, places=3)
         departure = self.inputs["ev_schedule"][0].start
         final_ev = [e.ev_energy for e in result.detail if e.period_start < departure][-1]
         self.assertAlmostEqual(final_ev / 60 * 100, 69.5, places=3)
@@ -131,7 +131,7 @@ class ForecastFloorTests(unittest.TestCase):
             nightly_power=546.0,
             is_charging_ev=False,
             smart_limiter_active=False,
-            charge_limit=90.0,
+            charge_limit=0.0, # Floor-only scenario: grid charging explicitly disabled.
             max_charge_price=0.2,
             force_charge_switch=False,
             min_discharge_price=0.0,

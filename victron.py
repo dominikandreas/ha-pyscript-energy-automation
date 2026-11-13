@@ -1,3 +1,4 @@
+from math import isfinite
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -79,7 +80,7 @@ def update_moving_average_power(
     state_name, factor=0.1, avg_state_name=None, new_val=None, slack: int | float = None, decimals=2, **attributes
 ):
     """Set the average power of the Victron inverter."""
-    power_now = new_val or get(state_name, None, mapper=float)
+    power_now = new_val if new_val is not None else get(state_name, None, mapper=float)
     avg_state_name = avg_state_name or (state_name + "_average")
     if power_now is not None:
         prev_power = get(avg_state_name, -1)
@@ -114,6 +115,17 @@ def set_victron_efficiency():
     battery_power = get("sensor.victron_battery_power_average", -1)
     dc_power = get("sensor.victron_dc_power_average", -1)
     if dc_power == -1 or battery_power == -1:
+        return
+    try:
+        battery_power = float(battery_power)
+        dc_power = float(dc_power)
+    except (TypeError, ValueError, OverflowError):
+        return
+    if not isfinite(battery_power) or not isfinite(dc_power):
+        return
+    if abs(dc_power) < 0.001 or abs(battery_power) < 0.001:
+        # Efficiency is undefined while the deliberately disabled inverter is
+        # idle. Preserve the last meaningful measurement without an exception.
         return
     if dc_power > 0:
         efficiency = round(battery_power / dc_power * 100, 4)
